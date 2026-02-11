@@ -1,6 +1,7 @@
 import os
 import io
 import uuid
+from fastapi import Query
 from typing import List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -292,3 +293,158 @@ def health():
 
 
 from fastapi import Request, BackgroundTasks
+
+# 1. VERIFICATION (GET): Meta calls this once during setup
+@app.get("/webhook/whatsapp")
+async def verify_whatsapp(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token")
+):
+    # This token must match what you set in the Meta Developer Dashboard
+    MY_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+    
+    if hub_mode == "subscribe" and hub_verify_token == MY_VERIFY_TOKEN:
+        return hub_challenge
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+# 2. MESSAGE HANDLER (POST): Meta sends user messages here
+@app.post("/webhook/whatsapp")
+async def handle_whatsapp_msg(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+
+    try:
+        if "entry" not in data:
+            return {"status": "ignored"}
+
+        entry = data["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
+
+        if "messages" not in value:
+            return {"status": "ignored"}
+
+        message = value["messages"][0]
+        from_phone = message["from"]
+        text_body = message.get("text", {}).get("body")
+        phone_number_id = value["metadata"]["phone_number_id"]
+
+        if not text_body:
+            return {"status": "no_text"}
+
+        background_tasks.add_task(
+            process_whatsapp_rag,
+            phone_number_id,
+            from_phone,
+            text_body
+        )
+
+    except Exception as e:
+        print("Webhook error:", e)
+
+    return {"status": "received"}
+
+
+def send_whatsapp_message(phone_number_id, to, message):
+    row = supabase.table("projects") \
+        .select("whatsapp_access_token") \
+        .eq("whatsapp_phone_number_id", phone_number_id) \
+        .execute()
+
+    if not row.data:
+        print("No token found")
+        return
+
+    access_token = row.data[0]["whatsapp_access_token"]
+
+    url = f"https://graph.facebook.com/v24.0/{phone_number_id}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "text": {"body": message}
+    }
+
+    requests.post(url, headers=headers, json=payload)
+
+
+@app.post("/whatsapp/onboard")
+async def onboard_whatsapp(req: dict):
+    code = req.get("code")
+    project_id = req.get("projectId")
+
+    if not code or not project_id:
+        raise HTTPException(status_code=400, detail="Missing code or projectId")
+
+    # Exchange code for token
+    token_res = requests.get(
+        "https://graph.facebook.com/v24.0/oauth/access_token",
+        params={
+            "client_id": os.getenv("FB_APP_ID"),
+            "client_secret": os.getenv("FB_APP_SECRET"),
+            "code": code,
+        },
+    ).json()
+
+    access_token = token_res.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=500, detail=token_res)
+
+    # -----------------------------
+    # GET WABA ID
+    # -----------------------------
+    waba_res = requests.get(
+        "https://graph.facebook.com/v24.0/me",
+        params={
+            "fields": "whatsapp_business_accounts",
+            "access_token": access_token,
+        },
+    ).json()
+
+    waba_id = waba_res["whatsapp_business_accounts"]["data"][0]["id"]
+
+    # -----------------------------
+    # GET PHONE NUMBER ID
+    # -----------------------------
+    phone_res = requests.get(
+        f"https://graph.facebook.com/v24.0/{waba_id}/phone_numbers",
+        params={"access_token": access_token},
+    ).json()
+
+    phone_number_id = phone_res["data"][0]["id"]
+
+    # -----------------------------
+    # SAVE TO PROJECT
+    # -----------------------------
+    supabase.table("projects").update({
+        "whatsapp_access_token": access_token,
+        "whatsapp_phone_number_id": phone_number_id
+    }).eq("id", project_id).execute()
+
+    return {"status": "connected"}
+
+def process_whatsapp_rag(phone_number_id, from_phone, text_body):
+    try:
+        row = supabase.table("projects") \
+            .select("id") \
+            .eq("whatsapp_phone_number_id", phone_number_id) \
+            .execute()
+
+        if not row.data:
+            return
+
+        project_id = row.data[0]["id"]
+
+        result = run_chat(project_id, text_body, [])
+        answer = result["answer"]
+
+        send_whatsapp_message(phone_number_id, from_phone, answer)
+
+    except Exception as e:
+        print("Background task error:", e)
+
