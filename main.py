@@ -291,26 +291,45 @@ def delete_document(file_id: str):
 def health():
     return {"status": "ok"}
 
-
 from fastapi import Request, BackgroundTasks
+from fastapi.responses import PlainTextResponse
+import hmac
+import hashlib
 
-# 1. VERIFICATION (GET): Meta calls this once during setup
-@app.get("/webhook/whatsapp")
+@app.get("/webhook/whatsapp", response_class=PlainTextResponse)
 async def verify_whatsapp(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token")
 ):
-    # This token must match what you set in the Meta Developer Dashboard
+    # Ensure this variable exactly matches the token in your Meta dashboard
     MY_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
     
     if hub_mode == "subscribe" and hub_verify_token == MY_VERIFY_TOKEN:
+        # Returning this as PlainTextResponse ensures NO quotes are added
         return hub_challenge
+    
     raise HTTPException(status_code=403, detail="Verification failed")
 
-# 2. MESSAGE HANDLER (POST): Meta sends user messages here
+def verify_signature(payload: bytes, signature: str):
+    app_secret = os.getenv("FB_APP_SECRET")
+
+    expected = hmac.new(
+        app_secret.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(f"sha256={expected}", signature)
+
 @app.post("/webhook/whatsapp")
 async def handle_whatsapp_msg(request: Request, background_tasks: BackgroundTasks):
+    signature = request.headers.get("X-Hub-Signature-256")
+    body = await request.body()
+
+    if not signature or not verify_signature(body, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
     data = await request.json()
 
     try:
@@ -344,6 +363,25 @@ async def handle_whatsapp_msg(request: Request, background_tasks: BackgroundTask
 
     return {"status": "received"}
 
+def process_whatsapp_rag(phone_number_id, from_phone, text_body):
+    try:
+        row = supabase.table("projects") \
+            .select("id") \
+            .eq("whatsapp_phone_number_id", phone_number_id) \
+            .execute()
+
+        if not row.data:
+            return
+
+        project_id = row.data[0]["id"]
+
+        result = run_chat(project_id, text_body, [])
+        answer = result["answer"]
+
+        send_whatsapp_message(phone_number_id, from_phone, answer)
+
+    except Exception as e:
+        print("Background task error:", e)
 
 def send_whatsapp_message(phone_number_id, to, message):
     row = supabase.table("projects") \
@@ -370,8 +408,8 @@ def send_whatsapp_message(phone_number_id, to, message):
         "text": {"body": message}
     }
 
-    requests.post(url, headers=headers, json=payload)
-
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    print("WhatsApp send:", r.status_code, r.text)
 
 @app.post("/whatsapp/onboard")
 async def onboard_whatsapp(req: dict):
@@ -381,7 +419,6 @@ async def onboard_whatsapp(req: dict):
     if not code or not project_id:
         raise HTTPException(status_code=400, detail="Missing code or projectId")
 
-    # Exchange code for token
     token_res = requests.get(
         "https://graph.facebook.com/v24.0/oauth/access_token",
         params={
@@ -395,9 +432,7 @@ async def onboard_whatsapp(req: dict):
     if not access_token:
         raise HTTPException(status_code=500, detail=token_res)
 
-    # -----------------------------
-    # GET WABA ID
-    # -----------------------------
+    # Get WABA
     waba_res = requests.get(
         "https://graph.facebook.com/v24.0/me",
         params={
@@ -408,9 +443,13 @@ async def onboard_whatsapp(req: dict):
 
     waba_id = waba_res["whatsapp_business_accounts"]["data"][0]["id"]
 
-    # -----------------------------
-    # GET PHONE NUMBER ID
-    # -----------------------------
+    # Subscribe app to WABA
+    requests.post(
+        f"https://graph.facebook.com/v24.0/{waba_id}/subscribed_apps",
+        params={"access_token": access_token}
+    )
+
+    # Get phone number
     phone_res = requests.get(
         f"https://graph.facebook.com/v24.0/{waba_id}/phone_numbers",
         params={"access_token": access_token},
@@ -418,33 +457,10 @@ async def onboard_whatsapp(req: dict):
 
     phone_number_id = phone_res["data"][0]["id"]
 
-    # -----------------------------
-    # SAVE TO PROJECT
-    # -----------------------------
     supabase.table("projects").update({
         "whatsapp_access_token": access_token,
         "whatsapp_phone_number_id": phone_number_id
     }).eq("id", project_id).execute()
 
     return {"status": "connected"}
-
-def process_whatsapp_rag(phone_number_id, from_phone, text_body):
-    try:
-        row = supabase.table("projects") \
-            .select("id") \
-            .eq("whatsapp_phone_number_id", phone_number_id) \
-            .execute()
-
-        if not row.data:
-            return
-
-        project_id = row.data[0]["id"]
-
-        result = run_chat(project_id, text_body, [])
-        answer = result["answer"]
-
-        send_whatsapp_message(phone_number_id, from_phone, answer)
-
-    except Exception as e:
-        print("Background task error:", e)
 
