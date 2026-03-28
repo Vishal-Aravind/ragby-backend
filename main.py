@@ -177,39 +177,166 @@ def ingest(req: IngestRequest):
 # STRICT CHAT (NO HALLUCINATION)
 # -------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are a helpful assistant.\n"
-    "Use ONLY the provided context.\n"
-    "If the answer is not explicitly present, reply exactly:\n"
-    "\"I don’t know based on the provided documents.\"\n"
-    "Do NOT infer, guess, or add external information.\n"
-    "Keep the answer concise (max 3 sentences)."
+    "You are a helpful and friendly AI assistant.\n"
+    "Use ONLY the provided context to answer.\n\n"
+
+    "Guidelines:\n"
+    "- Be natural, conversational, and clear\n"
+    "- Keep answers concise (max 3 sentences)\n"
+    "- Do not repeat the question\n\n"
+
+    "If answer is found:\n"
+    "- Respond confidently\n\n"
+
+    "If partially found:\n"
+    "- Share what is available\n"
+    "- Briefly mention what is missing\n\n"
+
+    "If NOT found:\n"
+    "- Say: \"I couldn’t find that in your documents.\"\n"
+    "- Suggest asking more specifically if helpful\n\n"
+
+    "Strict rules:\n"
+    "- No hallucination\n"
+    "- No external knowledge"
 )
 
-def is_greeting(text: str) -> bool:
-    text = text.lower().strip()
-    return text in {
-        "hi", "hello", "hey", "hi there", "hello there"      
-    }
 
-def is_thanking(text: str) -> bool:
-    text = text.lower().strip()
-    return text in {
-        "ok", "k", "thanks", "thank you"      
-    }
+# -------------------------------
+# Lightweight intent detection
+# -------------------------------
+def classify_intent(message: str) -> str:
+    msg = message.lower().strip()
+
+    words = msg.split()
+
+    # -------------------------------
+    # 1. Greeting (ONLY short messages)
+    # -------------------------------
+    if len(words) <= 3 and msg in ["hi", "hello", "hey", "hi there", "hello there"]:
+        return "greeting"
+
+    # -------------------------------
+    # 2. Thanks (ONLY short messages)
+    # -------------------------------
+    if len(words) <= 4 and any(w in msg for w in ["thanks", "thank you", "thx"]):
+        return "thanks"
+
+    # -------------------------------
+    # 3. Conversational (memory-type)
+    # -------------------------------
+    if any(k in msg for k in [
+        "earlier", "previous", "you said", "we talked",
+        "last message", "first question"
+    ]):
+        return "conversational"
+
+    # -------------------------------
+    # 4. Everything else = RAG
+    # -------------------------------
+    return "document_query"
 
 
+def generate_clarification(context, question):
+    prompt = f"""
+The user asked: "{question}"
+
+The context contains multiple possible answers.
+
+Ask a short clarification question to help the user choose.
+
+Context:
+{context}
+
+Return ONLY the question.
+"""
+
+    res = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return res.choices[0].message.content.strip()
+
+# -------------------------------------------------
+# Decide if ambiguous
+# -------------------------------------------------
+def check_ambiguity(context, question):
+    prompt = f"""
+You are an assistant.
+
+Question: "{question}"
+
+Context:
+{context}
+
+Determine:
+- If there is ONE clear answer → respond: CLEAR
+- If there are MULTIPLE possible answers → respond: AMBIGUOUS
+
+Return ONLY one word.
+"""
+
+    res = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    return res.choices[0].message.content.strip()
+
+# -------------------------------
+# Main Chat Function
+# -------------------------------
 def run_chat(project_id: str, message: str, history: List[ChatMessage]):
-    sources = [] 
-    # 1. Initialize messages immediately
-    messages = [] 
-    
     try:
-        if is_greeting(message):
-            return {"answer": "Hello! How can I help you?", "sources": []}
-        
-        if is_thanking(message):
-            return {"answer": "Great, looking forward to help you!", "sources": []}
+        intent = classify_intent(message)
 
+        # -------------------------------
+        # 1. Greeting
+        # -------------------------------
+        if intent == "greeting":
+            return {
+                "answer": "Hey! 👋 What can I help you with?",
+                "sources": []
+            }
+
+        # -------------------------------
+        # 2. Thanks
+        # -------------------------------
+        if intent == "thanks":
+            return {
+                "answer": "You're welcome! 😊 Let me know if you need anything else.",
+                "sources": []
+            }
+
+        # -------------------------------
+        # 3. Conversational (NO RAG)
+        # -------------------------------
+        if intent == "conversational":
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+
+            for h in history:
+                messages.append({"role": h.role, "content": h.content})
+
+            messages.append({"role": "user", "content": message})
+
+            completion = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=120,
+            )
+
+            return {
+                "answer": completion.choices[0].message.content.strip(),
+                "sources": []
+            }
+
+        # -------------------------------
+        # 4. RAG Retrieval
+        # -------------------------------
         q = embeddings.embed_query(message)
 
         res = qdrant.query_points(
@@ -225,14 +352,66 @@ def run_chat(project_id: str, message: str, history: List[ChatMessage]):
         )
 
         hits = res.points
-        if not hits:
-            return {"answer": "I don’t know based on the provided documents.", "sources": sources}
 
-        context = "\n\n---\n\n".join(h.payload.get("text", "") for h in hits)
-        
-        # 2. Setup the System Prompt and History
+        # -------------------------------
+        # 5. No results
+        # -------------------------------
+        if not hits:
+            return {
+                "answer": "I couldn’t find that in your documents. Try asking more specifically or upload related content.",
+                "sources": []
+            }
+
+        # -------------------------------
+        # 6. Build context
+        # -------------------------------
+        context = "\n\n---\n\n".join(
+            h.payload.get("text", "") for h in hits
+        )
+
+        # -------------------------------
+        # 7. 🔥 LLM Ambiguity Check (FIXED)
+        # -------------------------------
+        ambiguity_check_prompt = f"""
+Question: "{message}"
+
+Context:
+{context}
+
+Check carefully:
+
+- If the question can have MORE THAN ONE valid answer from the context (e.g., multiple companies, multiple packages, multiple values), respond: AMBIGUOUS
+- If there is ONLY ONE correct answer, respond: CLEAR
+
+Important:
+Even if one answer seems more prominent, if another valid answer exists, it is AMBIGUOUS.
+
+Return ONLY:
+CLEAR or AMBIGUOUS
+"""
+
+        decision_res = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": ambiguity_check_prompt}],
+            temperature=0
+        )
+
+        decision = decision_res.choices[0].message.content.strip()
+
+        # -------------------------------
+        # 8. If ambiguous → ask clarification
+        # -------------------------------
+        if decision == "AMBIGUOUS":
+            return {
+                "answer": generate_clarification(context, message),
+                "sources": []
+            }
+
+        # -------------------------------
+        # 9. Normal Answer (CLEAR case)
+        # -------------------------------
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        
+
         for h in history:
             messages.append({"role": h.role, "content": h.content})
 
@@ -241,18 +420,21 @@ def run_chat(project_id: str, message: str, history: List[ChatMessage]):
             "content": f"Context:\n{context}\n\nQuestion:\n{message}"
         })
 
-        # 3. Call OpenAI
         completion = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0,
+            temperature=0.2,
             max_tokens=120,
         )
 
-        # ... (rest of your sources logic)
+        answer = completion.choices[0].message.content.strip()
+
+        if answer and not answer.endswith((".", "!", "?")):
+            answer += "."
+
         return {
-            "answer": completion.choices[0].message.content.strip(),
-            "sources": sources
+            "answer": answer,
+            "sources": []
         }
 
     except Exception as e:
@@ -290,177 +472,4 @@ def delete_document(file_id: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-from fastapi import Request, BackgroundTasks
-from fastapi.responses import PlainTextResponse
-import hmac
-import hashlib
-
-@app.get("/webhook/whatsapp", response_class=PlainTextResponse)
-async def verify_whatsapp(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_challenge: str = Query(None, alias="hub.challenge"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token")
-):
-    # Ensure this variable exactly matches the token in your Meta dashboard
-    MY_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
-    
-    if hub_mode == "subscribe" and hub_verify_token == MY_VERIFY_TOKEN:
-        # Returning this as PlainTextResponse ensures NO quotes are added
-        return hub_challenge
-    
-    raise HTTPException(status_code=403, detail="Verification failed")
-
-def verify_signature(payload: bytes, signature: str):
-    app_secret = os.getenv("FB_APP_SECRET")
-
-    expected = hmac.new(
-        app_secret.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(f"sha256={expected}", signature)
-
-@app.post("/webhook/whatsapp")
-async def handle_whatsapp_msg(request: Request, background_tasks: BackgroundTasks):
-    signature = request.headers.get("X-Hub-Signature-256")
-    body = await request.body()
-
-    if not signature or not verify_signature(body, signature):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    data = await request.json()
-
-    try:
-        if "entry" not in data:
-            return {"status": "ignored"}
-
-        entry = data["entry"][0]
-        changes = entry["changes"][0]
-        value = changes["value"]
-
-        if "messages" not in value:
-            return {"status": "ignored"}
-
-        message = value["messages"][0]
-        from_phone = message["from"]
-        text_body = message.get("text", {}).get("body")
-        phone_number_id = value["metadata"]["phone_number_id"]
-
-        if not text_body:
-            return {"status": "no_text"}
-
-        background_tasks.add_task(
-            process_whatsapp_rag,
-            phone_number_id,
-            from_phone,
-            text_body
-        )
-
-    except Exception as e:
-        print("Webhook error:", e)
-
-    return {"status": "received"}
-
-def process_whatsapp_rag(phone_number_id, from_phone, text_body):
-    try:
-        row = supabase.table("projects") \
-            .select("id") \
-            .eq("whatsapp_phone_number_id", phone_number_id) \
-            .execute()
-
-        if not row.data:
-            return
-
-        project_id = row.data[0]["id"]
-
-        result = run_chat(project_id, text_body, [])
-        answer = result["answer"]
-
-        send_whatsapp_message(phone_number_id, from_phone, answer)
-
-    except Exception as e:
-        print("Background task error:", e)
-
-def send_whatsapp_message(phone_number_id, to, message):
-    row = supabase.table("projects") \
-        .select("whatsapp_access_token") \
-        .eq("whatsapp_phone_number_id", phone_number_id) \
-        .execute()
-
-    if not row.data:
-        print("No token found")
-        return
-
-    access_token = row.data[0]["whatsapp_access_token"]
-
-    url = f"https://graph.facebook.com/v24.0/{phone_number_id}/messages"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "text": {"body": message}
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=10)
-    print("WhatsApp send:", r.status_code, r.text)
-
-@app.post("/whatsapp/onboard")
-async def onboard_whatsapp(req: dict):
-    code = req.get("code")
-    project_id = req.get("projectId")
-
-    if not code or not project_id:
-        raise HTTPException(status_code=400, detail="Missing code or projectId")
-
-    token_res = requests.get(
-        "https://graph.facebook.com/v24.0/oauth/access_token",
-        params={
-            "client_id": os.getenv("FB_APP_ID"),
-            "client_secret": os.getenv("FB_APP_SECRET"),
-            "code": code,
-        },
-    ).json()
-
-    access_token = token_res.get("access_token")
-    if not access_token:
-        raise HTTPException(status_code=500, detail=token_res)
-
-    # Get WABA
-    waba_res = requests.get(
-        "https://graph.facebook.com/v24.0/me",
-        params={
-            "fields": "whatsapp_business_accounts",
-            "access_token": access_token,
-        },
-    ).json()
-
-    waba_id = waba_res["whatsapp_business_accounts"]["data"][0]["id"]
-
-    # Subscribe app to WABA
-    requests.post(
-        f"https://graph.facebook.com/v24.0/{waba_id}/subscribed_apps",
-        params={"access_token": access_token}
-    )
-
-    # Get phone number
-    phone_res = requests.get(
-        f"https://graph.facebook.com/v24.0/{waba_id}/phone_numbers",
-        params={"access_token": access_token},
-    ).json()
-
-    phone_number_id = phone_res["data"][0]["id"]
-
-    supabase.table("projects").update({
-        "whatsapp_access_token": access_token,
-        "whatsapp_phone_number_id": phone_number_id
-    }).eq("id", project_id).execute()
-
-    return {"status": "connected"}
 
