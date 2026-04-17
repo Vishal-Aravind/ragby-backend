@@ -77,13 +77,13 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     projectId: str
+    chatId: str
     message: str
-    history: Optional[List[ChatMessage]] = []
+    
 
 class PublicChatRequest(BaseModel):
     projectId: str
     message: str
-    history: Optional[List[ChatMessage]] = []
 
 
 # -------------------------------------------------
@@ -112,6 +112,7 @@ def extract_excel(b):
 
 def extract_txt(b):
     return [(1, b.decode("utf-8", errors="ignore"))]
+    
 
 
 # -------------------------------------------------
@@ -173,152 +174,132 @@ def ingest(req: IngestRequest):
     return {"status": "indexed", "chunks_indexed": len(chunks)}
 
 
+def get_history(chat_id: str, limit: int = 5):
+    res = supabase.table("chat_messages") \
+        .select("role, content") \
+        .eq("chat_id", chat_id) \
+        .order("created_at", desc=True) \
+        .limit(limit) \
+        .execute()
+
+    return list(reversed(res.data)) if res.data else []
+
+def save_message(chat_id: str, role: str, content: str):
+    supabase.table("chat_messages").insert({
+        "chat_id": chat_id,
+        "role": role,
+        "content": content
+    }).execute()
+
 # -------------------------------------------------
-# STRICT CHAT (NO HALLUCINATION)
+# LOGIC FOR CHAT
 # -------------------------------------------------
+
 SYSTEM_PROMPT = (
-    "You are a helpful and friendly AI assistant.\n"
-    "Use ONLY the provided context to answer.\n\n"
+    "You are a helpful RAG AI assistant based on domain. Use ONLY the provided context and recent conversation if relevant. If user asks about you introduce yourself politely\n\n"
 
-    "Guidelines:\n"
-    "- Be natural, conversational, and clear\n"
-    "- Keep answers concise (max 3 sentences)\n"
-    "- Do not repeat the question\n\n"
+    "Style:\n"
+    "- Simple question → short answer\n"
+    "- Complex question → structured answer no formatting medium length\n"
+    "- Be concise, do not over-explain unless necessary\n\n"
 
-    "If answer is found:\n"
-    "- Respond confidently\n\n"
+    "Logic:\n"
+    "- One clear answer → answer directly\n"
+    "- Multiple answers → ask a clarification question briefly\n"
+    "- Partial info → answer + mention missing briefly\n"
+    "- No answer → say that you couldn't find the information and ask if they have more information briefly\n\n"
+    "- Match answer length to question complexity\n"
+    
+    "Formatting rules:\n"
+    "- Use bullet points ONLY when needed\n"
 
-    "If partially found:\n"
-    "- Share what is available\n"
-    "- Briefly mention what is missing\n\n"
-
-    "If NOT found:\n"
-    "- Say: \"I couldn’t find that in your documents.\"\n"
-    "- Suggest asking more specifically if helpful\n\n"
-
-    "Strict rules:\n"
+    "Rules:\n"
     "- No hallucination\n"
     "- No external knowledge"
+    "- You will be feeded with previous conversation history also, take context from their if needed "
 )
-
 
 # -------------------------------
 # Lightweight intent detection
 # -------------------------------
 def classify_intent(message: str) -> str:
     msg = message.lower().strip()
-
     words = msg.split()
 
-    # -------------------------------
-    # 1. Greeting (ONLY short messages)
-    # -------------------------------
     if len(words) <= 3 and msg in ["hi", "hello", "hey", "hi there", "hello there"]:
         return "greeting"
 
-    # -------------------------------
-    # 2. Thanks (ONLY short messages)
-    # -------------------------------
     if len(words) <= 4 and any(w in msg for w in ["thanks", "thank you", "thx"]):
         return "thanks"
 
-    # -------------------------------
-    # 3. Conversational (memory-type)
-    # -------------------------------
     if any(k in msg for k in [
         "earlier", "previous", "you said", "we talked",
         "last message", "first question"
     ]):
         return "conversational"
 
-    # -------------------------------
-    # 4. Everything else = RAG
-    # -------------------------------
     return "document_query"
 
+def get_project_domain(project_id: str):
+    res = supabase.table("projects") \
+        .select("domain") \
+        .eq("id", project_id) \
+        .single() \
+        .execute()
 
-def generate_clarification(context, question):
-    prompt = f"""
-The user asked: "{question}"
+    if res.data:
+        return res.data.get("domain")
 
-The context contains multiple possible answers.
+    return None
 
-Ask a short clarification question to help the user choose.
-
-Context:
-{context}
-
-Return ONLY the question.
-"""
-
-    res = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return res.choices[0].message.content.strip()
-
-# -------------------------------------------------
-# Decide if ambiguous
-# -------------------------------------------------
-def check_ambiguity(context, question):
-    prompt = f"""
-You are an assistant.
-
-Question: "{question}"
-
-Context:
-{context}
-
-Determine:
-- If there is ONE clear answer → respond: CLEAR
-- If there are MULTIPLE possible answers → respond: AMBIGUOUS
-
-Return ONLY one word.
-"""
-
-    res = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    return res.choices[0].message.content.strip()
 
 # -------------------------------
-# Main Chat Function
+# Main Chat Function 
 # -------------------------------
-def run_chat(project_id: str, message: str, history: List[ChatMessage]):
+def run_chat(project_id: str, chat_id: str, message: str, history):
     try:
+        history = history or []
+        domain = get_project_domain(project_id)
+
+        system_prompt = SYSTEM_PROMPT
+
+        if domain:
+            system_prompt += f"\n\nDomain:\n- You are specialized in {domain}."
+
         intent = classify_intent(message)
 
         # -------------------------------
         # 1. Greeting
         # -------------------------------
         if intent == "greeting":
-            return {
-                "answer": "Hey! 👋 What can I help you with?",
-                "sources": []
-            }
+            answer = "Hey! 👋 What can I help you with?"
+            save_message(chat_id, "assistant", answer)
+
+            return {"answer": answer, "sources": []}
+
+        # save user message
+        save_message(chat_id, "user", message)
 
         # -------------------------------
         # 2. Thanks
         # -------------------------------
         if intent == "thanks":
-            return {
-                "answer": "You're welcome! 😊 Let me know if you need anything else.",
-                "sources": []
-            }
+            answer = "You're welcome! 😊"
+            save_message(chat_id, "assistant", answer)
+
+            return {"answer": answer, "sources": []}
 
         # -------------------------------
-        # 3. Conversational (NO RAG)
+        # 3. Conversational
         # -------------------------------
         if intent == "conversational":
-            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            messages = [{"role": "system", "content": system_prompt}]
 
-            for h in history:
-                messages.append({"role": h.role, "content": h.content})
+            for h in history[-7:]:
+                messages.append({
+                    "role": h["role"],
+                    "content": h["content"]
+                })
 
             messages.append({"role": "user", "content": message})
 
@@ -326,23 +307,31 @@ def run_chat(project_id: str, message: str, history: List[ChatMessage]):
                 model="gpt-4o-mini",
                 messages=messages,
                 temperature=0.3,
-                max_tokens=120,
+                max_tokens=500,
             )
 
-            return {
-                "answer": completion.choices[0].message.content.strip(),
-                "sources": []
-            }
+            answer = completion.choices[0].message.content.strip()
+
+            save_message(chat_id, "assistant", answer)
+
+            return {"answer": answer, "sources": []}
 
         # -------------------------------
         # 4. RAG Retrieval
         # -------------------------------
-        q = embeddings.embed_query(message)
+        query_for_embedding = message
+
+        if len(message.split()) <= 4 and history:
+            last_user_msgs = [m for m in history if m["role"] == "user"]
+            if last_user_msgs:
+                query_for_embedding = last_user_msgs[-1]["content"] + " " + message
+
+        q = embeddings.embed_query(query_for_embedding)
 
         res = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             query=q,
-            limit=5,
+            limit=7,
             query_filter=models.Filter(
                 must=[models.FieldCondition(
                     key="project_id",
@@ -353,89 +342,55 @@ def run_chat(project_id: str, message: str, history: List[ChatMessage]):
 
         hits = res.points
 
-        # -------------------------------
-        # 5. No results
-        # -------------------------------
         if not hits:
-            return {
-                "answer": "I couldn’t find that in your documents. Try asking more specifically or upload related content.",
-                "sources": []
-            }
+            answer = "I couldn’t find that in your documents."
+            save_message(chat_id, "assistant", answer)
 
-        # -------------------------------
-        # 6. Build context
-        # -------------------------------
+            return {"answer": answer, "sources": []}
+
         context = "\n\n---\n\n".join(
-            h.payload.get("text", "") for h in hits
+            f"{h.payload.get('text', '')}"
+            for h in hits
         )
 
-        # -------------------------------
-        # 7. 🔥 LLM Ambiguity Check (FIXED)
-        # -------------------------------
-        ambiguity_check_prompt = f"""
-Question: "{message}"
+        messages = [{"role": "system", "content": system_prompt}]
 
-Context:
-{context}
+        for h in history[-7:]:
+            messages.append({
+                "role": h["role"],
+                "content": h["content"]
+            })
 
-Check carefully:
-
-- If the question can have MORE THAN ONE valid answer from the context (e.g., multiple companies, multiple packages, multiple values), respond: AMBIGUOUS
-- If there is ONLY ONE correct answer, respond: CLEAR
-
-Important:
-Even if one answer seems more prominent, if another valid answer exists, it is AMBIGUOUS.
-
-Return ONLY:
-CLEAR or AMBIGUOUS
-"""
-
-        decision_res = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": ambiguity_check_prompt}],
-            temperature=0
-        )
-
-        decision = decision_res.choices[0].message.content.strip()
-
-        # -------------------------------
-        # 8. If ambiguous → ask clarification
-        # -------------------------------
-        if decision == "AMBIGUOUS":
-            return {
-                "answer": generate_clarification(context, message),
-                "sources": []
-            }
-
-        # -------------------------------
-        # 9. Normal Answer (CLEAR case)
-        # -------------------------------
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        for h in history:
-            messages.append({"role": h.role, "content": h.content})
-
+        # ✅ Add current query WITH context
         messages.append({
             "role": "user",
-            "content": f"Context:\n{context}\n\nQuestion:\n{message}"
+            "content": f"""
+        Context:
+        {context}
+
+        Question:
+        {message}
+        """
         })
+
+        import json
+
+        print("\n================ LLM INPUT ================\n")
+        print(json.dumps(messages, indent=2))
+        print("\n===========================================\n")
 
         completion = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
             temperature=0.2,
-            max_tokens=120,
+            max_tokens=300,
         )
 
         answer = completion.choices[0].message.content.strip()
 
-        if answer and not answer.endswith((".", "!", "?")):
-            answer += "."
+        save_message(chat_id, "assistant", answer)
 
-        return {
-            "answer": answer,
-            "sources": []
-        }
+        return {"answer": answer, "sources": []}
 
     except Exception as e:
         print(f"ERROR IN RUN_CHAT: {str(e)}")
@@ -443,12 +398,15 @@ CLEAR or AMBIGUOUS
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    return run_chat(req.projectId, req.message, req.history)
+    history = get_history(req.chatId, limit=7)
+    return run_chat(req.projectId, req.chatId, req.message, history)
 
 
 @app.post("/public/chat")
 def public_chat(req: PublicChatRequest):
-    return run_chat(req.projectId, req.message, req.history)
+    chat_id = str(uuid.uuid4())  # or session-based ID
+    history = []
+    return run_chat(req.projectId, chat_id, req.message, history)
 
 
 # -------------------------------------------------
@@ -472,4 +430,5 @@ def delete_document(file_id: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 

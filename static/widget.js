@@ -6,24 +6,19 @@
   if (!projectId) return;
 
   const apiBase = new URL(script.src).origin;
-  const CHAT_TTL = 30 * 60 * 1000;
+
+  // ✅ session-based userId (IMPORTANT)
+  let userId = localStorage.getItem("rag_user_id");
+  if (!userId) {
+    userId = crypto.randomUUID();
+    localStorage.setItem("rag_user_id", userId);
+  }
 
   let lead = JSON.parse(localStorage.getItem("chat_lead") || "null");
   let awaitingLead = false;
   let pendingQuestion = null;
 
-  const storedChat = JSON.parse(localStorage.getItem("chat_session") || "null");
-  const history =
-    storedChat && Date.now() - storedChat.ts < CHAT_TTL
-      ? storedChat.history
-      : [];
-
-  function persistChat() {
-    localStorage.setItem(
-      "chat_session",
-      JSON.stringify({ ts: Date.now(), history })
-    );
-  }
+  const history = []; // only for UI
 
   function render(text) {
     return (text || "")
@@ -31,33 +26,6 @@
       .replace(/>/g, "&gt;")
       .replace(/\n/g, "<br/>");
   }
-
-  // ---------------- CSS (typing dots) ----------------
-  const style = document.createElement("style");
-  style.innerHTML = `
-    .typing {
-      display:inline-flex;
-      gap:4px;
-      padding:8px 10px;
-      background:#f4f4f5;
-      border-radius:8px;
-    }
-    .typing span {
-      width:6px;
-      height:6px;
-      background:#888;
-      border-radius:50%;
-      animation: blink 1.4s infinite both;
-    }
-    .typing span:nth-child(2){animation-delay:.2s}
-    .typing span:nth-child(3){animation-delay:.4s}
-    @keyframes blink {
-      0%{opacity:.2}
-      20%{opacity:1}
-      100%{opacity:.2}
-    }
-  `;
-  document.head.appendChild(style);
 
   // ---------------- UI ----------------
   const btn = document.createElement("div");
@@ -78,6 +46,7 @@
     display:none;flex-direction:column;z-index:999999;
     font-family:system-ui;
   `;
+
   box.innerHTML = `
     <div style="padding:12px;border-bottom:1px solid #eee;font-weight:600">
       Ask us
@@ -117,19 +86,11 @@
     `;
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
-    return el;
   }
-
-  history.forEach((m) => addMsg(m.role, render(m.content)));
 
   function showTyping() {
     const el = document.createElement("div");
-    el.style.marginBottom = "10px";
-    el.innerHTML = `
-      <div class="typing">
-        <span></span><span></span><span></span>
-      </div>
-    `;
+    el.innerText = "...";
     msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
     return el;
@@ -140,16 +101,20 @@
 
     const res = await fetch(`${apiBase}/public/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId, message: question, history }),
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        projectId,
+        message: question,
+        userId   // ✅ FIXED
+      }),
     });
 
     const data = await res.json();
     typing.remove();
 
     addMsg("assistant", render(data.answer || ""));
-    history.push({ role: "assistant", content: data.answer || "" });
-    persistChat();
   }
 
   function showLeadForm() {
@@ -204,18 +169,17 @@
     };
   }
 
-  // ---------------- CHAT ----------------
   form.onsubmit = async (e) => {
     e.preventDefault();
+
     const text = input.value.trim();
     if (!text || awaitingLead) return;
+
     input.value = "";
 
     addMsg("user", render(text));
-    history.push({ role: "user", content: text });
-    persistChat();
 
-    const userCount = history.filter((h) => h.role === "user").length;
+    const userCount = history.filter((h) => h.role === "user").length + 1;
 
     if (!lead && userCount === 2) {
       pendingQuestion = text;
