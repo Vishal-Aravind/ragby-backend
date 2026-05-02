@@ -1,11 +1,13 @@
 import os
 import io
 import uuid
-from fastapi import Query
+from fastapi import Query, Depends, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -24,6 +26,12 @@ from fastapi.staticfiles import StaticFiles
 import requests
 from qdrant_client import QdrantClient, models
 
+from sources.gsheets import sync_sheet
+from sources.postgres import run_text_to_sql, introspect_schema, validate_url
+from sources.excel import sync_excel_url, sync_excel_bytes
+from sources.website import sync_website
+
+import sqlalchemy
 
 # -------------------------------------------------
 # ENV & CLIENTS
@@ -36,6 +44,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")  # FIX: lock down CORS origin
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
 
@@ -56,11 +66,33 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    # FIX: Restrict CORS to your frontend origin instead of wildcard
+    allow_origins=[FRONTEND_URL],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# -------------------------------------------------
+# AUTH
+# -------------------------------------------------
+bearer_scheme = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)):
+    """
+    FIX: Verify the Supabase JWT on every protected endpoint.
+    Uses Supabase's get_user() which validates the token server-side.
+    Returns the user object so endpoints can use user.id if needed.
+    """
+    token = credentials.credentials
+    try:
+        user_response = supabase.auth.get_user(token)
+        if not user_response or not user_response.user:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        return user_response.user
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
 # -------------------------------------------------
@@ -79,17 +111,18 @@ class ChatRequest(BaseModel):
     projectId: str
     chatId: str
     message: str
-    
 
 class PublicChatRequest(BaseModel):
     projectId: str
     message: str
+    # FIX: Accept an optional sessionId so public chat can maintain history across turns
+    sessionId: Optional[str] = None
 
 
 # -------------------------------------------------
 # TEXT EXTRACTORS
 # -------------------------------------------------
-def extract_pdf(b): 
+def extract_pdf(b):
     with pdfplumber.open(io.BytesIO(b)) as pdf:
         return [(i+1, p.extract_text() or "") for i, p in enumerate(pdf.pages) if p.extract_text()]
 
@@ -112,14 +145,14 @@ def extract_excel(b):
 
 def extract_txt(b):
     return [(1, b.decode("utf-8", errors="ignore"))]
-    
 
 
 # -------------------------------------------------
 # INGEST
+# FIX: Protected with verify_token — only authenticated users can ingest
 # -------------------------------------------------
 @app.post("/ingest")
-def ingest(req: IngestRequest):
+def ingest(req: IngestRequest, user=Depends(verify_token)):
     row = supabase.table("files").select("id").eq("project_id", req.projectId).eq("filename", req.filename).execute()
     if not row.data:
         return {"error": "file not found"}
@@ -130,7 +163,7 @@ def ingest(req: IngestRequest):
     b = supabase.storage.from_("documents").download(req.filePath)
     ext = req.filename.lower().split(".")[-1]
 
-    units = {
+    extractor = {
         "pdf": extract_pdf,
         "docx": extract_docx,
         "ppt": extract_pptx,
@@ -140,13 +173,14 @@ def ingest(req: IngestRequest):
         "txt": extract_txt,
     }.get(ext)
 
-    if not units:
+    if not extractor:
+        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
         return {"error": "unsupported file type"}
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     chunks, metas = [], []
 
-    for page, text in units(b):
+    for page, text in extractor(b):
         for c in splitter.split_text(text):
             chunks.append(c)
             metas.append({
@@ -154,6 +188,7 @@ def ingest(req: IngestRequest):
                 "file_id": file_id,
                 "filename": req.filename,
                 "page_number": page,
+                "source_type": "document",  # ADD THIS
                 "text": c,
             })
 
@@ -174,14 +209,16 @@ def ingest(req: IngestRequest):
     return {"status": "indexed", "chunks_indexed": len(chunks)}
 
 
-def get_history(chat_id: str, limit: int = 5):
+# -------------------------------------------------
+# CHAT HISTORY HELPERS
+# -------------------------------------------------
+def get_history(chat_id: str, limit: int = 7):
     res = supabase.table("chat_messages") \
         .select("role, content") \
         .eq("chat_id", chat_id) \
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
-
     return list(reversed(res.data)) if res.data else []
 
 def save_message(chat_id: str, role: str, content: str):
@@ -192,41 +229,13 @@ def save_message(chat_id: str, role: str, content: str):
     }).execute()
 
 # -------------------------------------------------
-# LOGIC FOR CHAT
+# INTENT DETECTION
 # -------------------------------------------------
-
-SYSTEM_PROMPT = (
-    "You are a helpful RAG AI assistant based on domain. Use ONLY the provided context and recent conversation if relevant. If user asks about you introduce yourself politely\n\n"
-
-    "Style:\n"
-    "- Simple question → short answer\n"
-    "- Complex question → structured answer no formatting medium length\n"
-    "- Be concise, do not over-explain unless necessary\n\n"
-
-    "Logic:\n"
-    "- One clear answer → answer directly\n"
-    "- Multiple answers → ask a clarification question briefly\n"
-    "- Partial info → answer + mention missing briefly\n"
-    "- No answer → say that you couldn't find the information and ask if they have more information briefly\n\n"
-    "- Match answer length to question complexity\n"
-    
-    "Formatting rules:\n"
-    "- Use bullet points ONLY when needed\n"
-
-    "Rules:\n"
-    "- No hallucination\n"
-    "- No external knowledge"
-    "- You will be feeded with previous conversation history also, take context from their if needed "
-)
-
-# -------------------------------
-# Lightweight intent detection
-# -------------------------------
 def classify_intent(message: str) -> str:
     msg = message.lower().strip()
     words = msg.split()
 
-    if len(words) <= 3 and msg in ["hi", "hello", "hey", "hi there", "hello there"]:
+    if len(words) <= 3 and msg in {"hi", "hello", "hey", "hi there", "hello there"}:
         return "greeting"
 
     if len(words) <= 4 and any(w in msg for w in ["thanks", "thank you", "thx"]):
@@ -240,67 +249,114 @@ def classify_intent(message: str) -> str:
 
     return "document_query"
 
+
 def get_project_domain(project_id: str):
     res = supabase.table("projects") \
         .select("domain") \
         .eq("id", project_id) \
         .single() \
         .execute()
-
-    if res.data:
-        return res.data.get("domain")
-
-    return None
+    return res.data.get("domain") if res.data else None
 
 
-# -------------------------------
-# Main Chat Function 
-# -------------------------------
-def run_chat(project_id: str, chat_id: str, message: str, history):
+# -------------------------------------------------
+# SOURCE INTENT CLASSIFIER
+# -------------------------------------------------
+def classify_source_intent(message: str) -> str:
+    """
+    Classifies whether the question is looking up a specific record (structured)
+    or asking about a concept/process (conceptual).
+    structured → search gsheets/postgres
+    conceptual → search documents
+    """
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "user",
+            "content": f"""Classify this question as either 'structured' or 'conceptual'.
+
+'structured' = looking up a specific record, person, value, date, status, or list
+Examples: "what are John's remarks", "show sales for March", "find order status for ID 123", "list all employees"
+
+'conceptual' = asking about a process, policy, explanation, or general knowledge
+Examples: "how does the refund process work", "what is the leave policy", "explain the onboarding steps"
+
+Question: {message}
+Reply with only one word: structured or conceptual"""
+        }],
+        temperature=0,
+        max_tokens=10,
+    )
+    result = resp.choices[0].message.content.strip().lower()
+    # Safety fallback — if LLM returns something unexpected, default to conceptual
+    return result if result in ("structured", "conceptual") else "conceptual"
+
+
+# -------------------------------------------------
+# SYSTEM PROMPT
+# -------------------------------------------------
+SYSTEM_PROMPT = (
+    "You are a helpful RAG AI assistant. Use ONLY the provided context and recent conversation if relevant. "
+    "If the user asks about you, introduce yourself politely.\n\n"
+
+    "Context source guidance:\n"
+    "- Context chunks labeled [Source: gsheets] or [Source: database] contain structured data like records, names, values, dates.\n"
+    "- Context chunks labeled [Source: document] contain policies, procedures, or explanatory content.\n"
+    "- Always prefer the source that best matches the question type.\n\n"
+
+    "Style:\n"
+    "- Simple question → short answer\n"
+    "- Complex question → structured answer, no heavy formatting, medium length\n"
+    "- Be concise, do not over-explain unless necessary\n\n"
+    "- Pricing/packages/plans questions → always list ALL options, never just one\n"
+
+    "Logic:\n"
+    "- One clear answer → answer directly\n"
+    "- Multiple answers → ask a clarification question briefly\n"
+    "- Partial info → answer + mention missing briefly\n"
+    "- No answer → say you couldn't find the information and ask if they have more details\n"
+    "- Match answer length to question complexity\n\n"
+
+    "Formatting rules:\n"
+    "- Use bullet points ONLY when needed\n\n"
+
+    "Rules:\n"
+    "- No hallucination\n"
+    "- No external knowledge\n"
+    "- Use previous conversation history for context when relevant"
+)
+
+
+# -------------------------------------------------
+# CORE CHAT LOGIC
+# -------------------------------------------------
+def run_chat(project_id: str, chat_id: str, message: str, history: list):
     try:
         history = history or []
         domain = get_project_domain(project_id)
 
         system_prompt = SYSTEM_PROMPT
-
         if domain:
             system_prompt += f"\n\nDomain:\n- You are specialized in {domain}."
 
         intent = classify_intent(message)
 
-        # -------------------------------
         # 1. Greeting
-        # -------------------------------
         if intent == "greeting":
-            answer = "Hey! 👋 What can I help you with?"
-            save_message(chat_id, "assistant", answer)
+            return {"answer": "Hey! 👋 What can I help you with?", "sources": []}
 
-            return {"answer": answer, "sources": []}
+        # 2. Thanks
+        if intent == "thanks":
+            return {"answer": "You're welcome! 😊", "sources": []}
 
-        # save user message
+        # Save user message for all real intents
         save_message(chat_id, "user", message)
 
-        # -------------------------------
-        # 2. Thanks
-        # -------------------------------
-        if intent == "thanks":
-            answer = "You're welcome! 😊"
-            save_message(chat_id, "assistant", answer)
-
-            return {"answer": answer, "sources": []}
-
-        # -------------------------------
-        # 3. Conversational
-        # -------------------------------
+        # 3. Conversational — history only, no retrieval needed
         if intent == "conversational":
             messages = [{"role": "system", "content": system_prompt}]
-
             for h in history[-7:]:
-                messages.append({
-                    "role": h["role"],
-                    "content": h["content"]
-                })
-
+                messages.append({"role": h["role"], "content": h["content"]})
             messages.append({"role": "user", "content": message})
 
             completion = openai_client.chat.completions.create(
@@ -309,18 +365,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history):
                 temperature=0.3,
                 max_tokens=500,
             )
-
             answer = completion.choices[0].message.content.strip()
-
             save_message(chat_id, "assistant", answer)
-
             return {"answer": answer, "sources": []}
 
-        # -------------------------------
-        # 4. RAG Retrieval
-        # -------------------------------
-        query_for_embedding = message
+        # 4. Classify source intent — structured (sheet/db) or conceptual (docs)
+        source_intent = classify_source_intent(message)
 
+        # Expand short queries with last user message for better recall
+        query_for_embedding = message
         if len(message.split()) <= 4 and history:
             last_user_msgs = [m for m in history if m["role"] == "user"]
             if last_user_msgs:
@@ -328,56 +381,86 @@ def run_chat(project_id: str, chat_id: str, message: str, history):
 
         q = embeddings.embed_query(query_for_embedding)
 
-        res = qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=q,
-            limit=7,
-            query_filter=models.Filter(
-                must=[models.FieldCondition(
-                    key="project_id",
-                    match=models.MatchValue(value=project_id)
-                )]
+        context = None
+
+        # -------------------------------------------------
+        # 5. Route to correct source based on intent
+        # -------------------------------------------------
+        if source_intent == "structured":
+            # Try gsheets chunks in Qdrant first
+            res = qdrant.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=q,
+                limit=7,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
+                        models.FieldCondition(key="source_type", match=models.MatchAny(any=["gsheets", "excel"])),
+                    ]
+                )
             )
-        )
+            hits = res.points
 
-        hits = res.points
+            if hits:
+                context = "\n\n---\n\n".join(
+                    f"[Source: gsheets]\n{h.payload.get('text', '')}" for h in hits
+                )
+            else:
+                # Fallback: try postgres text-to-SQL
+                pg_source = supabase.table("data_sources") \
+                    .select("config, allowed_schema") \
+                    .eq("project_id", project_id) \
+                    .eq("type", "postgres") \
+                    .limit(1) \
+                    .execute()
 
-        if not hits:
-            answer = "I couldn’t find that in your documents."
+                if pg_source.data:
+                    db_url = pg_source.data[0]["config"]["url"]
+                    allowed_schema = pg_source.data[0].get("allowed_schema")
+                    sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
+                    context = f"[Source: database]\n{sql_result}"
+                else:
+                    # No structured source found — fall through to document search
+                    source_intent = "conceptual"
+
+        if source_intent == "conceptual":
+            # Search document chunks only
+            res = qdrant.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=q,
+                limit=7,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
+                        models. models.FieldCondition(key="source_type", match=models.MatchAny(any=["document", "website"])),
+                    ]
+                )
+            )
+            hits = res.points
+
+            if hits:
+                context = "\n\n---\n\n".join(
+                    f"[Source: document]\n{h.payload.get('text', '')}" for h in hits
+                )
+
+        # -------------------------------------------------
+        # 6. If nothing found anywhere, give up cleanly
+        # -------------------------------------------------
+        if not context:
+            answer = "I couldn't find that in your documents or data sources."
             save_message(chat_id, "assistant", answer)
-
             return {"answer": answer, "sources": []}
 
-        context = "\n\n---\n\n".join(
-            f"{h.payload.get('text', '')}"
-            for h in hits
-        )
-
+        # -------------------------------------------------
+        # 7. Build LLM messages and generate answer
+        # -------------------------------------------------
         messages = [{"role": "system", "content": system_prompt}]
-
         for h in history[-7:]:
-            messages.append({
-                "role": h["role"],
-                "content": h["content"]
-            })
-
-        # ✅ Add current query WITH context
+            messages.append({"role": h["role"], "content": h["content"]})
         messages.append({
             "role": "user",
-            "content": f"""
-        Context:
-        {context}
-
-        Question:
-        {message}
-        """
+            "content": f"Context:\n{context}\n\nQuestion:\n{message}"
         })
-
-        import json
-
-        print("\n================ LLM INPUT ================\n")
-        print(json.dumps(messages, indent=2))
-        print("\n===========================================\n")
 
         completion = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -387,33 +470,63 @@ def run_chat(project_id: str, chat_id: str, message: str, history):
         )
 
         answer = completion.choices[0].message.content.strip()
-
         save_message(chat_id, "assistant", answer)
-
         return {"answer": answer, "sources": []}
 
     except Exception as e:
         print(f"ERROR IN RUN_CHAT: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# -------------------------------------------------
+# INGEST — make sure source_type: "document" is set
+# (update your existing ingest endpoint's metas to include this)
+# -------------------------------------------------
+# metas.append({
+#     "project_id": req.projectId,
+#     "file_id": file_id,
+#     "filename": req.filename,
+#     "page_number": page,
+#     "source_type": "document",   <-- ADD THIS LINE
+#     "text": c,
+# })
+
+
+# -------------------------------------------------
+# CHAT ENDPOINTS
+# FIX: /chat is protected with verify_token
+# -------------------------------------------------
 @app.post("/chat")
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, user=Depends(verify_token)):
     history = get_history(req.chatId, limit=7)
     return run_chat(req.projectId, req.chatId, req.message, history)
 
-
 @app.post("/public/chat")
 def public_chat(req: PublicChatRequest):
-    chat_id = str(uuid.uuid4())  # or session-based ID
-    history = []
-    return run_chat(req.projectId, chat_id, req.message, history)
+    session_id = req.sessionId or str(uuid.uuid4())
+    
+    # FIX: ensure a chat record exists for this session
+    # so chat_messages foreign key constraint doesn't fail
+    existing = supabase.table("chats").select("id").eq("id", session_id).execute()
+    if not existing.data:
+        supabase.table("chats").insert({
+            "id": session_id,
+            "project_id": req.projectId,
+            "title": "Public Chat",
+            "channel": "public",
+        }).execute()
 
+    history = get_history(session_id, limit=7) if req.sessionId else []
+    result = run_chat(req.projectId, session_id, req.message, history)
+    result["sessionId"] = session_id
+    return result
 
 # -------------------------------------------------
 # DELETE DOCUMENT
+# FIX: Protected with verify_token
 # -------------------------------------------------
 @app.delete("/document/{file_id}")
-def delete_document(file_id: str):
+def delete_document(file_id: str, user=Depends(verify_token)):
     qdrant.delete(
         collection_name=QDRANT_COLLECTION,
         points_selector=models.Filter(
@@ -432,13 +545,16 @@ def health():
     return {"status": "ok"}
 
 
+# -------------------------------------------------
+# WHATSAPP
+# -------------------------------------------------
 @app.post("/whatsapp/onboard")
-def whatsapp_onboard(data: dict):
+def whatsapp_onboard(data: dict, user=Depends(verify_token)):
+    # FIX: Protected — only authenticated users can connect WhatsApp
     code = data["code"]
     project_id = data["projectId"]
 
     url = "https://graph.facebook.com/v19.0/oauth/access_token"
-
     params = {
         "client_id": os.getenv("META_APP_ID"),
         "client_secret": os.getenv("META_APP_SECRET"),
@@ -447,10 +563,8 @@ def whatsapp_onboard(data: dict):
 
     res = requests.get(url, params=params)
     token_data = res.json()
-
     access_token = token_data.get("access_token")
 
-    # TEMP store token (update later when metadata arrives)
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
         "access_token": access_token
@@ -458,17 +572,18 @@ def whatsapp_onboard(data: dict):
 
     return {"success": True}
 
-@app.post("/whatsapp/save-metadata")
-def save_metadata(data: dict):
-    project_id = data["projectId"]
 
+@app.post("/whatsapp/save-metadata")
+def save_metadata(data: dict, user=Depends(verify_token)):
+    # FIX: Protected
+    project_id = data["projectId"]
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
         "phone_number_id": data["phone_number_id"],
         "waba_id": data["waba_id"]
     }).execute()
-
     return {"success": True}
+
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(req: Request):
@@ -482,7 +597,6 @@ async def whatsapp_webhook(req: Request):
 
         msg = value["messages"][0]
 
-        # ignore non-text
         if msg.get("type") != "text":
             return {"status": "ignored"}
 
@@ -490,9 +604,7 @@ async def whatsapp_webhook(req: Request):
         text = msg["text"]["body"]
         phone_number_id = value["metadata"]["phone_number_id"]
 
-        # -------------------------------
-        # 1. Get project
-        # -------------------------------
+        # Get project + token
         res = supabase.table("whatsapp_integrations") \
             .select("project_id, access_token") \
             .eq("phone_number_id", phone_number_id) \
@@ -505,9 +617,7 @@ async def whatsapp_webhook(req: Request):
         project_id = res.data["project_id"]
         access_token = res.data["access_token"]
 
-        # -------------------------------
-        # 2. Get or create chat
-        # -------------------------------
+        # Get or create chat session for this phone number
         chat = supabase.table("chats") \
             .select("id") \
             .eq("project_id", project_id) \
@@ -525,33 +635,24 @@ async def whatsapp_webhook(req: Request):
                 "channel": "whatsapp",
                 "title": f"WhatsApp {phone}"
             }).execute()
-
             chat_id = new_chat.data[0]["id"]
 
-        # -------------------------------
-        # 3. Memory + RAG
-        # -------------------------------
+        # Memory + RAG
         history = get_history(chat_id, 5)
         result = run_chat(project_id, chat_id, text, history)
-
         answer = result["answer"]
 
-        # -------------------------------
-        # 4. Send reply
-        # -------------------------------
+        # Send reply
         url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json"
         }
-
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,
             "text": {"body": answer}
         }
-
         requests.post(url, headers=headers, json=payload)
 
         return {"status": "ok"}
@@ -560,8 +661,170 @@ async def whatsapp_webhook(req: Request):
         print("ERROR:", e)
         return {"status": "error"}
 
+
 @app.get("/webhook/whatsapp")
-def verify(mode: str = Query(...), challenge: str = Query(...), verify_token: str = Query(...)):
-    if verify_token == os.getenv("VERIFY_TOKEN"):
+def verify(
+    mode: str = Query(...),
+    challenge: str = Query(...),
+    verify_token: str = Query(...)
+):
+    # FIX: Use the env var loaded at startup instead of re-reading each time
+    if verify_token == VERIFY_TOKEN:
         return challenge
-    return "error"
+    raise HTTPException(status_code=403, detail="Invalid verify token")
+
+@app.get("/sources")
+def list_sources(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("data_sources") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .execute()
+
+    return res.data
+
+@app.post("/sources/add")
+def add_source(data: dict, user=Depends(verify_token)):
+    res = supabase.table("data_sources").insert({
+        "project_id": data["projectId"],
+        "type": data["type"],
+        "label": data.get("label") or data["type"],
+        "config": data["config"],
+        "allowed_schema": data.get("allowed_schema"),
+    }).execute()
+    source = res.data[0]
+ 
+    skipped_tabs = []
+ 
+    if data["type"] == "gsheets":
+        cfg = data["config"]
+        result = sync_sheet(
+            cfg["sheet_id"], cfg["range"], data["projectId"],
+            source["id"], qdrant, embeddings, QDRANT_COLLECTION
+        )
+        skipped_tabs = result.get("skipped_tabs", [])
+ 
+    elif data["type"] == "excel_online":
+        cfg = data["config"]
+        sync_excel_url(
+            cfg["url"], data["projectId"],
+            source["id"], qdrant, embeddings, QDRANT_COLLECTION
+        )
+ 
+    elif data["type"] == "website":
+        cfg = data["config"]
+        result = sync_website(
+            url=cfg["url"],
+            project_id=data["projectId"],
+            source_id=source["id"],
+            qdrant=qdrant,
+            embeddings=embeddings,
+            collection=QDRANT_COLLECTION,
+            full_site=cfg.get("full_site", True),
+            max_pages=cfg.get("max_pages", 50),
+        )
+        # FIX: if nothing was indexed, delete the source record and tell the user
+        if result["pages_indexed"] == 0:
+            supabase.table("data_sources").delete().eq("id", source["id"]).execute()
+            raise HTTPException(
+                status_code=400,
+                detail="Could not crawl this website. It may be blocking automated access (anti-bot protection). Try a different website or contact the site owner."
+            )
+ 
+    return {"id": source["id"], "skipped_tabs": skipped_tabs}
+
+@app.delete("/sources/{source_id}")
+def delete_source(source_id: str, user=Depends(verify_token)):
+    qdrant.delete(collection_name=QDRANT_COLLECTION, points_selector=models.Filter(
+        must=[models.FieldCondition(key="source_id", match=models.MatchValue(value=source_id))]
+    ))
+    supabase.table("data_sources").delete().eq("id", source_id).execute()
+    return {"status": "deleted"}
+
+@app.post("/sources/sync/{source_id}")
+def resync_source(source_id: str, user=Depends(verify_token)):
+    res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
+    s = res.data
+ 
+    qdrant.delete(
+        collection_name=QDRANT_COLLECTION,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="source_id",
+                match=models.MatchValue(value=source_id)
+            )]
+        )
+    )
+ 
+    if s["type"] == "gsheets":
+        cfg = s["config"]
+        sync_sheet(
+            cfg["sheet_id"], cfg["range"],
+            s["project_id"], source_id,
+            qdrant, embeddings, QDRANT_COLLECTION
+        )
+    elif s["type"] == "excel_online":
+        cfg = s["config"]
+        sync_excel_url(
+            cfg["url"], s["project_id"],
+            source_id, qdrant, embeddings, QDRANT_COLLECTION
+        )
+    elif s["type"] == "website":
+        cfg = s["config"]
+        sync_website(
+            url=cfg["url"],
+            project_id=s["project_id"],
+            source_id=source_id,
+            qdrant=qdrant,
+            embeddings=embeddings,
+            collection=QDRANT_COLLECTION,
+            full_site=cfg.get("full_site", True),
+            max_pages=cfg.get("max_pages", 50),
+        )
+ 
+    return {"status": "synced"}
+
+@app.post("/sources/introspect")
+def introspect(data: dict, user=Depends(verify_token)):
+    db_url = data.get("db_url", "")
+    try:
+        validate_url(db_url)
+        schema = introspect_schema(db_url)
+        return {"schema": schema}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not connect: {str(e)}")
+
+@app.post("/sources/upload-excel")
+async def upload_excel(
+    file: UploadFile = File(...),
+    projectId: str = Form(...),
+    label: str = Form(""),
+    source_id: str = Form(""),   # optional — if provided, overwrite this source
+    user=Depends(verify_token)
+):
+    file_bytes = await file.read()
+
+    if source_id:
+        # Overwrite existing source — delete old Qdrant points and reuse record
+        s = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
+        sync_excel_bytes(file_bytes, projectId, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+        supabase.table("data_sources").update({
+            "config": {"filename": file.filename},
+            "label": label or file.filename,
+        }).eq("id", source_id).execute()
+        return {"id": source_id, "filename": file.filename}
+
+    # New source
+    res = supabase.table("data_sources").insert({
+        "project_id": projectId,
+        "type": "excel_local",
+        "label": label or file.filename,
+        "config": {"filename": file.filename},
+        "allowed_schema": None,
+    }).execute()
+    source = res.data[0]
+
+    sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
+    return {"id": source["id"], "filename": file.filename}
+
