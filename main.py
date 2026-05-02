@@ -432,3 +432,136 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/whatsapp/onboard")
+def whatsapp_onboard(data: dict):
+    code = data["code"]
+    project_id = data["projectId"]
+
+    url = "https://graph.facebook.com/v19.0/oauth/access_token"
+
+    params = {
+        "client_id": os.getenv("META_APP_ID"),
+        "client_secret": os.getenv("META_APP_SECRET"),
+        "code": code,
+    }
+
+    res = requests.get(url, params=params)
+    token_data = res.json()
+
+    access_token = token_data.get("access_token")
+
+    # TEMP store token (update later when metadata arrives)
+    supabase.table("whatsapp_integrations").upsert({
+        "project_id": project_id,
+        "access_token": access_token
+    }).execute()
+
+    return {"success": True}
+
+@app.post("/whatsapp/save-metadata")
+def save_metadata(data: dict):
+    project_id = data["projectId"]
+
+    supabase.table("whatsapp_integrations").upsert({
+        "project_id": project_id,
+        "phone_number_id": data["phone_number_id"],
+        "waba_id": data["waba_id"]
+    }).execute()
+
+    return {"success": True}
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(req: Request):
+    body = await req.json()
+
+    try:
+        value = body["entry"][0]["changes"][0]["value"]
+
+        if "messages" not in value:
+            return {"status": "ignored"}
+
+        msg = value["messages"][0]
+
+        # ignore non-text
+        if msg.get("type") != "text":
+            return {"status": "ignored"}
+
+        phone = msg["from"]
+        text = msg["text"]["body"]
+        phone_number_id = value["metadata"]["phone_number_id"]
+
+        # -------------------------------
+        # 1. Get project
+        # -------------------------------
+        res = supabase.table("whatsapp_integrations") \
+            .select("project_id, access_token") \
+            .eq("phone_number_id", phone_number_id) \
+            .single() \
+            .execute()
+
+        if not res.data:
+            return {"error": "integration not found"}
+
+        project_id = res.data["project_id"]
+        access_token = res.data["access_token"]
+
+        # -------------------------------
+        # 2. Get or create chat
+        # -------------------------------
+        chat = supabase.table("chats") \
+            .select("id") \
+            .eq("project_id", project_id) \
+            .eq("external_id", phone) \
+            .eq("channel", "whatsapp") \
+            .limit(1) \
+            .execute()
+
+        if chat.data:
+            chat_id = chat.data[0]["id"]
+        else:
+            new_chat = supabase.table("chats").insert({
+                "project_id": project_id,
+                "external_id": phone,
+                "channel": "whatsapp",
+                "title": f"WhatsApp {phone}"
+            }).execute()
+
+            chat_id = new_chat.data[0]["id"]
+
+        # -------------------------------
+        # 3. Memory + RAG
+        # -------------------------------
+        history = get_history(chat_id, 5)
+        result = run_chat(project_id, chat_id, text, history)
+
+        answer = result["answer"]
+
+        # -------------------------------
+        # 4. Send reply
+        # -------------------------------
+        url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "text": {"body": answer}
+        }
+
+        requests.post(url, headers=headers, json=payload)
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print("ERROR:", e)
+        return {"status": "error"}
+
+@app.get("/webhook/whatsapp")
+def verify(mode: str = Query(...), challenge: str = Query(...), verify_token: str = Query(...)):
+    if verify_token == os.getenv("VERIFY_TOKEN"):
+        return challenge
+    return "error"
