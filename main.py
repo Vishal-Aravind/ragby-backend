@@ -828,3 +828,189 @@ async def upload_excel(
     sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
     return {"id": source["id"], "filename": file.filename}
 
+
+
+# Add this import at the top of main.py
+import httpx
+
+# ─────────────────────────────────────────────────────────
+# TELEGRAM HELPER
+# ─────────────────────────────────────────────────────────
+def send_telegram_message(bot_token: str, chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
+
+
+def set_telegram_webhook(bot_token: str, webhook_url: str):
+    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
+    res = requests.post(url, json={"url": webhook_url})
+    return res.json()
+
+
+def get_bot_info(bot_token: str):
+    url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    res = requests.get(url)
+    return res.json()
+
+
+# ─────────────────────────────────────────────────────────
+# CONNECT TELEGRAM — save token + set webhook
+# ─────────────────────────────────────────────────────────
+@app.post("/telegram/connect")
+def telegram_connect(data: dict, user=Depends(verify_token)):
+    bot_token = data["bot_token"]
+    project_id = data["projectId"]
+
+    # Verify token is valid by calling getMe
+    bot_info = get_bot_info(bot_token)
+    if not bot_info.get("ok"):
+        raise HTTPException(status_code=400, detail="Invalid bot token. Make sure you copied it correctly from @BotFather.")
+
+    bot_username = bot_info["result"]["username"]
+
+    # Save to Supabase
+    supabase.table("telegram_integrations").upsert({
+        "project_id": project_id,
+        "bot_token": bot_token,
+        "bot_username": bot_username,
+    }, on_conflict="project_id").execute()
+
+    # Set webhook so Telegram sends messages to our server
+    webhook_url = f"{os.getenv('BACKEND_PUBLIC_URL')}/webhook/telegram/{project_id}"
+    result = set_telegram_webhook(bot_token, webhook_url)
+
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=f"Could not set webhook: {result}")
+
+    return {"success": True, "bot_username": bot_username}
+
+
+# ─────────────────────────────────────────────────────────
+# DISCONNECT TELEGRAM
+# ─────────────────────────────────────────────────────────
+@app.delete("/telegram/disconnect/{project_id}")
+def telegram_disconnect(project_id: str, user=Depends(verify_token)):
+    # Get token first to remove webhook
+    res = supabase.table("telegram_integrations") \
+        .select("bot_token") \
+        .eq("project_id", project_id) \
+        .single() \
+        .execute()
+
+    if res.data:
+        bot_token = res.data["bot_token"]
+        # Remove webhook
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+        )
+
+    supabase.table("telegram_integrations") \
+        .delete() \
+        .eq("project_id", project_id) \
+        .execute()
+
+    return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────
+# GET TELEGRAM STATUS
+# ─────────────────────────────────────────────────────────
+@app.get("/telegram/status/{project_id}")
+def telegram_status(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("telegram_integrations") \
+        .select("bot_username, created_at") \
+        .eq("project_id", project_id) \
+        .execute()
+
+    if res.data:
+        return {"connected": True, "bot_username": res.data[0]["bot_username"]}
+    return {"connected": False}
+
+
+# ─────────────────────────────────────────────────────────
+# TELEGRAM WEBHOOK — receives messages from Telegram
+# ─────────────────────────────────────────────────────────
+@app.post("/webhook/telegram/{project_id}")
+async def telegram_webhook(project_id: str, req: Request):
+    body = await req.json()
+
+    try:
+        # Handle both private messages and group messages
+        message = body.get("message") or body.get("edited_message")
+        if not message:
+            return {"status": "ignored"}
+
+        # Only handle text messages
+        if "text" not in message:
+            return {"status": "ignored"}
+
+        text = message["text"]
+        chat_id = message["chat"]["id"]
+        telegram_user_id = str(message["from"]["id"])
+        username = message["from"].get("username") or message["from"].get("first_name", "User")
+
+        # Ignore bot commands except /start
+        if text.startswith("/") and not text.startswith("/start"):
+            return {"status": "ignored"}
+
+        # Handle /start
+        if text.startswith("/start"):
+            res = supabase.table("telegram_integrations") \
+                .select("bot_token") \
+                .eq("project_id", project_id) \
+                .single() \
+                .execute()
+            if res.data:
+                send_telegram_message(
+                    res.data["bot_token"],
+                    chat_id,
+                    "👋 Hi! I'm ready to help. Ask me anything!"
+                )
+            return {"status": "ok"}
+
+        # Get bot token
+        res = supabase.table("telegram_integrations") \
+            .select("bot_token") \
+            .eq("project_id", project_id) \
+            .single() \
+            .execute()
+
+        if not res.data:
+            return {"error": "integration not found"}
+
+        bot_token = res.data["bot_token"]
+
+        # Get or create chat session per telegram user
+        chat = supabase.table("chats") \
+            .select("id") \
+            .eq("project_id", project_id) \
+            .eq("external_id", telegram_user_id) \
+            .eq("channel", "telegram") \
+            .limit(1) \
+            .execute()
+
+        if chat.data:
+            chat_id_db = chat.data[0]["id"]
+        else:
+            new_chat = supabase.table("chats").insert({
+                "project_id": project_id,
+                "external_id": telegram_user_id,
+                "channel": "telegram",
+                "title": f"Telegram @{username}",
+            }).execute()
+            chat_id_db = new_chat.data[0]["id"]
+
+        # Get history and run RAG
+        history = get_history(chat_id_db, limit=5)
+        result = run_chat(project_id, chat_id_db, text, history)
+        answer = result["answer"]
+
+        # Send reply
+        send_telegram_message(bot_token, chat_id, answer)
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        print(f"TELEGRAM WEBHOOK ERROR: {e}")
+        return {"status": "error"}
