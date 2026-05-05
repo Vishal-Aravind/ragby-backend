@@ -934,54 +934,59 @@ def telegram_status(project_id: str, user=Depends(verify_token)):
 @app.post("/webhook/telegram/{project_id}")
 async def telegram_webhook(project_id: str, req: Request):
     body = await req.json()
-
+ 
     try:
-        # Handle both private messages and group messages
         message = body.get("message") or body.get("edited_message")
-        if not message:
+        if not message or "text" not in message:
             return {"status": "ignored"}
-
-        # Only handle text messages
-        if "text" not in message:
-            return {"status": "ignored"}
-
+ 
         text = message["text"]
         chat_id = message["chat"]["id"]
+        chat_type = message["chat"]["type"]  # "private", "group", "supergroup"
         telegram_user_id = str(message["from"]["id"])
         username = message["from"].get("username") or message["from"].get("first_name", "User")
-
-        # Ignore bot commands except /start
-        if text.startswith("/") and not text.startswith("/start"):
-            return {"status": "ignored"}
-
-        # Handle /start
-        if text.startswith("/start"):
-            res = supabase.table("telegram_integrations") \
-                .select("bot_token") \
-                .eq("project_id", project_id) \
-                .single() \
-                .execute()
-            if res.data:
-                send_telegram_message(
-                    res.data["bot_token"],
-                    chat_id,
-                    "👋 Hi! I'm ready to help. Ask me anything!"
-                )
-            return {"status": "ok"}
-
-        # Get bot token
+ 
+        # Get integration — single DB fetch for everything we need
         res = supabase.table("telegram_integrations") \
-            .select("bot_token") \
+            .select("bot_token, bot_username") \
             .eq("project_id", project_id) \
             .single() \
             .execute()
-
+ 
         if not res.data:
             return {"error": "integration not found"}
-
+ 
         bot_token = res.data["bot_token"]
-
-        # Get or create chat session per telegram user
+        bot_username = res.data["bot_username"]
+ 
+        # ── Group chat handling ──────────────────────────────
+        if chat_type in ("group", "supergroup"):
+            mention = f"@{bot_username}"
+            if mention.lower() not in text.lower():
+                # Bot not mentioned — ignore completely
+                return {"status": "ignored"}
+            # Strip the mention so RAG gets a clean query
+            text = text.replace(mention, "").replace(mention.lower(), "").strip()
+            if not text:
+                # Message was just the mention with no question
+                send_telegram_message(bot_token, chat_id, "👋 Yes? Ask me anything!")
+                return {"status": "ok"}
+ 
+        # ── Handle /start ────────────────────────────────────
+        if text.startswith("/start"):
+            send_telegram_message(
+                bot_token, chat_id,
+                f"👋 Hi @{username}! I'm ready to help. Ask me anything!"
+            )
+            return {"status": "ok"}
+ 
+        # ── Ignore other commands ────────────────────────────
+        if text.startswith("/"):
+            return {"status": "ignored"}
+ 
+        # ── Get or create per-user chat session ──────────────
+        # Use telegram_user_id (not chat_id) so each person has
+        # their own memory even in group chats
         chat = supabase.table("chats") \
             .select("id") \
             .eq("project_id", project_id) \
@@ -989,7 +994,7 @@ async def telegram_webhook(project_id: str, req: Request):
             .eq("channel", "telegram") \
             .limit(1) \
             .execute()
-
+ 
         if chat.data:
             chat_id_db = chat.data[0]["id"]
         else:
@@ -1000,17 +1005,105 @@ async def telegram_webhook(project_id: str, req: Request):
                 "title": f"Telegram @{username}",
             }).execute()
             chat_id_db = new_chat.data[0]["id"]
-
-        # Get history and run RAG
+ 
+        # ── RAG + reply ──────────────────────────────────────
         history = get_history(chat_id_db, limit=5)
         result = run_chat(project_id, chat_id_db, text, history)
         answer = result["answer"]
-
-        # Send reply
+ 
         send_telegram_message(bot_token, chat_id, answer)
-
         return {"status": "ok"}
-
+ 
     except Exception as e:
         print(f"TELEGRAM WEBHOOK ERROR: {e}")
         return {"status": "error"}
+
+# -------------------------------------------------
+# LEAD CAPTURE CONFIG — public (widget fetches on load)
+# -------------------------------------------------
+@app.get("/public/lead-config/{project_id}")
+def get_lead_config(project_id: str):
+    res = supabase.table("lead_capture_config") \
+        .select("enabled, trigger_after_messages, form_title, form_subtitle") \
+        .eq("project_id", project_id) \
+        .execute()
+
+    if not res.data or not res.data[0]["enabled"]:
+        return {"enabled": False}
+
+    return res.data[0]
+
+
+# -------------------------------------------------
+# LEAD SUBMIT — public (widget posts here)
+# -------------------------------------------------
+class LeadSubmitRequest(BaseModel):
+    project_id: str
+    session_id: str
+    name: str
+    email: str
+    phone: str
+
+@app.post("/public/leads")
+def submit_lead(req: LeadSubmitRequest):
+    # Prevent duplicate for same session
+    existing = supabase.table("leads") \
+        .select("id") \
+        .eq("session_id", req.session_id) \
+        .eq("project_id", req.project_id) \
+        .execute()
+
+    if existing.data:
+        return {"status": "already_captured"}
+
+    if "@" not in req.email:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    if len(req.phone.strip()) < 7:
+        raise HTTPException(status_code=400, detail="Invalid phone")
+
+    supabase.table("leads").insert({
+        "project_id": req.project_id,
+        "session_id": req.session_id,
+        "name": req.name.strip(),
+        "email": req.email.strip(),
+        "phone": req.phone.strip(),
+        "source": "widget",
+    }).execute()
+
+    return {"status": "captured"}
+
+
+# -------------------------------------------------
+# LEAD CONFIG SAVE — dashboard (protected)
+# -------------------------------------------------
+class LeadConfigRequest(BaseModel):
+    projectId: str
+    enabled: bool
+    triggerAfterMessages: Optional[int] = 2
+    formTitle: Optional[str] = "Before we continue..."
+    formSubtitle: Optional[str] = "Please share your details to keep chatting."
+
+@app.put("/lead-config")
+def save_lead_config(req: LeadConfigRequest, user=Depends(verify_token)):
+    supabase.table("lead_capture_config").upsert({
+        "project_id": req.projectId,
+        "enabled": req.enabled,
+        "trigger_after_messages": req.triggerAfterMessages,
+        "form_title": req.formTitle,
+        "form_subtitle": req.formSubtitle,
+    }, on_conflict="project_id").execute()
+    return {"status": "saved"}
+
+
+# -------------------------------------------------
+# LEADS LIST — dashboard (protected)
+# -------------------------------------------------
+@app.get("/leads")
+def get_leads(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("leads") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .order("created_at", desc=True) \
+        .execute()
+    return res.data

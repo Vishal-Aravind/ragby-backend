@@ -7,24 +7,40 @@
 
   const apiBase = new URL(script.src).origin;
 
-  // ✅ session-based userId (IMPORTANT)
+  // Session-based userId
   let userId = localStorage.getItem("rag_user_id");
   if (!userId) {
     userId = crypto.randomUUID();
     localStorage.setItem("rag_user_id", userId);
   }
 
-  let lead = JSON.parse(localStorage.getItem("chat_lead") || "null");
+  // Lead state
+  let lead = JSON.parse(localStorage.getItem(`chat_lead_${projectId}`) || "null");
   let awaitingLead = false;
   let pendingQuestion = null;
+  let userMessageCount = 0;
 
-  const history = []; // only for UI
+  // Lead capture config (fetched from backend)
+  let leadConfig = null;
+
+  const history = [];
 
   function render(text) {
     return (text || "")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/\n/g, "<br/>");
+  }
+
+  // ---------------- FETCH LEAD CONFIG ----------------
+  async function fetchLeadConfig() {
+    try {
+      const res = await fetch(`${apiBase}/public/lead-config/${projectId}`);
+      const data = await res.json();
+      leadConfig = data.enabled ? data : null;
+    } catch (e) {
+      leadConfig = null;
+    }
   }
 
   // ---------------- UI ----------------
@@ -44,19 +60,19 @@
     width:340px;height:460px;background:#fff;
     border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);
     display:none;flex-direction:column;z-index:999999;
-    font-family:system-ui;
+    font-family:system-ui;overflow:hidden;
   `;
 
   box.innerHTML = `
     <div style="padding:12px;border-bottom:1px solid #eee;font-weight:600">
       Ask us
     </div>
-    <div id="msgs" style="flex:1;padding:12px;overflow:auto;font-size:14px"></div>
+    <div id="msgs" style="flex:1;padding:12px;overflow:auto;font-size:14px;position:relative"></div>
     <form id="chatForm" style="display:flex;border-top:1px solid #eee">
-      <input id="input" placeholder="Type your question..."
+      <input id="chat-input" placeholder="Type your question..."
         style="flex:1;padding:10px;border:none;outline:none"/>
-      <button type="submit"
-        style="padding:10px 14px;border:none;background:#000;color:#fff">
+      <button id="send-btn" type="submit"
+        style="padding:10px 14px;border:none;background:#000;color:#fff;cursor:pointer">
         Send
       </button>
     </form>
@@ -69,7 +85,8 @@
 
   const msgs = box.querySelector("#msgs");
   const form = box.querySelector("#chatForm");
-  const input = box.querySelector("#input");
+  const input = box.querySelector("#chat-input");
+  const sendBtn = box.querySelector("#send-btn");
 
   function addMsg(role, html) {
     const el = document.createElement("div");
@@ -96,79 +113,172 @@
     return el;
   }
 
+  function blockInput() {
+    input.disabled = true;
+    input.placeholder = "Please fill the form to continue...";
+    sendBtn.disabled = true;
+    sendBtn.style.opacity = "0.5";
+  }
+
+  function unblockInput() {
+    input.disabled = false;
+    input.placeholder = "Type your question...";
+    sendBtn.disabled = false;
+    sendBtn.style.opacity = "1";
+    input.focus();
+  }
+
+  // ---------------- LEAD FORM ----------------
+  function showLeadForm() {
+    awaitingLead = true;
+    blockInput();
+
+    const title = leadConfig?.form_title || "Before we continue...";
+    const subtitle = leadConfig?.form_subtitle || "Please share your details to keep chatting.";
+
+    // Overlay sits inside msgs container
+    const overlay = document.createElement("div");
+    overlay.id = "lead-overlay";
+    overlay.style.cssText = `
+      position:absolute;inset:0;
+      background:rgba(255,255,255,0.97);
+      display:flex;flex-direction:column;
+      align-items:center;justify-content:center;
+      padding:24px;z-index:10;
+    `;
+
+    overlay.innerHTML = `
+      <div style="width:100%;max-width:280px;text-align:center;">
+        <div style="font-size:22px;margin-bottom:8px;">👋</div>
+        <h3 style="font-size:15px;font-weight:600;margin:0 0 6px;">${title}</h3>
+        <p style="font-size:12px;color:#666;margin:0 0 18px;">${subtitle}</p>
+
+        <div style="display:flex;flex-direction:column;gap:8px;text-align:left;">
+          <input id="lf-name" type="text" placeholder="Your name *" style="
+            border:1px solid #ddd;border-radius:8px;
+            padding:9px 12px;font-size:13px;
+            width:100%;box-sizing:border-box;outline:none;
+          "/>
+          <input id="lf-email" type="email" placeholder="Email address *" style="
+            border:1px solid #ddd;border-radius:8px;
+            padding:9px 12px;font-size:13px;
+            width:100%;box-sizing:border-box;outline:none;
+          "/>
+          <input id="lf-phone" type="tel" placeholder="Phone number *" style="
+            border:1px solid #ddd;border-radius:8px;
+            padding:9px 12px;font-size:13px;
+            width:100%;box-sizing:border-box;outline:none;
+          "/>
+          <div id="lf-error" style="
+            color:#e53e3e;font-size:11px;display:none;
+          "></div>
+          <button id="lf-submit" style="
+            background:#000;color:#fff;border:none;
+            border-radius:8px;padding:10px;
+            font-size:13px;font-weight:500;
+            cursor:pointer;margin-top:2px;
+          ">
+            Continue chatting →
+          </button>
+        </div>
+      </div>
+    `;
+
+    msgs.style.position = "relative";
+    msgs.appendChild(overlay);
+
+    // Submit handler
+    overlay.querySelector("#lf-submit").onclick = async () => {
+      const name = overlay.querySelector("#lf-name").value.trim();
+      const email = overlay.querySelector("#lf-email").value.trim();
+      const phone = overlay.querySelector("#lf-phone").value.trim();
+      const errorEl = overlay.querySelector("#lf-error");
+      const submitBtn = overlay.querySelector("#lf-submit");
+
+      // Validate
+      if (!name || !email || !phone) {
+        errorEl.textContent = "All fields are required.";
+        errorEl.style.display = "block";
+        return;
+      }
+      if (!email.includes("@")) {
+        errorEl.textContent = "Enter a valid email address.";
+        errorEl.style.display = "block";
+        return;
+      }
+      if (phone.replace(/\D/g, "").length < 7) {
+        errorEl.textContent = "Enter a valid phone number.";
+        errorEl.style.display = "block";
+        return;
+      }
+
+      errorEl.style.display = "none";
+      submitBtn.textContent = "Saving...";
+      submitBtn.disabled = true;
+
+      try {
+        const res = await fetch(`${apiBase}/public/leads`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectId,
+            session_id: userId,
+            name,
+            email,
+            phone,
+          }),
+        });
+
+        if (res.ok) {
+          lead = { name, email, phone };
+          localStorage.setItem(`chat_lead_${projectId}`, JSON.stringify(lead));
+
+          awaitingLead = false;
+          overlay.remove();
+          unblockInput();
+
+          addMsg("assistant", `Thanks ${name}! How can I help you?`);
+
+          // Answer the question they had asked before form appeared
+          if (pendingQuestion) {
+            await askBot(pendingQuestion);
+            pendingQuestion = null;
+          }
+        } else {
+          submitBtn.textContent = "Continue chatting →";
+          submitBtn.disabled = false;
+          errorEl.textContent = "Something went wrong. Please try again.";
+          errorEl.style.display = "block";
+        }
+      } catch (e) {
+        submitBtn.textContent = "Continue chatting →";
+        submitBtn.disabled = false;
+        errorEl.textContent = "Network error. Please try again.";
+        errorEl.style.display = "block";
+      }
+    };
+  }
+
+  // ---------------- ASK BOT ----------------
   async function askBot(question) {
     const typing = showTyping();
 
     const res = await fetch(`${apiBase}/public/chat`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         projectId,
         message: question,
-        userId   // ✅ FIXED
+        userId,
       }),
     });
 
     const data = await res.json();
     typing.remove();
-
     addMsg("assistant", render(data.answer || ""));
   }
 
-  function showLeadForm() {
-    awaitingLead = true;
-
-    const id = "lead-form-" + Date.now();
-    addMsg(
-      "assistant",
-      `
-      <div id="${id}">
-        <div style="margin-bottom:6px;font-weight:500">
-          Before we continue, please share:
-        </div>
-        <input placeholder="Name" id="lf-name"
-          style="width:100%;padding:6px;margin-bottom:6px"/>
-        <input placeholder="Phone" id="lf-phone"
-          style="width:100%;padding:6px;margin-bottom:6px"/>
-        <input placeholder="Email (optional)" id="lf-email"
-          style="width:100%;padding:6px;margin-bottom:8px"/>
-        <button style="width:100%;padding:8px;background:#000;color:#fff;border:none">
-          Submit
-        </button>
-      </div>
-      `
-    );
-
-    const container = msgs.querySelector(`#${id}`);
-    container.querySelector("button").onclick = async () => {
-      const name = container.querySelector("#lf-name").value.trim();
-      const phone = container.querySelector("#lf-phone").value.trim();
-      const email = container.querySelector("#lf-email").value.trim();
-
-      if (!name || !phone) return;
-
-      lead = { name, phone, email };
-      localStorage.setItem("chat_lead", JSON.stringify(lead));
-
-      await fetch(`${apiBase}/public/lead`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId, ...lead }),
-      });
-
-      awaitingLead = false;
-      container.remove();
-      addMsg("assistant", "Thanks!");
-
-      if (pendingQuestion) {
-        await askBot(pendingQuestion);
-        pendingQuestion = null;
-      }
-    };
-  }
-
+  // ---------------- FORM SUBMIT ----------------
   form.onsubmit = async (e) => {
     e.preventDefault();
 
@@ -176,12 +286,13 @@
     if (!text || awaitingLead) return;
 
     input.value = "";
-
     addMsg("user", render(text));
+    userMessageCount++;
 
-    const userCount = history.filter((h) => h.role === "user").length + 1;
+    const threshold = leadConfig?.trigger_after_messages ?? 2;
 
-    if (!lead && userCount === 2) {
+    // Show lead form if enabled, not yet captured, and threshold reached
+    if (leadConfig && !lead && userMessageCount >= threshold) {
       pendingQuestion = text;
       showLeadForm();
       return;
@@ -189,4 +300,7 @@
 
     await askBot(text);
   };
+
+  // ---------------- INIT ----------------
+  fetchLeadConfig();
 })();
