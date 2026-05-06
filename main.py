@@ -33,6 +33,10 @@ from sources.website import sync_website
 
 import sqlalchemy
 
+import hmac
+import hashlib
+import time
+
 # -------------------------------------------------
 # ENV & CLIENTS
 # -------------------------------------------------
@@ -934,6 +938,7 @@ def telegram_status(project_id: str, user=Depends(verify_token)):
 @app.post("/webhook/telegram/{project_id}")
 async def telegram_webhook(project_id: str, req: Request):
     body = await req.json()
+    print(f"TELEGRAM BODY: {body}") 
  
     try:
         message = body.get("message") or body.get("edited_message")
@@ -1107,3 +1112,196 @@ def get_leads(project_id: str, user=Depends(verify_token)):
         .order("created_at", desc=True) \
         .execute()
     return res.data
+
+
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK HELPERS
+# ─────────────────────────────────────────────────────────
+def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
+    """Verify the request is genuinely from Slack."""
+    if abs(time.time() - int(timestamp)) > 300:
+        return False  # reject requests older than 5 minutes
+    sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+    my_sig = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(),
+        sig_basestring.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(my_sig, signature)
+ 
+ 
+def send_slack_message(access_token: str, channel: str, text: str):
+    requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"channel": channel, "text": text}
+    )
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK OAUTH — Step 1: Generate auth URL
+# ─────────────────────────────────────────────────────────
+@app.get("/slack/auth-url")
+def slack_auth_url(project_id: str, user=Depends(verify_token)):
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    redirect_uri = f"{frontend_url}/api/slack/callback"
+    scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
+    url = (
+        f"https://slack.com/oauth/v2/authorize"
+        f"?client_id={SLACK_CLIENT_ID}"
+        f"&scope={scopes}"
+        f"&redirect_uri={redirect_uri}"
+        f"&state={project_id}"
+    )
+    return {"url": url}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK OAUTH — Step 2: Handle callback, exchange code for token
+# ─────────────────────────────────────────────────────────
+@app.post("/slack/callback")
+def slack_callback(data: dict, user=Depends(verify_token)):
+    code = data["code"]
+    project_id = data["project_id"]
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    redirect_uri = f"{frontend_url}/api/slack/callback"
+ 
+    # Exchange code for access token
+    res = requests.post("https://slack.com/api/oauth.v2.access", data={
+        "client_id": SLACK_CLIENT_ID,
+        "client_secret": SLACK_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    })
+    token_data = res.json()
+ 
+    if not token_data.get("ok"):
+        raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {token_data.get('error')}")
+ 
+    access_token = token_data["access_token"]
+    team_id = token_data["team"]["id"]
+    team_name = token_data["team"]["name"]
+    bot_user_id = token_data["bot_user_id"]
+ 
+    supabase.table("slack_integrations").upsert({
+        "project_id": project_id,
+        "access_token": access_token,
+        "team_id": team_id,
+        "team_name": team_name,
+        "bot_user_id": bot_user_id,
+    }, on_conflict="project_id").execute()
+ 
+    return {"success": True, "team_name": team_name}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK STATUS
+# ─────────────────────────────────────────────────────────
+@app.get("/slack/status/{project_id}")
+def slack_status(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("slack_integrations") \
+        .select("team_name, team_id") \
+        .eq("project_id", project_id) \
+        .execute()
+    if res.data:
+        return {"connected": True, "team_name": res.data[0]["team_name"]}
+    return {"connected": False}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK DISCONNECT
+# ─────────────────────────────────────────────────────────
+@app.delete("/slack/disconnect/{project_id}")
+def slack_disconnect(project_id: str, user=Depends(verify_token)):
+    supabase.table("slack_integrations").delete().eq("project_id", project_id).execute()
+    return {"success": True}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# SLACK WEBHOOK — receives events from Slack
+# ─────────────────────────────────────────────────────────
+@app.post("/webhook/slack")
+async def slack_webhook(req: Request):
+    body_bytes = await req.body()
+    body = await req.json()
+ 
+    # Handle Slack URL verification challenge (one-time setup)
+    if body.get("type") == "url_verification":
+        return {"challenge": body["challenge"]}
+ 
+    # Verify signature
+    timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
+    signature = req.headers.get("X-Slack-Signature", "")
+    if not verify_slack_signature(body_bytes, timestamp, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+ 
+    event = body.get("event", {})
+    event_type = event.get("type")
+ 
+    # Handle app_mention and direct messages
+    if event_type not in ("app_mention", "message"):
+        return {"status": "ignored"}
+ 
+    # Ignore bot's own messages
+    if event.get("bot_id") or event.get("subtype"):
+        return {"status": "ignored"}
+ 
+    text = event.get("text", "").strip()
+    channel = event.get("channel")
+    user_id = event.get("user")
+    team_id = body.get("team_id")
+ 
+    if not text or not channel or not user_id:
+        return {"status": "ignored"}
+ 
+    # Find project by team_id
+    res = supabase.table("slack_integrations") \
+        .select("project_id, access_token, bot_user_id") \
+        .eq("team_id", team_id) \
+        .single() \
+        .execute()
+ 
+    if not res.data:
+        return {"error": "integration not found"}
+ 
+    project_id = res.data["project_id"]
+    access_token = res.data["access_token"]
+    bot_user_id = res.data["bot_user_id"]
+ 
+    # Strip bot mention from text
+    text = text.replace(f"<@{bot_user_id}>", "").strip()
+    if not text:
+        send_slack_message(access_token, channel, "👋 Yes? Ask me anything!")
+        return {"status": "ok"}
+ 
+    # Get or create chat session per Slack user
+    chat = supabase.table("chats") \
+        .select("id") \
+        .eq("project_id", project_id) \
+        .eq("external_id", user_id) \
+        .eq("channel", "slack") \
+        .limit(1) \
+        .execute()
+ 
+    if chat.data:
+        chat_id = chat.data[0]["id"]
+    else:
+        new_chat = supabase.table("chats").insert({
+            "project_id": project_id,
+            "external_id": user_id,
+            "channel": "slack",
+            "title": f"Slack {user_id}",
+        }).execute()
+        chat_id = new_chat.data[0]["id"]
+ 
+    # RAG + reply
+    history = get_history(chat_id, limit=5)
+    result = run_chat(project_id, chat_id, text, history)
+    send_slack_message(access_token, channel, result["answer"])
+ 
+    return {"status": "ok"}
