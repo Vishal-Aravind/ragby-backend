@@ -1165,7 +1165,7 @@ def slack_auth_url(project_id: str, user=Depends(verify_token)):
 # SLACK OAUTH — Step 2: Handle callback, exchange code for token
 # ─────────────────────────────────────────────────────────
 @app.post("/slack/callback")
-def slack_callback(data: dict, user=Depends(verify_token)):
+def slack_callback(data: dict):
     code = data["code"]
     project_id = data["project_id"]
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
