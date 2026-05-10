@@ -37,6 +37,8 @@ import hmac
 import hashlib
 import time
 
+from starlette.responses import PlainTextResponse
+
 # -------------------------------------------------
 # ENV & CLIENTS
 # -------------------------------------------------
@@ -549,133 +551,11 @@ def health():
     return {"status": "ok"}
 
 
-# -------------------------------------------------
-# WHATSAPP
-# -------------------------------------------------
-@app.post("/whatsapp/onboard")
-def whatsapp_onboard(data: dict, user=Depends(verify_token)):
-    # FIX: Protected — only authenticated users can connect WhatsApp
-    code = data["code"]
-    project_id = data["projectId"]
-
-    url = "https://graph.facebook.com/v19.0/oauth/access_token"
-    params = {
-        "client_id": os.getenv("META_APP_ID"),
-        "client_secret": os.getenv("META_APP_SECRET"),
-        "code": code,
-    }
-
-    res = requests.get(url, params=params)
-    token_data = res.json()
-    access_token = token_data.get("access_token")
-
-    supabase.table("whatsapp_integrations").upsert({
-        "project_id": project_id,
-        "access_token": access_token
-    }).execute()
-
-    return {"success": True}
 
 
-@app.post("/whatsapp/save-metadata")
-def save_metadata(data: dict, user=Depends(verify_token)):
-    # FIX: Protected
-    project_id = data["projectId"]
-    supabase.table("whatsapp_integrations").upsert({
-        "project_id": project_id,
-        "phone_number_id": data["phone_number_id"],
-        "waba_id": data["waba_id"]
-    }).execute()
-    return {"success": True}
-
-
-@app.post("/webhook/whatsapp")
-async def whatsapp_webhook(req: Request):
-    body = await req.json()
-
-    try:
-        value = body["entry"][0]["changes"][0]["value"]
-
-        if "messages" not in value:
-            return {"status": "ignored"}
-
-        msg = value["messages"][0]
-
-        if msg.get("type") != "text":
-            return {"status": "ignored"}
-
-        phone = msg["from"]
-        text = msg["text"]["body"]
-        phone_number_id = value["metadata"]["phone_number_id"]
-
-        # Get project + token
-        res = supabase.table("whatsapp_integrations") \
-            .select("project_id, access_token") \
-            .eq("phone_number_id", phone_number_id) \
-            .single() \
-            .execute()
-
-        if not res.data:
-            return {"error": "integration not found"}
-
-        project_id = res.data["project_id"]
-        access_token = res.data["access_token"]
-
-        # Get or create chat session for this phone number
-        chat = supabase.table("chats") \
-            .select("id") \
-            .eq("project_id", project_id) \
-            .eq("external_id", phone) \
-            .eq("channel", "whatsapp") \
-            .limit(1) \
-            .execute()
-
-        if chat.data:
-            chat_id = chat.data[0]["id"]
-        else:
-            new_chat = supabase.table("chats").insert({
-                "project_id": project_id,
-                "external_id": phone,
-                "channel": "whatsapp",
-                "title": f"WhatsApp {phone}"
-            }).execute()
-            chat_id = new_chat.data[0]["id"]
-
-        # Memory + RAG
-        history = get_history(chat_id, 5)
-        result = run_chat(project_id, chat_id, text, history)
-        answer = result["answer"]
-
-        # Send reply
-        url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "text": {"body": answer}
-        }
-        requests.post(url, headers=headers, json=payload)
-
-        return {"status": "ok"}
-
-    except Exception as e:
-        print("ERROR:", e)
-        return {"status": "error"}
-
-
-@app.get("/webhook/whatsapp")
-def verify(
-    mode: str = Query(...),
-    challenge: str = Query(...),
-    verify_token: str = Query(...)
-):
-    # FIX: Use the env var loaded at startup instead of re-reading each time
-    if verify_token == VERIFY_TOKEN:
-        return challenge
-    raise HTTPException(status_code=403, detail="Invalid verify token")
+########
+#Sources
+########
 
 @app.get("/sources")
 def list_sources(project_id: str, user=Depends(verify_token)):
@@ -1305,3 +1185,171 @@ async def slack_webhook(req: Request):
     send_slack_message(access_token, channel, result["answer"])
  
     return {"status": "ok"}
+
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP HELPER — send a message
+# ─────────────────────────────────────────────────────────
+def send_whatsapp_message(to: str, text: str):
+    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+    res = requests.post(url, headers=headers, json=payload)
+    if not res.ok:
+        print(f"WhatsApp send error: {res.text}")
+    return res
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP WEBHOOK — GET (verification)
+# ─────────────────────────────────────────────────────────
+@app.get("/webhook/whatsapp")
+async def whatsapp_verify(request: Request):
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+ 
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        print("WhatsApp webhook verified")
+        return PlainTextResponse(challenge)
+ 
+    raise HTTPException(status_code=403, detail="Verification failed")
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP WEBHOOK — POST (incoming messages)
+# ─────────────────────────────────────────────────────────
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    body = await request.json()
+ 
+    try:
+        entry = body.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        value = changes.get("value", {})
+ 
+        # Ignore status updates (delivered, read, etc.)
+        if "statuses" in value:
+            return {"status": "ignored"}
+ 
+        messages = value.get("messages", [])
+        if not messages:
+            return {"status": "ignored"}
+ 
+        message = messages[0]
+        msg_type = message.get("type")
+ 
+        # Only handle text messages
+        if msg_type != "text":
+            return {"status": "ignored"}
+ 
+        from_number = message["from"]  # e.g. "919876543210"
+        text = message["text"]["body"].strip()
+        waba_id = value.get("metadata", {}).get("phone_number_id")
+ 
+        # Find project by phone_number_id
+        res = supabase.table("whatsapp_integrations") \
+            .select("project_id") \
+            .eq("phone_number_id", waba_id or WHATSAPP_PHONE_NUMBER_ID) \
+            .single() \
+            .execute()
+ 
+        if not res.data:
+            print(f"No project found for phone_number_id: {waba_id}")
+            return {"status": "ignored"}
+ 
+        project_id = res.data["project_id"]
+ 
+        # Get or create chat session per WhatsApp user
+        chat = supabase.table("chats") \
+            .select("id") \
+            .eq("project_id", project_id) \
+            .eq("external_id", from_number) \
+            .eq("channel", "whatsapp") \
+            .limit(1) \
+            .execute()
+ 
+        if chat.data:
+            chat_id = chat.data[0]["id"]
+        else:
+            new_chat = supabase.table("chats").insert({
+                "project_id": project_id,
+                "external_id": from_number,
+                "channel": "whatsapp",
+                "title": f"WhatsApp {from_number}",
+            }).execute()
+            chat_id = new_chat.data[0]["id"]
+ 
+        # RAG + reply
+        history = get_history(chat_id, limit=5)
+        result = run_chat(project_id, chat_id, text, history)
+        answer = result["answer"]
+ 
+        send_whatsapp_message(from_number, answer)
+        return {"status": "ok"}
+ 
+    except Exception as e:
+        print(f"WHATSAPP WEBHOOK ERROR: {e}")
+        return {"status": "error"}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP STATUS — get connected number for a project
+# ─────────────────────────────────────────────────────────
+@app.get("/whatsapp/status/{project_id}")
+def whatsapp_status(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("whatsapp_integrations") \
+        .select("phone_number_id, display_phone_number, waba_id") \
+        .eq("project_id", project_id) \
+        .execute()
+ 
+    if res.data:
+        return {"connected": True, **res.data[0]}
+    return {"connected": False}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP CONNECT — save phone number + project mapping
+# Called after embedded signup or manual setup
+# ─────────────────────────────────────────────────────────
+@app.post("/whatsapp/connect")
+def whatsapp_connect(data: dict, user=Depends(verify_token)):
+    project_id = data["projectId"]
+    phone_number_id = data["phone_number_id"]
+    waba_id = data.get("waba_id", "")
+    display_phone_number = data.get("display_phone_number", "")
+ 
+    supabase.table("whatsapp_integrations").upsert({
+        "project_id": project_id,
+        "phone_number_id": phone_number_id,
+        "waba_id": waba_id,
+        "display_phone_number": display_phone_number,
+    }, on_conflict="project_id").execute()
+ 
+    return {"success": True}
+ 
+ 
+# ─────────────────────────────────────────────────────────
+# WHATSAPP DISCONNECT
+# ─────────────────────────────────────────────────────────
+@app.delete("/whatsapp/disconnect/{project_id}")
+def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
+    supabase.table("whatsapp_integrations") \
+        .delete() \
+        .eq("project_id", project_id) \
+        .execute()
+    return {"success": True}
