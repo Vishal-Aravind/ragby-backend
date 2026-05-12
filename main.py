@@ -1195,10 +1195,12 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 # ─────────────────────────────────────────────────────────
 # WHATSAPP HELPER — send a message
 # ─────────────────────────────────────────────────────────
-def send_whatsapp_message(to: str, text: str):
-    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None):
+    pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
+    tok = token or WHATSAPP_TOKEN
+    url = f"https://graph.facebook.com/v19.0/{pid}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {tok}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -1353,3 +1355,64 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
         .eq("project_id", project_id) \
         .execute()
     return {"success": True}
+
+# ─────────────────────────────────────────────────────────
+# WHATSAPP ONBOARD — exchange OAuth code for token
+# Called after embedded signup FB.login callback
+# ─────────────────────────────────────────────────────────
+@app.post("/whatsapp/onboard")
+def whatsapp_onboard(data: dict, user=Depends(verify_token)):
+    code = data["code"]
+    project_id = data["projectId"]
+
+    META_APP_ID = os.getenv("META_APP_ID")
+    META_APP_SECRET = os.getenv("META_APP_SECRET")
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+    # Exchange code for access token
+    token_res = requests.get(
+        "https://graph.facebook.com/v19.0/oauth/access_token",
+        params={
+            "client_id": META_APP_ID,
+            "client_secret": META_APP_SECRET,
+            "code": code,
+        }
+    )
+    token_data = token_res.json()
+
+    if "access_token" not in token_data:
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_data}")
+
+    access_token = token_data["access_token"]
+
+    # Get WhatsApp Business Account details
+    waba_res = requests.get(
+        "https://graph.facebook.com/v19.0/me/businesses",
+        params={"access_token": access_token}
+    )
+    waba_data = waba_res.json()
+
+    # Get phone numbers linked to this WABA
+    phone_res = requests.get(
+        "https://graph.facebook.com/v19.0/me/phone_numbers",
+        params={"access_token": access_token}
+    )
+    phone_data = phone_res.json()
+    phone_number_id = phone_data.get("data", [{}])[0].get("id", "")
+    display_phone = phone_data.get("data", [{}])[0].get("display_phone_number", "")
+    waba_id = waba_data.get("data", [{}])[0].get("id", "")
+
+    # Save to DB
+    supabase.table("whatsapp_integrations").upsert({
+        "project_id": project_id,
+        "phone_number_id": phone_number_id,
+        "waba_id": waba_id,
+        "display_phone_number": display_phone,
+    }, on_conflict="project_id").execute()
+
+    return {
+        "success": True,
+        "phone_number_id": phone_number_id,
+        "display_phone_number": display_phone,
+        "waba_id": waba_id,
+    }
