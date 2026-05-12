@@ -1361,13 +1361,13 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
 # Called after embedded signup FB.login callback
 # ─────────────────────────────────────────────────────────
 @app.post("/whatsapp/onboard")
+@app.post("/whatsapp/onboard")
 def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     code = data["code"]
     project_id = data["projectId"]
 
     META_APP_ID = os.getenv("META_APP_ID")
     META_APP_SECRET = os.getenv("META_APP_SECRET")
-    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
     # Exchange code for access token
     token_res = requests.get(
@@ -1379,28 +1379,35 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
         }
     )
     token_data = token_res.json()
+    print(f"Token exchange: {token_data}")
 
     if "access_token" not in token_data:
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_data}")
 
     access_token = token_data["access_token"]
 
-    # Get WhatsApp Business Account details
+    # Get all WABAs this token has access to
     waba_res = requests.get(
-        "https://graph.facebook.com/v19.0/me/businesses",
+        "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
         params={"access_token": access_token}
     )
     waba_data = waba_res.json()
+    print(f"WABA data: {waba_data}")
 
-    # Get phone numbers linked to this WABA
+    waba_id = waba_data.get("data", [{}])[0].get("id", "")
+
+    # Get phone numbers for this WABA
     phone_res = requests.get(
-        "https://graph.facebook.com/v19.0/me/phone_numbers",
+        f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
         params={"access_token": access_token}
     )
     phone_data = phone_res.json()
+    print(f"Phone data: {phone_data}")
+
     phone_number_id = phone_data.get("data", [{}])[0].get("id", "")
     display_phone = phone_data.get("data", [{}])[0].get("display_phone_number", "")
-    waba_id = waba_data.get("data", [{}])[0].get("id", "")
+
+    print(f"Saving: waba_id={waba_id}, phone_number_id={phone_number_id}, display={display_phone}")
 
     # Save to DB
     supabase.table("whatsapp_integrations").upsert({
