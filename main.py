@@ -1516,23 +1516,26 @@ def customer_portal(user=Depends(verify_token)):
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
- 
+
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
- 
+
     event_type = event["type"]
     data = event["data"]["object"]
- 
-    # ── Checkout completed → activate plan ──────────────
+
+    # Convert StripeObject to plain dict
+    data = dict(data)
+
     if event_type == "checkout.session.completed":
-        user_id = data.get("metadata", {}).get("supabase_user_id")
-        price_id = data.get("metadata", {}).get("price_id")
+        metadata = dict(data.get("metadata") or {})
+        user_id = metadata.get("supabase_user_id")
+        price_id = metadata.get("price_id")
         subscription_id = data.get("subscription")
- 
+
         if user_id and price_id:
             plan = PRICE_TO_PLAN.get(price_id, "free")
             supabase.table("profiles").upsert({
@@ -1541,48 +1544,42 @@ async def stripe_webhook(request: Request):
                 "stripe_subscription_id": subscription_id,
             }, on_conflict="id").execute()
             print(f"Plan activated: {user_id} → {plan}")
- 
-    # ── Subscription updated → update plan ──────────────
+
     elif event_type == "customer.subscription.updated":
         subscription_id = data.get("id")
-        price_id = data["items"]["data"][0]["price"]["id"]
+        items = dict(data.get("items") or {})
+        item_data = items.get("data", [{}])
+        price_id = dict(dict(item_data[0]).get("price") or {}).get("id", "")
         status = data.get("status")
- 
+
         profile = supabase.table("profiles") \
             .select("id") \
             .eq("stripe_subscription_id", subscription_id) \
             .single() \
             .execute()
- 
+
         if profile.data:
             user_id = profile.data["id"]
-            if status in ("active", "trialing"):
-                plan = PRICE_TO_PLAN.get(price_id, "free")
-            else:
-                plan = "free"
- 
-            supabase.table("profiles").update({
-                "plan": plan,
-            }).eq("id", user_id).execute()
-            print(f"Plan updated: {user_id} → {plan} (status: {status})")
- 
-    # ── Subscription deleted → downgrade to free ────────
+            plan = PRICE_TO_PLAN.get(price_id, "free") if status in ("active", "trialing") else "free"
+            supabase.table("profiles").update({"plan": plan}).eq("id", user_id).execute()
+            print(f"Plan updated: {user_id} → {plan}")
+
     elif event_type == "customer.subscription.deleted":
         subscription_id = data.get("id")
- 
+
         profile = supabase.table("profiles") \
             .select("id") \
             .eq("stripe_subscription_id", subscription_id) \
             .single() \
             .execute()
- 
+
         if profile.data:
             supabase.table("profiles").update({
                 "plan": "free",
                 "stripe_subscription_id": None,
             }).eq("id", profile.data["id"]).execute()
             print(f"Plan cancelled: {profile.data['id']} → free")
- 
+
     return {"status": "ok"}
  
  
