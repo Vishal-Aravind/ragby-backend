@@ -1,6 +1,7 @@
 import os
 import io
 import uuid
+from datetime import datetime
 from fastapi import Query, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional
@@ -32,7 +33,6 @@ from sources.excel import sync_excel_url, sync_excel_bytes
 from sources.website import sync_website
 
 import sqlalchemy
-
 import hmac
 import hashlib
 import time
@@ -50,8 +50,19 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")  # FIX: lock down CORS origin
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+META_APP_ID = os.getenv("META_APP_ID")
+META_APP_SECRET = os.getenv("META_APP_SECRET")
 
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
 
@@ -72,7 +83,6 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.add_middleware(
     CORSMiddleware,
-    # FIX: Restrict CORS to your frontend origin instead of wildcard
     allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
@@ -86,11 +96,6 @@ app.add_middleware(
 bearer_scheme = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)):
-    """
-    FIX: Verify the Supabase JWT on every protected endpoint.
-    Uses Supabase's get_user() which validates the token server-side.
-    Returns the user object so endpoints can use user.id if needed.
-    """
     token = credentials.credentials
     try:
         user_response = supabase.auth.get_user(token)
@@ -121,8 +126,147 @@ class ChatRequest(BaseModel):
 class PublicChatRequest(BaseModel):
     projectId: str
     message: str
-    # FIX: Accept an optional sessionId so public chat can maintain history across turns
     sessionId: Optional[str] = None
+
+
+# -------------------------------------------------
+# PLAN LIMITS & RATE LIMITING
+# -------------------------------------------------
+PLAN_LIMITS = {
+    "free":     {"conversations": 100,   "projects": 1},
+    "pro":      {"conversations": 1000,  "projects": 5},
+    "business": {"conversations": 7500,  "projects": None},
+}
+
+def get_current_month() -> str:
+    return datetime.utcnow().strftime("%Y-%m")
+
+def check_rate_limit(project_id: str) -> dict:
+    proj = supabase.table("projects") \
+        .select("user_id") \
+        .eq("id", project_id) \
+        .single() \
+        .execute()
+
+    if not proj.data:
+        return {"allowed": False, "reason": "Project not found"}
+
+    user_id = proj.data["user_id"]
+
+    profile = supabase.table("profiles") \
+        .select("plan") \
+        .eq("id", user_id) \
+        .single() \
+        .execute()
+
+    plan = "free"
+    if profile.data and profile.data.get("plan"):
+        plan = profile.data["plan"]
+
+    limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    month = get_current_month()
+
+    try:
+        usage = supabase.table("usage") \
+            .select("count") \
+            .eq("user_id", user_id) \
+            .eq("month", month) \
+            .single() \
+            .execute()
+        current_count = usage.data.get("count", 0) if usage.data else 0
+    except Exception:
+        current_count = 0
+
+    if current_count >= limit["conversations"]:
+        return {
+            "allowed": False,
+            "reason": f"Monthly limit of {limit['conversations']} conversations reached. Please upgrade your plan.",
+            "plan": plan,
+            "usage": current_count,
+            "limit": limit["conversations"],
+        }
+
+    return {
+        "allowed": True,
+        "plan": plan,
+        "usage": current_count,
+        "limit": limit["conversations"],
+    }
+
+def increment_usage(project_id: str):
+    try:
+        proj = supabase.table("projects") \
+            .select("user_id") \
+            .eq("id", project_id) \
+            .single() \
+            .execute()
+
+        if not proj.data:
+            return
+
+        user_id = proj.data["user_id"]
+        month = get_current_month()
+
+        existing = supabase.table("usage") \
+            .select("id, count") \
+            .eq("user_id", user_id) \
+            .eq("month", month) \
+            .single() \
+            .execute()
+
+        if existing.data:
+            supabase.table("usage") \
+                .update({"count": existing.data["count"] + 1}) \
+                .eq("id", existing.data["id"]) \
+                .execute()
+        else:
+            supabase.table("usage").insert({
+                "user_id": user_id,
+                "month": month,
+                "count": 1,
+            }).execute()
+    except Exception as e:
+        print(f"increment_usage error: {e}")
+
+
+# -------------------------------------------------
+# USAGE STATUS ENDPOINT
+# -------------------------------------------------
+@app.get("/usage/status")
+def usage_status(user=Depends(verify_token)):
+    user_id = user.id
+    month = get_current_month()
+
+    profile = supabase.table("profiles") \
+        .select("plan") \
+        .eq("id", user_id) \
+        .single() \
+        .execute()
+
+    plan = "free"
+    if profile.data and profile.data.get("plan"):
+        plan = profile.data["plan"]
+
+    limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+    try:
+        usage = supabase.table("usage") \
+            .select("count") \
+            .eq("user_id", user_id) \
+            .eq("month", month) \
+            .single() \
+            .execute()
+        count = usage.data.get("count", 0) if usage.data else 0
+    except Exception:
+        count = 0
+
+    return {
+        "plan": plan,
+        "usage": count,
+        "limit": limit["conversations"],
+        "remaining": max(0, limit["conversations"] - count),
+        "month": month,
+    }
 
 
 # -------------------------------------------------
@@ -155,7 +299,6 @@ def extract_txt(b):
 
 # -------------------------------------------------
 # INGEST
-# FIX: Protected with verify_token — only authenticated users can ingest
 # -------------------------------------------------
 @app.post("/ingest")
 def ingest(req: IngestRequest, user=Depends(verify_token)):
@@ -194,7 +337,7 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
                 "file_id": file_id,
                 "filename": req.filename,
                 "page_number": page,
-                "source_type": "document",  # ADD THIS
+                "source_type": "document",
                 "text": c,
             })
 
@@ -234,6 +377,7 @@ def save_message(chat_id: str, role: str, content: str):
         "content": content
     }).execute()
 
+
 # -------------------------------------------------
 # INTENT DETECTION
 # -------------------------------------------------
@@ -269,12 +413,6 @@ def get_project_domain(project_id: str):
 # SOURCE INTENT CLASSIFIER
 # -------------------------------------------------
 def classify_source_intent(message: str) -> str:
-    """
-    Classifies whether the question is looking up a specific record (structured)
-    or asking about a concept/process (conceptual).
-    structured → search gsheets/postgres
-    conceptual → search documents
-    """
     resp = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{
@@ -294,7 +432,6 @@ Reply with only one word: structured or conceptual"""
         max_tokens=10,
     )
     result = resp.choices[0].message.content.strip().lower()
-    # Safety fallback — if LLM returns something unexpected, default to conceptual
     return result if result in ("structured", "conceptual") else "conceptual"
 
 
@@ -347,18 +484,14 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 
         intent = classify_intent(message)
 
-        # 1. Greeting
         if intent == "greeting":
             return {"answer": "Hey! 👋 What can I help you with?", "sources": []}
 
-        # 2. Thanks
         if intent == "thanks":
             return {"answer": "You're welcome! 😊", "sources": []}
 
-        # Save user message for all real intents
         save_message(chat_id, "user", message)
 
-        # 3. Conversational — history only, no retrieval needed
         if intent == "conversational":
             messages = [{"role": "system", "content": system_prompt}]
             for h in history[-7:]:
@@ -375,10 +508,8 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
-        # 4. Classify source intent — structured (sheet/db) or conceptual (docs)
         source_intent = classify_source_intent(message)
 
-        # Expand short queries with last user message for better recall
         query_for_embedding = message
         if len(message.split()) <= 4 and history:
             last_user_msgs = [m for m in history if m["role"] == "user"]
@@ -386,14 +517,9 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 query_for_embedding = last_user_msgs[-1]["content"] + " " + message
 
         q = embeddings.embed_query(query_for_embedding)
-
         context = None
 
-        # -------------------------------------------------
-        # 5. Route to correct source based on intent
-        # -------------------------------------------------
         if source_intent == "structured":
-            # Try gsheets chunks in Qdrant first
             res = qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
                 query=q,
@@ -412,7 +538,6 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: gsheets]\n{h.payload.get('text', '')}" for h in hits
                 )
             else:
-                # Fallback: try postgres text-to-SQL
                 pg_source = supabase.table("data_sources") \
                     .select("config, allowed_schema") \
                     .eq("project_id", project_id) \
@@ -426,11 +551,9 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
                     context = f"[Source: database]\n{sql_result}"
                 else:
-                    # No structured source found — fall through to document search
                     source_intent = "conceptual"
 
         if source_intent == "conceptual":
-            # Search document chunks only
             res = qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
                 query=q,
@@ -438,7 +561,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 query_filter=models.Filter(
                     must=[
                         models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
-                        models. models.FieldCondition(key="source_type", match=models.MatchAny(any=["document", "website"])),
+                        models.FieldCondition(key="source_type", match=models.MatchAny(any=["document", "website"])),
                     ]
                 )
             )
@@ -449,17 +572,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: document]\n{h.payload.get('text', '')}" for h in hits
                 )
 
-        # -------------------------------------------------
-        # 6. If nothing found anywhere, give up cleanly
-        # -------------------------------------------------
         if not context:
             answer = "I couldn't find that in your documents or data sources."
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
-        # -------------------------------------------------
-        # 7. Build LLM messages and generate answer
-        # -------------------------------------------------
         messages = [{"role": "system", "content": system_prompt}]
         for h in history[-7:]:
             messages.append({"role": h["role"], "content": h["content"]})
@@ -485,34 +602,24 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 
 
 # -------------------------------------------------
-# INGEST — make sure source_type: "document" is set
-# (update your existing ingest endpoint's metas to include this)
-# -------------------------------------------------
-# metas.append({
-#     "project_id": req.projectId,
-#     "file_id": file_id,
-#     "filename": req.filename,
-#     "page_number": page,
-#     "source_type": "document",   <-- ADD THIS LINE
-#     "text": c,
-# })
-
-
-# -------------------------------------------------
 # CHAT ENDPOINTS
-# FIX: /chat is protected with verify_token
 # -------------------------------------------------
 @app.post("/chat")
 def chat(req: ChatRequest, user=Depends(verify_token)):
+    rate_check = check_rate_limit(req.projectId)
+    if not rate_check["allowed"]:
+        raise HTTPException(status_code=429, detail=rate_check["reason"])
+
     history = get_history(req.chatId, limit=7)
-    return run_chat(req.projectId, req.chatId, req.message, history)
+    result = run_chat(req.projectId, req.chatId, req.message, history)
+    increment_usage(req.projectId)
+    return result
+
 
 @app.post("/public/chat")
 def public_chat(req: PublicChatRequest):
     session_id = req.sessionId or str(uuid.uuid4())
-    
-    # FIX: ensure a chat record exists for this session
-    # so chat_messages foreign key constraint doesn't fail
+
     existing = supabase.table("chats").select("id").eq("id", session_id).execute()
     if not existing.data:
         supabase.table("chats").insert({
@@ -522,14 +629,22 @@ def public_chat(req: PublicChatRequest):
             "channel": "public",
         }).execute()
 
+    rate_check = check_rate_limit(req.projectId)
+    if not rate_check["allowed"]:
+        return {
+            "answer": "Sorry, this assistant has reached its monthly limit. Please try again next month.",
+            "sessionId": session_id,
+        }
+
     history = get_history(session_id, limit=7) if req.sessionId else []
     result = run_chat(req.projectId, session_id, req.message, history)
     result["sessionId"] = session_id
+    increment_usage(req.projectId)
     return result
+
 
 # -------------------------------------------------
 # DELETE DOCUMENT
-# FIX: Protected with verify_token
 # -------------------------------------------------
 @app.delete("/document/{file_id}")
 def delete_document(file_id: str, user=Depends(verify_token)):
@@ -551,19 +666,15 @@ def health():
     return {"status": "ok"}
 
 
-
-
-########
-#Sources
-########
-
+# -------------------------------------------------
+# SOURCES
+# -------------------------------------------------
 @app.get("/sources")
 def list_sources(project_id: str, user=Depends(verify_token)):
     res = supabase.table("data_sources") \
         .select("*") \
         .eq("project_id", project_id) \
         .execute()
-
     return res.data
 
 @app.post("/sources/add")
@@ -576,9 +687,9 @@ def add_source(data: dict, user=Depends(verify_token)):
         "allowed_schema": data.get("allowed_schema"),
     }).execute()
     source = res.data[0]
- 
+
     skipped_tabs = []
- 
+
     if data["type"] == "gsheets":
         cfg = data["config"]
         result = sync_sheet(
@@ -586,14 +697,14 @@ def add_source(data: dict, user=Depends(verify_token)):
             source["id"], qdrant, embeddings, QDRANT_COLLECTION
         )
         skipped_tabs = result.get("skipped_tabs", [])
- 
+
     elif data["type"] == "excel_online":
         cfg = data["config"]
         sync_excel_url(
             cfg["url"], data["projectId"],
             source["id"], qdrant, embeddings, QDRANT_COLLECTION
         )
- 
+
     elif data["type"] == "website":
         cfg = data["config"]
         result = sync_website(
@@ -606,14 +717,13 @@ def add_source(data: dict, user=Depends(verify_token)):
             full_site=cfg.get("full_site", True),
             max_pages=cfg.get("max_pages", 50),
         )
-        # FIX: if nothing was indexed, delete the source record and tell the user
         if result["pages_indexed"] == 0:
             supabase.table("data_sources").delete().eq("id", source["id"]).execute()
             raise HTTPException(
                 status_code=400,
-                detail="Could not crawl this website. It may be blocking automated access (anti-bot protection). Try a different website or contact the site owner."
+                detail="Could not crawl this website. It may be blocking automated access."
             )
- 
+
     return {"id": source["id"], "skipped_tabs": skipped_tabs}
 
 @app.delete("/sources/{source_id}")
@@ -628,7 +738,7 @@ def delete_source(source_id: str, user=Depends(verify_token)):
 def resync_source(source_id: str, user=Depends(verify_token)):
     res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
     s = res.data
- 
+
     qdrant.delete(
         collection_name=QDRANT_COLLECTION,
         points_selector=models.Filter(
@@ -638,7 +748,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             )]
         )
     )
- 
+
     if s["type"] == "gsheets":
         cfg = s["config"]
         sync_sheet(
@@ -664,7 +774,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             full_site=cfg.get("full_site", True),
             max_pages=cfg.get("max_pages", 50),
         )
- 
+
     return {"status": "synced"}
 
 @app.post("/sources/introspect")
@@ -684,14 +794,12 @@ async def upload_excel(
     file: UploadFile = File(...),
     projectId: str = Form(...),
     label: str = Form(""),
-    source_id: str = Form(""),   # optional — if provided, overwrite this source
+    source_id: str = Form(""),
     user=Depends(verify_token)
 ):
     file_bytes = await file.read()
 
     if source_id:
-        # Overwrite existing source — delete old Qdrant points and reuse record
-        s = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
         sync_excel_bytes(file_bytes, projectId, source_id, qdrant, embeddings, QDRANT_COLLECTION)
         supabase.table("data_sources").update({
             "config": {"filename": file.filename},
@@ -699,7 +807,6 @@ async def upload_excel(
         }).eq("id", source_id).execute()
         return {"id": source_id, "filename": file.filename}
 
-    # New source
     res = supabase.table("data_sources").insert({
         "project_id": projectId,
         "type": "excel_local",
@@ -713,198 +820,8 @@ async def upload_excel(
     return {"id": source["id"], "filename": file.filename}
 
 
-
-# Add this import at the top of main.py
-import httpx
-
-# ─────────────────────────────────────────────────────────
-# TELEGRAM HELPER
-# ─────────────────────────────────────────────────────────
-def send_telegram_message(bot_token: str, chat_id: int, text: str):
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
-
-
-def set_telegram_webhook(bot_token: str, webhook_url: str):
-    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
-    res = requests.post(url, json={"url": webhook_url})
-    return res.json()
-
-
-def get_bot_info(bot_token: str):
-    url = f"https://api.telegram.org/bot{bot_token}/getMe"
-    res = requests.get(url)
-    return res.json()
-
-
-# ─────────────────────────────────────────────────────────
-# CONNECT TELEGRAM — save token + set webhook
-# ─────────────────────────────────────────────────────────
-@app.post("/telegram/connect")
-def telegram_connect(data: dict, user=Depends(verify_token)):
-    bot_token = data["bot_token"]
-    project_id = data["projectId"]
-
-    # Verify token is valid by calling getMe
-    bot_info = get_bot_info(bot_token)
-    if not bot_info.get("ok"):
-        raise HTTPException(status_code=400, detail="Invalid bot token. Make sure you copied it correctly from @BotFather.")
-
-    bot_username = bot_info["result"]["username"]
-
-    # Save to Supabase
-    supabase.table("telegram_integrations").upsert({
-        "project_id": project_id,
-        "bot_token": bot_token,
-        "bot_username": bot_username,
-    }, on_conflict="project_id").execute()
-
-    # Set webhook so Telegram sends messages to our server
-    webhook_url = f"{os.getenv('BACKEND_PUBLIC_URL')}/webhook/telegram/{project_id}"
-    result = set_telegram_webhook(bot_token, webhook_url)
-
-    if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=f"Could not set webhook: {result}")
-
-    return {"success": True, "bot_username": bot_username}
-
-
-# ─────────────────────────────────────────────────────────
-# DISCONNECT TELEGRAM
-# ─────────────────────────────────────────────────────────
-@app.delete("/telegram/disconnect/{project_id}")
-def telegram_disconnect(project_id: str, user=Depends(verify_token)):
-    # Get token first to remove webhook
-    res = supabase.table("telegram_integrations") \
-        .select("bot_token") \
-        .eq("project_id", project_id) \
-        .single() \
-        .execute()
-
-    if res.data:
-        bot_token = res.data["bot_token"]
-        # Remove webhook
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
-        )
-
-    supabase.table("telegram_integrations") \
-        .delete() \
-        .eq("project_id", project_id) \
-        .execute()
-
-    return {"success": True}
-
-
-# ─────────────────────────────────────────────────────────
-# GET TELEGRAM STATUS
-# ─────────────────────────────────────────────────────────
-@app.get("/telegram/status/{project_id}")
-def telegram_status(project_id: str, user=Depends(verify_token)):
-    res = supabase.table("telegram_integrations") \
-        .select("bot_username, created_at") \
-        .eq("project_id", project_id) \
-        .execute()
-
-    if res.data:
-        return {"connected": True, "bot_username": res.data[0]["bot_username"]}
-    return {"connected": False}
-
-
-# ─────────────────────────────────────────────────────────
-# TELEGRAM WEBHOOK — receives messages from Telegram
-# ─────────────────────────────────────────────────────────
-@app.post("/webhook/telegram/{project_id}")
-async def telegram_webhook(project_id: str, req: Request):
-    body = await req.json()
-    print(f"TELEGRAM BODY: {body}") 
- 
-    try:
-        message = body.get("message") or body.get("edited_message")
-        if not message or "text" not in message:
-            return {"status": "ignored"}
- 
-        text = message["text"]
-        chat_id = message["chat"]["id"]
-        chat_type = message["chat"]["type"]  # "private", "group", "supergroup"
-        telegram_user_id = str(message["from"]["id"])
-        username = message["from"].get("username") or message["from"].get("first_name", "User")
- 
-        # Get integration — single DB fetch for everything we need
-        res = supabase.table("telegram_integrations") \
-            .select("bot_token, bot_username") \
-            .eq("project_id", project_id) \
-            .single() \
-            .execute()
- 
-        if not res.data:
-            return {"error": "integration not found"}
- 
-        bot_token = res.data["bot_token"]
-        bot_username = res.data["bot_username"]
- 
-        # ── Group chat handling ──────────────────────────────
-        if chat_type in ("group", "supergroup"):
-            mention = f"@{bot_username}"
-            if mention.lower() not in text.lower():
-                # Bot not mentioned — ignore completely
-                return {"status": "ignored"}
-            # Strip the mention so RAG gets a clean query
-            text = text.replace(mention, "").replace(mention.lower(), "").strip()
-            if not text:
-                # Message was just the mention with no question
-                send_telegram_message(bot_token, chat_id, "👋 Yes? Ask me anything!")
-                return {"status": "ok"}
- 
-        # ── Handle /start ────────────────────────────────────
-        if text.startswith("/start"):
-            send_telegram_message(
-                bot_token, chat_id,
-                f"👋 Hi @{username}! I'm ready to help. Ask me anything!"
-            )
-            return {"status": "ok"}
- 
-        # ── Ignore other commands ────────────────────────────
-        if text.startswith("/"):
-            return {"status": "ignored"}
- 
-        # ── Get or create per-user chat session ──────────────
-        # Use telegram_user_id (not chat_id) so each person has
-        # their own memory even in group chats
-        chat = supabase.table("chats") \
-            .select("id") \
-            .eq("project_id", project_id) \
-            .eq("external_id", telegram_user_id) \
-            .eq("channel", "telegram") \
-            .limit(1) \
-            .execute()
- 
-        if chat.data:
-            chat_id_db = chat.data[0]["id"]
-        else:
-            new_chat = supabase.table("chats").insert({
-                "project_id": project_id,
-                "external_id": telegram_user_id,
-                "channel": "telegram",
-                "title": f"Telegram @{username}",
-            }).execute()
-            chat_id_db = new_chat.data[0]["id"]
- 
-        # ── RAG + reply ──────────────────────────────────────
-        history = get_history(chat_id_db, limit=5)
-        result = run_chat(project_id, chat_id_db, text, history)
-        answer = result["answer"]
- 
-        send_telegram_message(bot_token, chat_id, answer)
-        return {"status": "ok"}
- 
-    except Exception as e:
-        print(f"TELEGRAM WEBHOOK ERROR: {e}")
-        return {"status": "error"}
-
 # -------------------------------------------------
-# LEAD CAPTURE CONFIG — public (widget fetches on load)
+# LEAD CAPTURE
 # -------------------------------------------------
 @app.get("/public/lead-config/{project_id}")
 def get_lead_config(project_id: str):
@@ -919,9 +836,6 @@ def get_lead_config(project_id: str):
     return res.data[0]
 
 
-# -------------------------------------------------
-# LEAD SUBMIT — public (widget posts here)
-# -------------------------------------------------
 class LeadSubmitRequest(BaseModel):
     project_id: str
     session_id: str
@@ -931,7 +845,6 @@ class LeadSubmitRequest(BaseModel):
 
 @app.post("/public/leads")
 def submit_lead(req: LeadSubmitRequest):
-    # Prevent duplicate for same session
     existing = supabase.table("leads") \
         .select("id") \
         .eq("session_id", req.session_id) \
@@ -959,9 +872,6 @@ def submit_lead(req: LeadSubmitRequest):
     return {"status": "captured"}
 
 
-# -------------------------------------------------
-# LEAD CONFIG SAVE — dashboard (protected)
-# -------------------------------------------------
 class LeadConfigRequest(BaseModel):
     projectId: str
     enabled: bool
@@ -981,9 +891,6 @@ def save_lead_config(req: LeadConfigRequest, user=Depends(verify_token)):
     return {"status": "saved"}
 
 
-# -------------------------------------------------
-# LEADS LIST — dashboard (protected)
-# -------------------------------------------------
 @app.get("/leads")
 def get_leads(project_id: str, user=Depends(verify_token)):
     res = supabase.table("leads") \
@@ -994,18 +901,163 @@ def get_leads(project_id: str, user=Depends(verify_token)):
     return res.data
 
 
-SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
-SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK HELPERS
-# ─────────────────────────────────────────────────────────
+# -------------------------------------------------
+# TELEGRAM
+# -------------------------------------------------
+def send_telegram_message(bot_token: str, chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
+
+def set_telegram_webhook(bot_token: str, webhook_url: str):
+    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
+    res = requests.post(url, json={"url": webhook_url})
+    return res.json()
+
+def get_bot_info(bot_token: str):
+    url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    res = requests.get(url)
+    return res.json()
+
+
+@app.post("/telegram/connect")
+def telegram_connect(data: dict, user=Depends(verify_token)):
+    bot_token = data["bot_token"]
+    project_id = data["projectId"]
+
+    bot_info = get_bot_info(bot_token)
+    if not bot_info.get("ok"):
+        raise HTTPException(status_code=400, detail="Invalid bot token.")
+
+    bot_username = bot_info["result"]["username"]
+
+    supabase.table("telegram_integrations").upsert({
+        "project_id": project_id,
+        "bot_token": bot_token,
+        "bot_username": bot_username,
+    }, on_conflict="project_id").execute()
+
+    webhook_url = f"{os.getenv('BACKEND_PUBLIC_URL')}/webhook/telegram/{project_id}"
+    result = set_telegram_webhook(bot_token, webhook_url)
+
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=f"Could not set webhook: {result}")
+
+    return {"success": True, "bot_username": bot_username}
+
+
+@app.delete("/telegram/disconnect/{project_id}")
+def telegram_disconnect(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("telegram_integrations") \
+        .select("bot_token") \
+        .eq("project_id", project_id) \
+        .single() \
+        .execute()
+
+    if res.data:
+        requests.post(f"https://api.telegram.org/bot{res.data['bot_token']}/deleteWebhook")
+
+    supabase.table("telegram_integrations").delete().eq("project_id", project_id).execute()
+    return {"success": True}
+
+
+@app.get("/telegram/status/{project_id}")
+def telegram_status(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("telegram_integrations") \
+        .select("bot_username, created_at") \
+        .eq("project_id", project_id) \
+        .execute()
+
+    if res.data:
+        return {"connected": True, "bot_username": res.data[0]["bot_username"]}
+    return {"connected": False}
+
+
+@app.post("/webhook/telegram/{project_id}")
+async def telegram_webhook(project_id: str, req: Request):
+    body = await req.json()
+    print(f"TELEGRAM BODY: {body}")
+
+    try:
+        message = body.get("message") or body.get("edited_message")
+        if not message or "text" not in message:
+            return {"status": "ignored"}
+
+        text = message["text"]
+        chat_id = message["chat"]["id"]
+        chat_type = message["chat"]["type"]
+        telegram_user_id = str(message["from"]["id"])
+        username = message["from"].get("username") or message["from"].get("first_name", "User")
+
+        res = supabase.table("telegram_integrations") \
+            .select("bot_token, bot_username") \
+            .eq("project_id", project_id) \
+            .single() \
+            .execute()
+
+        if not res.data:
+            return {"error": "integration not found"}
+
+        bot_token = res.data["bot_token"]
+        bot_username = res.data["bot_username"]
+
+        if chat_type in ("group", "supergroup"):
+            mention = f"@{bot_username}"
+            if mention.lower() not in text.lower():
+                return {"status": "ignored"}
+            text = text.replace(mention, "").replace(mention.lower(), "").strip()
+            if not text:
+                send_telegram_message(bot_token, chat_id, "👋 Yes? Ask me anything!")
+                return {"status": "ok"}
+
+        if text.startswith("/start"):
+            send_telegram_message(bot_token, chat_id, f"👋 Hi @{username}! I'm ready to help. Ask me anything!")
+            return {"status": "ok"}
+
+        if text.startswith("/"):
+            return {"status": "ignored"}
+
+        chat = supabase.table("chats") \
+            .select("id") \
+            .eq("project_id", project_id) \
+            .eq("external_id", telegram_user_id) \
+            .eq("channel", "telegram") \
+            .limit(1) \
+            .execute()
+
+        if chat.data:
+            chat_id_db = chat.data[0]["id"]
+        else:
+            new_chat = supabase.table("chats").insert({
+                "project_id": project_id,
+                "external_id": telegram_user_id,
+                "channel": "telegram",
+                "title": f"Telegram @{username}",
+            }).execute()
+            chat_id_db = new_chat.data[0]["id"]
+
+        rate_check = check_rate_limit(project_id)
+        if not rate_check["allowed"]:
+            send_telegram_message(bot_token, chat_id, "⚠️ Monthly message limit reached. Please try again next month.")
+            return {"status": "rate_limited"}
+
+        history = get_history(chat_id_db, limit=5)
+        result = run_chat(project_id, chat_id_db, text, history)
+        send_telegram_message(bot_token, chat_id, result["answer"])
+        increment_usage(project_id)
+        return {"status": "ok"}
+
+    except Exception as e:
+        print(f"TELEGRAM WEBHOOK ERROR: {e}")
+        return {"status": "error"}
+
+
+# -------------------------------------------------
+# SLACK
+# -------------------------------------------------
 def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
-    """Verify the request is genuinely from Slack."""
     if abs(time.time() - int(timestamp)) > 300:
-        return False  # reject requests older than 5 minutes
+        return False
     sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
     my_sig = "v0=" + hmac.new(
         SLACK_SIGNING_SECRET.encode(),
@@ -1013,23 +1065,18 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
         hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(my_sig, signature)
- 
- 
+
 def send_slack_message(access_token: str, channel: str, text: str):
     requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {access_token}"},
         json={"channel": channel, "text": text}
     )
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK OAUTH — Step 1: Generate auth URL
-# ─────────────────────────────────────────────────────────
+
+
 @app.get("/slack/auth-url")
 def slack_auth_url(project_id: str, user=Depends(verify_token)):
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-    redirect_uri = f"{frontend_url}/api/slack/callback"
+    redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
     scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
     url = (
         f"https://slack.com/oauth/v2/authorize"
@@ -1039,19 +1086,14 @@ def slack_auth_url(project_id: str, user=Depends(verify_token)):
         f"&state={project_id}"
     )
     return {"url": url}
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK OAUTH — Step 2: Handle callback, exchange code for token
-# ─────────────────────────────────────────────────────────
+
+
 @app.post("/slack/callback")
 def slack_callback(data: dict):
     code = data["code"]
     project_id = data["project_id"]
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-    redirect_uri = f"{frontend_url}/api/slack/callback"
- 
-    # Exchange code for access token
+    redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
+
     res = requests.post("https://slack.com/api/oauth.v2.access", data={
         "client_id": SLACK_CLIENT_ID,
         "client_secret": SLACK_CLIENT_SECRET,
@@ -1059,29 +1101,21 @@ def slack_callback(data: dict):
         "redirect_uri": redirect_uri,
     })
     token_data = res.json()
- 
+
     if not token_data.get("ok"):
         raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {token_data.get('error')}")
- 
-    access_token = token_data["access_token"]
-    team_id = token_data["team"]["id"]
-    team_name = token_data["team"]["name"]
-    bot_user_id = token_data["bot_user_id"]
- 
+
     supabase.table("slack_integrations").upsert({
         "project_id": project_id,
-        "access_token": access_token,
-        "team_id": team_id,
-        "team_name": team_name,
-        "bot_user_id": bot_user_id,
+        "access_token": token_data["access_token"],
+        "team_id": token_data["team"]["id"],
+        "team_name": token_data["team"]["name"],
+        "bot_user_id": token_data["bot_user_id"],
     }, on_conflict="project_id").execute()
- 
-    return {"success": True, "team_name": team_name}
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK STATUS
-# ─────────────────────────────────────────────────────────
+
+    return {"success": True, "team_name": token_data["team"]["name"]}
+
+
 @app.get("/slack/status/{project_id}")
 def slack_status(project_id: str, user=Depends(verify_token)):
     res = supabase.table("slack_integrations") \
@@ -1091,75 +1125,62 @@ def slack_status(project_id: str, user=Depends(verify_token)):
     if res.data:
         return {"connected": True, "team_name": res.data[0]["team_name"]}
     return {"connected": False}
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK DISCONNECT
-# ─────────────────────────────────────────────────────────
+
+
 @app.delete("/slack/disconnect/{project_id}")
 def slack_disconnect(project_id: str, user=Depends(verify_token)):
     supabase.table("slack_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
- 
- 
-# ─────────────────────────────────────────────────────────
-# SLACK WEBHOOK — receives events from Slack
-# ─────────────────────────────────────────────────────────
+
+
 @app.post("/webhook/slack")
 async def slack_webhook(req: Request):
     body_bytes = await req.body()
     body = await req.json()
- 
-    # Handle Slack URL verification challenge (one-time setup)
+
     if body.get("type") == "url_verification":
         return {"challenge": body["challenge"]}
- 
-    # Verify signature
+
     timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
     signature = req.headers.get("X-Slack-Signature", "")
     if not verify_slack_signature(body_bytes, timestamp, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
- 
+
     event = body.get("event", {})
     event_type = event.get("type")
- 
-    # Handle app_mention and direct messages
+
     if event_type not in ("app_mention", "message"):
         return {"status": "ignored"}
- 
-    # Ignore bot's own messages
+
     if event.get("bot_id") or event.get("subtype"):
         return {"status": "ignored"}
- 
+
     text = event.get("text", "").strip()
     channel = event.get("channel")
     user_id = event.get("user")
     team_id = body.get("team_id")
- 
+
     if not text or not channel or not user_id:
         return {"status": "ignored"}
- 
-    # Find project by team_id
+
     res = supabase.table("slack_integrations") \
         .select("project_id, access_token, bot_user_id") \
         .eq("team_id", team_id) \
         .single() \
         .execute()
- 
+
     if not res.data:
         return {"error": "integration not found"}
- 
+
     project_id = res.data["project_id"]
     access_token = res.data["access_token"]
     bot_user_id = res.data["bot_user_id"]
- 
-    # Strip bot mention from text
+
     text = text.replace(f"<@{bot_user_id}>", "").strip()
     if not text:
         send_slack_message(access_token, channel, "👋 Yes? Ask me anything!")
         return {"status": "ok"}
- 
-    # Get or create chat session per Slack user
+
     chat = supabase.table("chats") \
         .select("id") \
         .eq("project_id", project_id) \
@@ -1167,7 +1188,7 @@ async def slack_webhook(req: Request):
         .eq("channel", "slack") \
         .limit(1) \
         .execute()
- 
+
     if chat.data:
         chat_id = chat.data[0]["id"]
     else:
@@ -1178,23 +1199,22 @@ async def slack_webhook(req: Request):
             "title": f"Slack {user_id}",
         }).execute()
         chat_id = new_chat.data[0]["id"]
- 
-    # RAG + reply
+
+    rate_check = check_rate_limit(project_id)
+    if not rate_check["allowed"]:
+        send_slack_message(access_token, channel, "⚠️ Monthly message limit reached. Please try again next month.")
+        return {"status": "rate_limited"}
+
     history = get_history(chat_id, limit=5)
     result = run_chat(project_id, chat_id, text, history)
     send_slack_message(access_token, channel, result["answer"])
- 
+    increment_usage(project_id)
     return {"status": "ok"}
 
 
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP HELPER — send a message
-# ─────────────────────────────────────────────────────────
+# -------------------------------------------------
+# WHATSAPP
+# -------------------------------------------------
 def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None):
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
@@ -1213,70 +1233,60 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
     if not res.ok:
         print(f"WhatsApp send error: {res.text}")
     return res
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP WEBHOOK — GET (verification)
-# ─────────────────────────────────────────────────────────
+
+
 @app.get("/webhook/whatsapp")
 async def whatsapp_verify(request: Request):
     params = dict(request.query_params)
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
- 
+
     if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
         print("WhatsApp webhook verified")
         return PlainTextResponse(challenge)
- 
+
     raise HTTPException(status_code=403, detail="Verification failed")
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP WEBHOOK — POST (incoming messages)
-# ─────────────────────────────────────────────────────────
+
+
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     body = await request.json()
- 
+
     try:
         entry = body.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
- 
-        # Ignore status updates (delivered, read, etc.)
+
         if "statuses" in value:
             return {"status": "ignored"}
- 
+
         messages = value.get("messages", [])
         if not messages:
             return {"status": "ignored"}
- 
+
         message = messages[0]
         msg_type = message.get("type")
- 
-        # Only handle text messages
+
         if msg_type != "text":
             return {"status": "ignored"}
- 
-        from_number = message["from"]  # e.g. "919876543210"
+
+        from_number = message["from"]
         text = message["text"]["body"].strip()
         waba_id = value.get("metadata", {}).get("phone_number_id")
- 
-        # Find project by phone_number_id
+
         res = supabase.table("whatsapp_integrations") \
             .select("project_id") \
             .eq("phone_number_id", waba_id or WHATSAPP_PHONE_NUMBER_ID) \
             .single() \
             .execute()
- 
+
         if not res.data:
             print(f"No project found for phone_number_id: {waba_id}")
             return {"status": "ignored"}
- 
+
         project_id = res.data["project_id"]
- 
-        # Get or create chat session per WhatsApp user
+
         chat = supabase.table("chats") \
             .select("id") \
             .eq("project_id", project_id) \
@@ -1284,7 +1294,7 @@ async def whatsapp_webhook(request: Request):
             .eq("channel", "whatsapp") \
             .limit(1) \
             .execute()
- 
+
         if chat.data:
             chat_id = chat.data[0]["id"]
         else:
@@ -1295,59 +1305,52 @@ async def whatsapp_webhook(request: Request):
                 "title": f"WhatsApp {from_number}",
             }).execute()
             chat_id = new_chat.data[0]["id"]
- 
-        # RAG + reply
+
+        rate_check = check_rate_limit(project_id)
+        if not rate_check["allowed"]:
+            send_whatsapp_message(from_number, "⚠️ Monthly message limit reached. Please try again next month.")
+            return {"status": "rate_limited"}
+
         history = get_history(chat_id, limit=5)
         result = run_chat(project_id, chat_id, text, history)
-        answer = result["answer"]
- 
-        send_whatsapp_message(from_number, answer)
+        send_whatsapp_message(from_number, result["answer"])
+        increment_usage(project_id)
         return {"status": "ok"}
- 
+
     except Exception as e:
         print(f"WHATSAPP WEBHOOK ERROR: {e}")
         return {"status": "error"}
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP STATUS — get connected number for a project
-# ─────────────────────────────────────────────────────────
+
+
 @app.get("/whatsapp/status/{project_id}")
 def whatsapp_status(project_id: str, user=Depends(verify_token)):
     res = supabase.table("whatsapp_integrations") \
         .select("phone_number_id, display_phone_number, waba_id") \
         .eq("project_id", project_id) \
         .execute()
- 
+
     if res.data:
         return {"connected": True, **res.data[0]}
     return {"connected": False}
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP CONNECT — save phone number + project mapping
-# Called after embedded signup or manual setup
-# ─────────────────────────────────────────────────────────
+
+
 @app.post("/whatsapp/connect")
 def whatsapp_connect(data: dict, user=Depends(verify_token)):
     project_id = data["projectId"]
     phone_number_id = data["phone_number_id"]
     waba_id = data.get("waba_id", "")
     display_phone_number = data.get("display_phone_number", "")
- 
+
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
         "phone_number_id": phone_number_id,
         "waba_id": waba_id,
         "display_phone_number": display_phone_number,
     }, on_conflict="project_id").execute()
- 
+
     return {"success": True}
- 
- 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP DISCONNECT
-# ─────────────────────────────────────────────────────────
+
+
 @app.delete("/whatsapp/disconnect/{project_id}")
 def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
     supabase.table("whatsapp_integrations") \
@@ -1356,20 +1359,12 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
         .execute()
     return {"success": True}
 
-# ─────────────────────────────────────────────────────────
-# WHATSAPP ONBOARD — exchange OAuth code for token
-# Called after embedded signup FB.login callback
-# ─────────────────────────────────────────────────────────
-@app.post("/whatsapp/onboard")
+
 @app.post("/whatsapp/onboard")
 def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     code = data["code"]
     project_id = data["projectId"]
 
-    META_APP_ID = os.getenv("META_APP_ID")
-    META_APP_SECRET = os.getenv("META_APP_SECRET")
-
-    # Exchange code for access token
     token_res = requests.get(
         "https://graph.facebook.com/v19.0/oauth/access_token",
         params={
@@ -1386,7 +1381,6 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 
     access_token = token_data["access_token"]
 
-    # Get all WABAs this token has access to
     waba_res = requests.get(
         "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
         params={"access_token": access_token}
@@ -1396,7 +1390,6 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 
     waba_id = waba_data.get("data", [{}])[0].get("id", "")
 
-    # Get phone numbers for this WABA
     phone_res = requests.get(
         f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
         params={"access_token": access_token}
@@ -1407,9 +1400,6 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     phone_number_id = phone_data.get("data", [{}])[0].get("id", "")
     display_phone = phone_data.get("data", [{}])[0].get("display_phone_number", "")
 
-    print(f"Saving: waba_id={waba_id}, phone_number_id={phone_number_id}, display={display_phone}")
-
-    # Save to DB
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
         "phone_number_id": phone_number_id,
