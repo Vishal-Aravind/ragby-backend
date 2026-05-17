@@ -183,16 +183,14 @@ def check_rate_limit(project_id: str) -> dict:
     limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
     month = get_current_month()
 
-    try:
-        usage = supabase.table("usage") \
-            .select("count") \
-            .eq("user_id", user_id) \
-            .eq("month", month) \
-            .single() \
-            .execute()
-        current_count = usage.data.get("count", 0) if usage.data else 0
-    except Exception:
-        current_count = 0
+    # ← removed .single() — use list instead
+    usage = supabase.table("usage") \
+        .select("count") \
+        .eq("user_id", user_id) \
+        .eq("month", month) \
+        .execute()
+
+    current_count = usage.data[0]["count"] if usage.data else 0
 
     if current_count >= limit["conversations"]:
         return {
@@ -224,17 +222,17 @@ def increment_usage(project_id: str):
         user_id = proj.data["user_id"]
         month = get_current_month()
 
+        # ← removed .single() — use list instead
         existing = supabase.table("usage") \
             .select("id, count") \
             .eq("user_id", user_id) \
             .eq("month", month) \
-            .single() \
             .execute()
 
         if existing.data:
             supabase.table("usage") \
-                .update({"count": existing.data["count"] + 1}) \
-                .eq("id", existing.data["id"]) \
+                .update({"count": existing.data[0]["count"] + 1}) \
+                .eq("id", existing.data[0]["id"]) \
                 .execute()
         else:
             supabase.table("usage").insert({
@@ -242,6 +240,7 @@ def increment_usage(project_id: str):
                 "month": month,
                 "count": 1,
             }).execute()
+
     except Exception as e:
         print(f"increment_usage error: {e}")
 
@@ -266,16 +265,14 @@ def usage_status(user=Depends(verify_token)):
 
     limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
 
-    try:
-        usage = supabase.table("usage") \
-            .select("count") \
-            .eq("user_id", user_id) \
-            .eq("month", month) \
-            .single() \
-            .execute()
-        count = usage.data.get("count", 0) if usage.data else 0
-    except Exception:
-        count = 0
+    # ← removed .single()
+    usage = supabase.table("usage") \
+        .select("count") \
+        .eq("user_id", user_id) \
+        .eq("month", month) \
+        .execute()
+
+    count = usage.data[0]["count"] if usage.data else 0
 
     return {
         "plan": plan,
