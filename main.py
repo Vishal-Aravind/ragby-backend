@@ -1524,14 +1524,14 @@ async def stripe_webhook(request: Request):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    event_type = event["type"]
-    data = event["data"]["object"]
-
-    # Convert StripeObject to plain dict
-    data = dict(data)
+    import json
+    # Parse raw payload as plain dict — bypass Stripe SDK objects entirely
+    raw = json.loads(payload)
+    event_type = raw["type"]
+    data = raw["data"]["object"]
 
     if event_type == "checkout.session.completed":
-        metadata = dict(data.get("metadata") or {})
+        metadata = data.get("metadata") or {}
         user_id = metadata.get("supabase_user_id")
         price_id = metadata.get("price_id")
         subscription_id = data.get("subscription")
@@ -1547,9 +1547,7 @@ async def stripe_webhook(request: Request):
 
     elif event_type == "customer.subscription.updated":
         subscription_id = data.get("id")
-        items = dict(data.get("items") or {})
-        item_data = items.get("data", [{}])
-        price_id = dict(dict(item_data[0]).get("price") or {}).get("id", "")
+        price_id = data.get("items", {}).get("data", [{}])[0].get("price", {}).get("id", "")
         status = data.get("status")
 
         profile = supabase.table("profiles") \
