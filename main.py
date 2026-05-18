@@ -150,9 +150,9 @@ class PublicChatRequest(BaseModel):
 # PLAN LIMITS & RATE LIMITING
 # -------------------------------------------------
 PLAN_LIMITS = {
-    "free":     {"conversations": 100,   "projects": 1},
-    "pro":      {"conversations": 1000,  "projects": 5},
-    "business": {"conversations": 7500,  "projects": None},
+    "free":     {"conversations": 300,   "projects": 1},
+    "pro":      {"conversations": 5000,  "projects": 3},
+    "business": {"conversations": 25000, "projects": None},
 }
 
 def get_current_month() -> str:
