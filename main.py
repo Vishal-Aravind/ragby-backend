@@ -1292,14 +1292,13 @@ async def whatsapp_webhook(request: Request):
         res = supabase.table("whatsapp_integrations") \
             .select("project_id") \
             .eq("phone_number_id", waba_id or WHATSAPP_PHONE_NUMBER_ID) \
-            .single() \
             .execute()
 
         if not res.data:
             print(f"No project found for phone_number_id: {waba_id}")
             return {"status": "ignored"}
 
-        project_id = res.data["project_id"]
+        project_id = res.data[0]["project_id"]
 
         chat = supabase.table("chats") \
             .select("id") \
