@@ -92,6 +92,11 @@ def run_text_to_sql(
     sql_prompt = f"""You are a {dialect} SQL expert. Given this schema:
 {schema}
 
+STRICT RULES:
+- NEVER use SELECT * — always list column names explicitly
+- Only use columns that appear in the schema above
+- Only write SELECT queries, never INSERT/UPDATE/DELETE
+
 Write a single safe read-only SELECT query to answer: "{question}"
 Use {dialect} syntax only.
 Return ONLY the SQL query, nothing else."""
