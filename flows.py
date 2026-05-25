@@ -1,12 +1,14 @@
 """
 Interactive Message Flows for WhatsApp
-Handles: flow execution, session management, button/list routing
+- Everything driven by button IDs, no global keywords
+- "ask_a_question" button ID → RAG mode + [Back to Menu] after every answer
+- "back_to_menu" button ID → restart flow
+- "handoff" button ID → human handoff
+- Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 from typing import Optional
-
+from fastapi import APIRouter, Depends
 from clients import supabase
 from auth import verify_token
 from whatsapp import (
@@ -18,29 +20,17 @@ from whatsapp import (
 
 router = APIRouter()
 
-
-# -------------------------------------------------
-# ESCAPE & HANDOFF KEYWORDS
-# -------------------------------------------------
-ESCAPE_KEYWORDS = {"menu", "back", "start", "main menu", "home"}
-HANDOFF_KEYWORDS = {"human", "agent", "support", "talk to human", "talk to agent"}
-OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "quit"}
-
-def is_escape_keyword(text: str) -> bool:
-    return text.lower().strip() in ESCAPE_KEYWORDS
-
-def is_handoff_keyword(text: str) -> bool:
-    return text.lower().strip() in HANDOFF_KEYWORDS
-
-def is_opt_out_keyword(text: str) -> bool:
-    return text.lower().strip() in OPT_OUT_KEYWORDS
+# Reserved button IDs — builder cannot use these for custom nodes
+RESERVED_ASK_AI   = "ask_a_question"
+RESERVED_BACK     = "back_to_menu"
+RESERVED_HANDOFF  = "talk_to_human"
 
 
 # -------------------------------------------------
 # SESSION MANAGEMENT
 # -------------------------------------------------
-def get_or_create_session(project_id: str, phone_number: str) -> Optional[dict]:
-    """Get existing non-expired session or return None."""
+def get_session(project_id: str, phone_number: str) -> Optional[dict]:
+    """Get existing non-expired session."""
     try:
         res = supabase.table("whatsapp_sessions") \
             .select("*") \
@@ -52,43 +42,29 @@ def get_or_create_session(project_id: str, phone_number: str) -> Optional[dict]:
             return None
 
         session = res.data[0]
-
-        # Check expiry
         expires_at = session.get("expires_at")
         if expires_at:
             exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
             if exp < datetime.now(timezone.utc):
-                # Expired — delete and return None
                 supabase.table("whatsapp_sessions") \
                     .delete() \
                     .eq("id", session["id"]) \
                     .execute()
                 return None
-
         return session
 
     except Exception as e:
-        print(f"get_or_create_session error: {e}")
+        print(f"get_session error: {e}")
         return None
 
 
-def create_session(project_id: str, phone_number: str, flow_id: str, start_node_id: str) -> dict:
-    """Create a new flow session."""
-    res = supabase.table("whatsapp_sessions").upsert({
+def upsert_session(project_id: str, phone_number: str, data: dict):
+    """Create or update session."""
+    supabase.table("whatsapp_sessions").upsert({
         "project_id": project_id,
         "phone_number": phone_number,
-        "flow_id": flow_id,
-        "current_node_id": start_node_id,
-        "mode": "flow",
+        **data,
     }, on_conflict="project_id,phone_number").execute()
-    return res.data[0]
-
-
-def update_session_node(session_id: str, node_id: str):
-    supabase.table("whatsapp_sessions") \
-        .update({"current_node_id": node_id}) \
-        .eq("id", session_id) \
-        .execute()
 
 
 def delete_session(project_id: str, phone_number: str):
@@ -100,10 +76,9 @@ def delete_session(project_id: str, phone_number: str):
 
 
 # -------------------------------------------------
-# FLOW LOOKUP
+# FLOW + NODE LOOKUP
 # -------------------------------------------------
 def get_active_flow(project_id: str) -> Optional[dict]:
-    """Get the active flow for a project."""
     try:
         res = supabase.table("flows") \
             .select("*") \
@@ -118,7 +93,6 @@ def get_active_flow(project_id: str) -> Optional[dict]:
 
 
 def get_start_node(flow_id: str) -> Optional[dict]:
-    """Get the start node of a flow."""
     res = supabase.table("flow_nodes") \
         .select("*") \
         .eq("flow_id", flow_id) \
@@ -138,7 +112,6 @@ def get_node(node_id: str) -> Optional[dict]:
 
 
 def get_next_node(flow_id: str, from_node_id: str, trigger: str) -> Optional[dict]:
-    """Get next node by matching edge trigger."""
     edge = supabase.table("flow_edges") \
         .select("to_node_id") \
         .eq("flow_id", flow_id) \
@@ -146,152 +119,275 @@ def get_next_node(flow_id: str, from_node_id: str, trigger: str) -> Optional[dic
         .eq("trigger", trigger) \
         .limit(1) \
         .execute()
-
     if not edge.data:
         return None
-
     return get_node(edge.data[0]["to_node_id"])
 
 
 # -------------------------------------------------
 # NODE SENDER
 # -------------------------------------------------
-def send_flow_node(node: dict, to: str, phone_number_id: str, token: str):
-    """Send the appropriate message type for a flow node."""
-    node_type = node["type"]
-    content = node["content"]
+def send_node(node: dict, to: str, phone_number_id: str, token: str):
+    """Send the right WhatsApp message type for a node."""
+    t = node["type"]
+    c = node["content"]
 
-    if node_type == "text":
-        send_whatsapp_message(to, content["body"], phone_number_id, token)
+    if t == "text":
+        send_whatsapp_message(to, c["body"], phone_number_id, token)
 
-    elif node_type == "buttons":
-        send_whatsapp_buttons(to, content["body"], content["buttons"], phone_number_id, token)
+    elif t == "buttons":
+        send_whatsapp_buttons(to, c["body"], c.get("buttons", []), phone_number_id, token)
 
-    elif node_type == "list":
+    elif t == "list":
         send_whatsapp_list(
-            to, content["body"], content["button_text"],
-            content["sections"], phone_number_id, token
+            to, c["body"], c.get("button_text", "View Options"),
+            c.get("sections", []), phone_number_id, token
         )
 
-    elif node_type == "cta_url":
+    elif t == "cta_url":
         send_whatsapp_cta_url(
-            to, content["body"], content["button_text"],
-            content["url"], phone_number_id, token
+            to, c["body"], c.get("button_text", "Click Here"),
+            c.get("url", ""), phone_number_id, token
         )
 
-    elif node_type == "handoff":
-        send_whatsapp_message(to, content["body"], phone_number_id, token)
-        # Switch session to human mode
-        supabase.table("whatsapp_sessions").upsert({
-            "project_id": None,  # will be set by caller
-            "phone_number": to,
-            "mode": "human",
-        }, on_conflict="project_id,phone_number").execute()
+    elif t == "handoff":
+        send_whatsapp_message(to, c["body"], phone_number_id, token)
 
-    elif node_type == "rag":
-        send_whatsapp_message(to, content["body"], phone_number_id, token)
+    elif t == "rag":
+        send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+
+def send_back_to_menu_button(to: str, text: str, phone_number_id: str, token: str):
+    """Send a single [Back to Menu] button after RAG answers."""
+    send_whatsapp_buttons(
+        to, text,
+        [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+        phone_number_id, token
+    )
 
 
 # -------------------------------------------------
 # FLOW EXECUTION
 # -------------------------------------------------
 def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: str, token: str):
-    """Start a flow from its start node."""
+    """Start flow from start node."""
     start_node = get_start_node(flow["id"])
     if not start_node:
-        print(f"No start node found for flow {flow['id']}")
+        print(f"No start node for flow {flow['id']}")
         return
 
-    create_session(project_id, phone_number, flow["id"], start_node["id"])
+    upsert_session(project_id, phone_number, {
+        "flow_id": flow["id"],
+        "current_node_id": start_node["id"],
+        "mode": "flow",
+    })
 
+    # If free_questions ON, append hint to body
+    body = start_node["content"].get("body", "")
+    if flow.get("free_questions") and start_node["type"] in ("buttons", "list"):
+        body = body + "\n\n💬 _Tap an option or type your question directly_"
+        node_with_hint = {**start_node, "content": {**start_node["content"], "body": body}}
+        send_node(node_with_hint, phone_number, phone_number_id, token)
+    else:
+        send_node(start_node, phone_number, phone_number_id, token)
+
+    # If start node is handoff
     if start_node["type"] == "handoff":
-        supabase.table("whatsapp_sessions").upsert({
-            "project_id": project_id,
-            "phone_number": phone_number,
+        upsert_session(project_id, phone_number, {
+            "flow_id": flow["id"],
+            "current_node_id": start_node["id"],
             "mode": "human",
-        }, on_conflict="project_id,phone_number").execute()
-
-    send_flow_node(start_node, phone_number, phone_number_id, token)
+        })
 
 
-def advance_flow(session: dict, trigger: str, phone_number_id: str, token: str, phone_number: str):
-    """Advance the flow based on a button/list trigger."""
-    current_node_id = session.get("current_node_id")
+def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str):
+    """Handle button/list click."""
+
+    # Back to Menu → restart flow
+    if trigger == RESERVED_BACK:
+        flow = get_active_flow(project_id)
+        if flow:
+            start_flow(flow, project_id, phone_number, phone_number_id, token)
+        return
+
+    # Ask a Question → send confirmation + set rag_question mode
+    if trigger == RESERVED_ASK_AI:
+        upsert_session(project_id, phone_number, {
+            "flow_id": session.get("flow_id"),
+            "current_node_id": session.get("current_node_id"),
+            "mode": "rag_question",
+        })
+        send_whatsapp_buttons(
+            phone_number,
+            "You can now ask me anything about our products and services!",
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+            phone_number_id, token
+        )
+        return
+
+    # Talk to Human → handoff
+    if trigger == RESERVED_HANDOFF:
+        upsert_session(project_id, phone_number, {
+            "flow_id": session.get("flow_id"),
+            "current_node_id": session.get("current_node_id"),
+            "mode": "human",
+        })
+        send_whatsapp_message(
+            phone_number,
+            "Connecting you to our team. Please wait...",
+            phone_number_id, token
+        )
+        return
+
+    # Normal button → advance flow
     flow_id = session.get("flow_id")
+    current_node_id = session.get("current_node_id")
 
-    if not current_node_id or not flow_id:
+    if not flow_id or not current_node_id:
         return
 
     next_node = get_next_node(flow_id, current_node_id, trigger)
     if not next_node:
-        # No edge found — send fallback
-        send_whatsapp_message(phone_number, "I didn't understand that. Type *menu* to start over.", phone_number_id, token)
+        # No edge — resend current node
+        current_node = get_node(current_node_id)
+        if current_node:
+            send_node(current_node, phone_number, phone_number_id, token)
         return
 
-    update_session_node(session["id"], next_node["id"])
+    upsert_session(project_id, phone_number, {
+        "flow_id": flow_id,
+        "current_node_id": next_node["id"],
+        "mode": "human" if next_node["type"] == "handoff" else "flow",
+    })
 
     if next_node["type"] == "handoff":
-        supabase.table("whatsapp_sessions") \
-            .update({"mode": "human"}) \
-            .eq("id", session["id"]) \
-            .execute()
+        send_whatsapp_message(
+            phone_number,
+            next_node["content"].get("body", "Connecting you to our team..."),
+            phone_number_id, token
+        )
+    else:
+        send_node(next_node, phone_number, phone_number_id, token)
 
-    send_flow_node(next_node, phone_number, phone_number_id, token)
 
+def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
+    """Handle a text message — behavior depends on session mode and free_questions toggle."""
+    from chat import run_chat, get_history
+    from usage import check_rate_limit, increment_usage
 
-def handle_flow_text(session: dict, text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
-    """Handle a text message while inside a flow."""
-    current_node = get_node(session.get("current_node_id"))
-
-    if not current_node:
+    # ── No session → check if flow should start ──────
+    if not session:
+        flow = get_active_flow(project_id)
+        if flow:
+            keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
+            if text.lower().strip() in keywords:
+                start_flow(flow, project_id, phone_number, phone_number_id, token)
+                return
+        # Pure RAG fallback
+        _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
         return
 
-    node_type = current_node["type"]
+    mode = session.get("mode", "flow")
 
-    if node_type == "rag":
-        # RAG node — answer with AI
-        rag_exit_keywords = current_node["content"].get("rag_exit_keywords", [])
-        if text.lower() in [k.lower() for k in rag_exit_keywords]:
-            # Exit RAG, restart flow
-            flow = get_active_flow(project_id)
-            if flow:
-                start_flow(flow, project_id, phone_number, phone_number_id, token)
-            return
+    # ── Human handoff mode → ignore, queue for human ─
+    if mode == "human":
+        return
 
-        from chat import run_chat, get_history
-        from usage import check_rate_limit, increment_usage
-
+    # ── RAG question mode → always answer with RAG ───
+    if mode == "rag_question":
         rate_check = check_rate_limit(project_id)
         if not rate_check["allowed"]:
             send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
             return
-
         history = get_history(chat_id, limit=5)
         result = run_chat(project_id, chat_id, text, history)
-        send_whatsapp_message(phone_number, result["answer"], phone_number_id, token)
+        send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
+        increment_usage(project_id)
+        return
+
+    # ── Flow mode ─────────────────────────────────────
+    flow_id = session.get("flow_id")
+    current_node_id = session.get("current_node_id")
+    current_node = get_node(current_node_id) if current_node_id else None
+
+    if not current_node:
+        # No current node — try to start flow
+        flow = get_active_flow(project_id)
+        if flow:
+            keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
+            if text.lower().strip() in keywords:
+                start_flow(flow, project_id, phone_number, phone_number_id, token)
+        return
+
+    # Check free_questions toggle
+    flow = supabase.table("flows").select("free_questions, trigger_keywords").eq("id", flow_id).single().execute()
+    free_questions = flow.data.get("free_questions", False) if flow.data else False
+
+    if current_node["type"] in ("buttons", "list"):
+        if free_questions:
+            # Answer with RAG then resend buttons
+            rate_check = check_rate_limit(project_id)
+            if not rate_check["allowed"]:
+                send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
+                return
+            history = get_history(chat_id, limit=5)
+            result = run_chat(project_id, chat_id, text, history)
+            # Send RAG answer first
+            send_whatsapp_message(phone_number, result["answer"], phone_number_id, token)
+            # Resend current buttons node
+            send_node(current_node, phone_number, phone_number_id, token)
+            increment_usage(project_id)
+        else:
+            # Strict mode — resend buttons, ignore text
+            send_node(current_node, phone_number, phone_number_id, token)
+
+    elif current_node["type"] == "rag":
+        # RAG node — always answer
+        rate_check = check_rate_limit(project_id)
+        if not rate_check["allowed"]:
+            send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
+            return
+        history = get_history(chat_id, limit=5)
+        result = run_chat(project_id, chat_id, text, history)
+        send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
         increment_usage(project_id)
 
-    elif node_type in ("buttons", "list"):
-        # Text received when buttons/list expected — resend the node
-        send_flow_node(current_node, phone_number, phone_number_id, token)
-
-    else:
-        # Text node or anything else — try to advance by text match
-        next_node = get_next_node(session["flow_id"], current_node["id"], text.lower())
+    elif current_node["type"] == "text":
+        # Text node receiving text — advance by keyword match or just move on
+        next_node = get_next_node(flow_id, current_node_id, text.lower())
         if next_node:
-            update_session_node(session["id"], next_node["id"])
-            send_flow_node(next_node, phone_number, phone_number_id, token)
+            upsert_session(project_id, phone_number, {
+                "flow_id": flow_id,
+                "current_node_id": next_node["id"],
+                "mode": "flow",
+            })
+            send_node(next_node, phone_number, phone_number_id, token)
         else:
-            send_whatsapp_message(phone_number, "Type *menu* to see options.", phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token)
+
+
+def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
+    """Pure RAG reply with no flow context."""
+    from chat import run_chat, get_history
+    from usage import check_rate_limit, increment_usage
+
+    rate_check = check_rate_limit(project_id)
+    if not rate_check["allowed"]:
+        send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
+        return
+    history = get_history(chat_id, limit=5)
+    result = run_chat(project_id, chat_id, text, history)
+    send_whatsapp_message(phone_number, result["answer"], phone_number_id, token)
+    increment_usage(project_id)
 
 
 # -------------------------------------------------
-# FLOW MANAGEMENT API ENDPOINTS
+# FLOW CRUD API
 # -------------------------------------------------
 @router.get("/flows")
 def list_flows(project_id: str, user=Depends(verify_token)):
     res = supabase.table("flows") \
-        .select("id, name, is_active, trigger_keywords, created_at") \
+        .select("id, name, is_active, trigger_keywords, free_questions, created_at") \
         .eq("project_id", project_id) \
         .order("created_at", desc=True) \
         .execute()
@@ -305,6 +401,7 @@ def create_flow(data: dict, user=Depends(verify_token)):
         "name": data["name"],
         "is_active": data.get("is_active", False),
         "trigger_keywords": data.get("trigger_keywords", ["hi", "hello", "hey", "start", "menu"]),
+        "free_questions": data.get("free_questions", False),
     }).execute()
     return res.data[0]
 
@@ -312,14 +409,11 @@ def create_flow(data: dict, user=Depends(verify_token)):
 @router.put("/flows/{flow_id}")
 def update_flow(flow_id: str, data: dict, user=Depends(verify_token)):
     update = {}
-    if "name" in data:
-        update["name"] = data["name"]
-    if "is_active" in data:
-        update["is_active"] = data["is_active"]
-    if "trigger_keywords" in data:
-        update["trigger_keywords"] = data["trigger_keywords"]
+    if "name" in data: update["name"] = data["name"]
+    if "is_active" in data: update["is_active"] = data["is_active"]
+    if "trigger_keywords" in data: update["trigger_keywords"] = data["trigger_keywords"]
+    if "free_questions" in data: update["free_questions"] = data["free_questions"]
 
-    # If activating this flow, deactivate others for the same project
     if data.get("is_active"):
         flow = supabase.table("flows").select("project_id").eq("id", flow_id).single().execute()
         if flow.data:
@@ -341,15 +435,8 @@ def delete_flow(flow_id: str, user=Depends(verify_token)):
 
 @router.get("/flows/{flow_id}/nodes")
 def get_flow_nodes(flow_id: str, user=Depends(verify_token)):
-    nodes = supabase.table("flow_nodes") \
-        .select("*") \
-        .eq("flow_id", flow_id) \
-        .order("created_at") \
-        .execute()
-    edges = supabase.table("flow_edges") \
-        .select("*") \
-        .eq("flow_id", flow_id) \
-        .execute()
+    nodes = supabase.table("flow_nodes").select("*").eq("flow_id", flow_id).order("created_at").execute()
+    edges = supabase.table("flow_edges").select("*").eq("flow_id", flow_id).execute()
     return {"nodes": nodes.data, "edges": edges.data}
 
 
@@ -367,13 +454,9 @@ def create_node(flow_id: str, data: dict, user=Depends(verify_token)):
 @router.put("/flows/nodes/{node_id}")
 def update_node(node_id: str, data: dict, user=Depends(verify_token)):
     update = {}
-    if "type" in data:
-        update["type"] = data["type"]
-    if "content" in data:
-        update["content"] = data["content"]
-    if "is_start" in data:
-        update["is_start"] = data["is_start"]
-
+    if "type" in data: update["type"] = data["type"]
+    if "content" in data: update["content"] = data["content"]
+    if "is_start" in data: update["is_start"] = data["is_start"]
     res = supabase.table("flow_nodes").update(update).eq("id", node_id).execute()
     return res.data[0]
 

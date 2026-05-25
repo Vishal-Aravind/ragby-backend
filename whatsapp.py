@@ -5,8 +5,6 @@ from starlette.responses import PlainTextResponse
 from clients import supabase
 from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, META_APP_ID, META_APP_SECRET
 from auth import verify_token
-from usage import check_rate_limit, increment_usage
-from chat import run_chat, get_history
 
 router = APIRouter()
 
@@ -18,10 +16,7 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
     url = f"https://graph.facebook.com/v19.0/{pid}/messages"
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -35,12 +30,8 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
 
 
 def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: str, token: str):
-    """Send interactive button message (max 3 buttons)"""
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -63,12 +54,8 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: st
 
 
 def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, phone_number_id: str, token: str):
-    """Send interactive list message"""
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -76,10 +63,7 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
         "interactive": {
             "type": "list",
             "body": {"text": body},
-            "action": {
-                "button": button_text,
-                "sections": sections
-            }
+            "action": {"button": button_text, "sections": sections}
         }
     }
     res = requests.post(url, headers=headers, json=payload)
@@ -89,12 +73,8 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
 
 
 def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, phone_number_id: str, token: str):
-    """Send CTA URL button message"""
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -192,13 +172,9 @@ async def whatsapp_webhook(request: Request):
             }).execute()
             chat_id = new_chat.data[0]["id"]
 
-        # Rate limit check
-        rate_check = check_rate_limit(project_id)
-        if not rate_check["allowed"]:
-            send_whatsapp_message(from_number, "⚠️ Monthly message limit reached. Please try again next month.", phone_number_id, token)
-            return {"status": "rate_limited"}
+        from flows import get_session, handle_interactive, handle_text
 
-        # ── Interactive message (button/list reply) ──────────────
+        # ── Interactive (button/list click) ──────────────
         if msg_type == "interactive":
             interactive = message.get("interactive", {})
             if interactive.get("type") == "button_reply":
@@ -208,62 +184,16 @@ async def whatsapp_webhook(request: Request):
             else:
                 return {"status": "ignored"}
 
-            # Import here to avoid circular imports at module load
-            from flows import advance_flow, get_or_create_session
-            session = get_or_create_session(project_id, from_number)
+            session = get_session(project_id, from_number)
             if session:
-                advance_flow(session, trigger, phone_number_id, token, from_number)
+                handle_interactive(session, trigger, from_number, phone_number_id, token, project_id)
             return {"status": "ok"}
 
-        # ── Text message ─────────────────────────────────────────
+        # ── Text message ──────────────────────────────────
         if msg_type == "text":
             text = message["text"]["body"].strip()
-
-            from flows import (
-                is_escape_keyword, is_handoff_keyword,
-                get_or_create_session, get_active_flow,
-                start_flow, handle_flow_text
-            )
-
-            # Escape keywords always win
-            if is_escape_keyword(text):
-                flow = get_active_flow(project_id)
-                if flow:
-                    start_flow(flow, project_id, from_number, phone_number_id, token)
-                return {"status": "ok"}
-
-            if is_handoff_keyword(text):
-                send_whatsapp_message(from_number, "Connecting you to our team. Please wait...", phone_number_id, token)
-                supabase.table("whatsapp_sessions").upsert({
-                    "project_id": project_id,
-                    "phone_number": from_number,
-                    "mode": "human",
-                }, on_conflict="project_id,phone_number").execute()
-                return {"status": "ok"}
-
-            session = get_or_create_session(project_id, from_number)
-
-            if session and session.get("mode") == "human":
-                # Human handoff — queue for owner, ignore bot reply
-                return {"status": "queued_for_human"}
-
-            if session and session.get("mode") == "flow":
-                handle_flow_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
-                return {"status": "ok"}
-
-            # No active session — check if a flow should start
-            flow = get_active_flow(project_id)
-            if flow:
-                keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
-                if text.lower().strip() in keywords:
-                    start_flow(flow, project_id, from_number, phone_number_id, token)
-                    return {"status": "ok"}
-
-            # Pure RAG fallback
-            history = get_history(chat_id, limit=5)
-            result = run_chat(project_id, chat_id, text, history)
-            send_whatsapp_message(from_number, result["answer"], phone_number_id, token)
-            increment_usage(project_id)
+            session = get_session(project_id, from_number)
+            handle_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
             return {"status": "ok"}
 
         return {"status": "ignored"}
@@ -282,7 +212,6 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
         .select("phone_number_id, display_phone_number, waba_id") \
         .eq("project_id", project_id) \
         .execute()
-
     if res.data:
         return {"connected": True, **res.data[0]}
     return {"connected": False}
@@ -290,27 +219,18 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
 
 @router.post("/whatsapp/connect")
 def whatsapp_connect(data: dict, user=Depends(verify_token)):
-    project_id = data["projectId"]
-    phone_number_id = data["phone_number_id"]
-    waba_id = data.get("waba_id", "")
-    display_phone_number = data.get("display_phone_number", "")
-
     supabase.table("whatsapp_integrations").upsert({
-        "project_id": project_id,
-        "phone_number_id": phone_number_id,
-        "waba_id": waba_id,
-        "display_phone_number": display_phone_number,
+        "project_id": data["projectId"],
+        "phone_number_id": data["phone_number_id"],
+        "waba_id": data.get("waba_id", ""),
+        "display_phone_number": data.get("display_phone_number", ""),
     }, on_conflict="project_id").execute()
-
     return {"success": True}
 
 
 @router.delete("/whatsapp/disconnect/{project_id}")
 def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
-    supabase.table("whatsapp_integrations") \
-        .delete() \
-        .eq("project_id", project_id) \
-        .execute()
+    supabase.table("whatsapp_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
 
 
@@ -321,11 +241,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 
     token_res = requests.get(
         "https://graph.facebook.com/v19.0/oauth/access_token",
-        params={
-            "client_id": META_APP_ID,
-            "client_secret": META_APP_SECRET,
-            "code": code,
-        }
+        params={"client_id": META_APP_ID, "client_secret": META_APP_SECRET, "code": code}
     )
     token_data = token_res.json()
     print(f"Token exchange: {token_data}")
@@ -339,18 +255,15 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
         "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
         params={"access_token": access_token}
     )
-    waba_data = waba_res.json()
-    print(f"WABA data: {waba_data}")
-    waba_id = waba_data.get("data", [{}])[0].get("id", "")
+    waba_id = waba_res.json().get("data", [{}])[0].get("id", "")
 
     phone_res = requests.get(
         f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
         params={"access_token": access_token}
     )
-    phone_data = phone_res.json()
-    print(f"Phone data: {phone_data}")
-    phone_number_id = phone_data.get("data", [{}])[0].get("id", "")
-    display_phone = phone_data.get("data", [{}])[0].get("display_phone_number", "")
+    phone_data = phone_res.json().get("data", [{}])[0]
+    phone_number_id = phone_data.get("id", "")
+    display_phone = phone_data.get("display_phone_number", "")
 
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
