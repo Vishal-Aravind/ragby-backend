@@ -132,26 +132,113 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
     t = node["type"]
     c = node["content"]
 
-    if t == "text":
+    # ── Plain message ──────────────────────────────────────
+    if t in ("text", "message"):
         send_whatsapp_message(to, c["body"], phone_number_id, token)
 
-    elif t == "buttons":
-        send_whatsapp_buttons(to, c["body"], c.get("buttons", []), phone_number_id, token)
+    # ── Message + Buttons ──────────────────────────────────
+    elif t in ("buttons", "message_buttons"):
+        # Build buttons list with auto-IDs from labels
+        btns = []
+        for btn in c.get("buttons", []):
+            label = btn.get("title") or btn.get("label", "")
+            btn_id = btn.get("id") or label.strip().lower().replace(" ", "_")
+            if label:
+                btns.append({"id": btn_id, "title": label})
+        send_whatsapp_buttons(to, c["body"], btns, phone_number_id, token)
 
-    elif t == "list":
+    # ── Message + List ─────────────────────────────────────
+    elif t in ("list", "message_list"):
+        # Build sections with auto-IDs from labels
+        sections = []
+        for section in c.get("sections", []):
+            rows = []
+            for row in section.get("rows", []):
+                label = row.get("title") or row.get("label", "")
+                row_id = row.get("id") or label.strip().lower().replace(" ", "_")
+                if label:
+                    rows.append({"id": row_id, "title": label})
+            sections.append({"title": section.get("title", ""), "rows": rows})
         send_whatsapp_list(
             to, c["body"], c.get("button_text", "View Options"),
-            c.get("sections", []), phone_number_id, token
+            sections, phone_number_id, token
         )
 
+    # ── Message + Media ────────────────────────────────────
+    elif t == "message_media":
+        if c.get("media_url"):
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "image", "image": {"link": c["media_url"], "caption": c.get("body", "")},
+            }
+            import requests as req
+            req.post(url, headers=headers, json=payload)
+        elif c.get("body"):
+            send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+    # ── Message + Video ────────────────────────────────────
+    elif t == "message_video":
+        if c.get("video_url"):
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "video", "video": {"link": c["video_url"], "caption": c.get("body", "")},
+            }
+            import requests as req
+            req.post(url, headers=headers, json=payload)
+        elif c.get("body"):
+            send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+    # ── Message + Document ─────────────────────────────────
+    elif t == "message_document":
+        if c.get("document_url"):
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "document",
+                "document": {
+                    "link": c["document_url"],
+                    "caption": c.get("body", ""),
+                    "filename": c.get("filename", "document"),
+                },
+            }
+            import requests as req
+            req.post(url, headers=headers, json=payload)
+        elif c.get("body"):
+            send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+    # ── CTA URL ────────────────────────────────────────────
     elif t == "cta_url":
         send_whatsapp_cta_url(
             to, c["body"], c.get("button_text", "Click Here"),
             c.get("url", ""), phone_number_id, token
         )
 
-    elif t == "handoff":
-        send_whatsapp_message(to, c["body"], phone_number_id, token)
+    # ── Special nodes ──────────────────────────────────────
+    elif t == "ask_a_question":
+        # Switch to RAG question mode and send confirmation
+        from clients import supabase as sb
+        project_res = sb.table("chats").select("project_id").eq("external_id", to).eq("channel", "whatsapp").limit(1).execute()
+        project_id = project_res.data[0]["project_id"] if project_res.data else None
+        if project_id:
+            upsert_session(project_id, to, {"mode": "rag_question"})
+        send_whatsapp_buttons(
+            to,
+            c.get("body", "You can now ask me anything!"),
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+            phone_number_id, token
+        )
+
+    elif t == "back_to_menu":
+        # Handled by the flow engine — just restart flow
+        pass
+
+    elif t in ("handoff", "talk_to_human"):
+        send_whatsapp_message(to, c.get("body", "Connecting you to our team. Please wait..."), phone_number_id, token)
 
     elif t == "rag":
         send_whatsapp_message(to, c["body"], phone_number_id, token)
@@ -257,15 +344,20 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     upsert_session(project_id, phone_number, {
         "flow_id": flow_id,
         "current_node_id": next_node["id"],
-        "mode": "human" if next_node["type"] == "handoff" else "flow",
+        "mode": "human" if next_node["type"] in ("handoff", "talk_to_human") else
+                "rag_question" if next_node["type"] == "ask_a_question" else "flow",
     })
 
-    if next_node["type"] == "handoff":
+    if next_node["type"] in ("handoff", "talk_to_human"):
         send_whatsapp_message(
             phone_number,
             next_node["content"].get("body", "Connecting you to our team..."),
             phone_number_id, token
         )
+    elif next_node["type"] == "back_to_menu":
+        flow = get_active_flow(project_id)
+        if flow:
+            start_flow(flow, project_id, phone_number, phone_number_id, token)
     else:
         send_node(next_node, phone_number, phone_number_id, token)
 
@@ -482,3 +574,59 @@ def create_edge(flow_id: str, data: dict, user=Depends(verify_token)):
 def delete_edge(edge_id: str, user=Depends(verify_token)):
     supabase.table("flow_edges").delete().eq("id", edge_id).execute()
     return {"status": "deleted"}
+
+
+@router.post("/flows/{flow_id}/sync")
+def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
+    """
+    Full sync — replaces all nodes and edges for a flow.
+    data = { nodes: [...], edges: [...] }
+    Each node: { id (optional), type, content, is_start, position }
+    Each edge: { from_node_id, trigger, to_node_id }
+    """
+    import uuid as uuid_lib
+
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+
+    # Delete all existing nodes (cascade deletes edges too)
+    supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
+
+    if not nodes:
+        return {"status": "synced", "nodes": 0, "edges": 0}
+
+    # Build ID map: old temp/local ID → new DB ID
+    id_map = {}
+
+    # Insert nodes
+    for node in nodes:
+        old_id = node.get("id", "")
+        new_id = str(uuid_lib.uuid4())
+        id_map[old_id] = new_id
+
+        supabase.table("flow_nodes").insert({
+            "id": new_id,
+            "flow_id": flow_id,
+            "type": node["type"],
+            "content": node.get("content", {}),
+            "is_start": node.get("is_start", False),
+        }).execute()
+
+    # Insert edges — remap node IDs
+    edges_inserted = 0
+    for edge in edges:
+        from_id = id_map.get(edge["from_node_id"], edge["from_node_id"])
+        to_id   = id_map.get(edge["to_node_id"],   edge["to_node_id"])
+
+        if not from_id or not to_id:
+            continue
+
+        supabase.table("flow_edges").insert({
+            "flow_id": flow_id,
+            "from_node_id": from_id,
+            "trigger": edge["trigger"],
+            "to_node_id": to_id,
+        }).execute()
+        edges_inserted += 1
+
+    return {"status": "synced", "nodes": len(nodes), "edges": edges_inserted, "id_map": id_map}
