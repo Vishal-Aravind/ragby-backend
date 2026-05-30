@@ -278,3 +278,46 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
         "display_phone_number": display_phone,
         "waba_id": waba_id,
     }
+
+
+# -------------------------------------------------
+# HUMAN REPLY ENDPOINT
+# -------------------------------------------------
+@router.post("/whatsapp/reply")
+async def whatsapp_reply(data: dict, user=Depends(verify_token)):
+    """Send a manual reply from the dashboard to a WhatsApp user."""
+    project_id  = data["project_id"]
+    phone_number = data["phone_number"]
+    message     = data["message"]
+
+    # Get WhatsApp integration for this project
+    res = supabase.table("whatsapp_integrations") \
+        .select("phone_number_id") \
+        .eq("project_id", project_id) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="WhatsApp not connected")
+
+    phone_number_id = res.data[0]["phone_number_id"]
+
+    # Send message
+    send_whatsapp_message(phone_number, message, phone_number_id, WHATSAPP_TOKEN)
+
+    # Save to chat_messages so it appears in conversation
+    chat = supabase.table("chats") \
+        .select("id") \
+        .eq("project_id", project_id) \
+        .eq("external_id", phone_number) \
+        .eq("channel", "whatsapp") \
+        .limit(1) \
+        .execute()
+
+    if chat.data:
+        supabase.table("chat_messages").insert({
+            "chat_id": chat.data[0]["id"],
+            "role": "assistant",
+            "content": f"[Human] {message}",
+        }).execute()
+
+    return {"status": "sent"}
