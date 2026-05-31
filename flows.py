@@ -218,7 +218,53 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
             c.get("url", ""), phone_number_id, token
         )
 
-    # ── Special nodes ──────────────────────────────────────
+    # ── Message + Audio ────────────────────────────────────
+    elif t == "message_audio":
+        if c.get("audio_url"):
+            import requests as req
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "audio", "audio": {"link": c["audio_url"]},
+            }
+            req.post(url, headers=headers, json=payload)
+
+    # ── Message + Location ─────────────────────────────────
+    elif t == "message_location":
+        if c.get("latitude") and c.get("longitude"):
+            import requests as req
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "location",
+                "location": {
+                    "latitude": c["latitude"],
+                    "longitude": c["longitude"],
+                    "name": c.get("name", ""),
+                    "address": c.get("address", ""),
+                },
+            }
+            req.post(url, headers=headers, json=payload)
+        if c.get("body"):
+            send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+    # ── Message + Contact ──────────────────────────────────
+    elif t == "message_contact":
+        if c.get("contact_name") and c.get("contact_phone"):
+            import requests as req
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "contacts",
+                "contacts": [{
+                    "name": {"formatted_name": c["contact_name"], "first_name": c["contact_name"]},
+                    "phones": [{"phone": c["contact_phone"], "type": "CELL"}],
+                }],
+            }
+            req.post(url, headers=headers, json=payload)
     elif t == "ask_a_question":
         # Switch to RAG question mode and send confirmation
         from clients import supabase as sb
