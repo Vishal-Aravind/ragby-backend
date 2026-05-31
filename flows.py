@@ -286,6 +286,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
     elif t in ("handoff", "talk_to_human"):
         send_whatsapp_message(to, c.get("body", "Connecting you to our team. Please wait..."), phone_number_id, token)
 
+    elif t == "time_delay":
+        pass  # Delay handled in flow execution via threading
+
     elif t == "rag":
         send_whatsapp_message(to, c["body"], phone_number_id, token)
 
@@ -416,6 +419,34 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         flow = get_active_flow(project_id)
         if flow:
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
+    elif next_node["type"] == "time_delay":
+        # Execute delay in background thread
+        import threading
+        c = next_node["content"]
+        unit = c.get("delay_unit", "seconds")
+        amount = int(c.get("delay_seconds", 60))
+        delay_secs = amount * (60 if unit == "minutes" else 3600 if unit == "hours" else 1)
+
+        def delayed_advance():
+            import time
+            time.sleep(delay_secs)
+            # Find next node after the delay node
+            after_node = get_next_node(flow_id, next_node["id"], "next")
+            if after_node:
+                upsert_session(project_id, phone_number, {
+                    "flow_id": flow_id,
+                    "current_node_id": after_node["id"],
+                    "mode": "flow",
+                })
+                send_node(after_node, phone_number, phone_number_id, token)
+                if chat_id:
+                    save_message(chat_id, "assistant", after_node["content"].get("body", ""))
+
+        threading.Thread(target=delayed_advance, daemon=True).start()
+    else:
+        send_node(next_node, phone_number, phone_number_id, token)
+        if chat_id:
+            save_message(chat_id, "assistant", next_node["content"].get("body", ""))
     else:
         send_node(next_node, phone_number, phone_number_id, token)
 
