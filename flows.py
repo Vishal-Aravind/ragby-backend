@@ -447,8 +447,6 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         send_node(next_node, phone_number, phone_number_id, token)
         if chat_id:
             save_message(chat_id, "assistant", next_node["content"].get("body", ""))
-    else:
-        send_node(next_node, phone_number, phone_number_id, token)
 
 
 def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
