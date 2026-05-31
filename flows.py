@@ -256,8 +256,9 @@ def send_back_to_menu_button(to: str, text: str, phone_number_id: str, token: st
 # -------------------------------------------------
 # FLOW EXECUTION
 # -------------------------------------------------
-def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: str, token: str):
+def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: str, token: str, chat_id: str = None):
     """Start flow from start node."""
+    from chat import save_message
     start_node = get_start_node(flow["id"])
     if not start_node:
         print(f"No start node for flow {flow['id']}")
@@ -278,6 +279,10 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
     else:
         send_node(start_node, phone_number, phone_number_id, token)
 
+    # Save bot message to chat
+    if chat_id and body:
+        save_message(chat_id, "assistant", body)
+
     # If start node is handoff
     if start_node["type"] == "handoff":
         upsert_session(project_id, phone_number, {
@@ -287,14 +292,19 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
         })
 
 
-def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str):
+def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str, chat_id: str = None):
     """Handle button/list click."""
+    from chat import save_message
+
+    # Save user button tap
+    if chat_id:
+        save_message(chat_id, "user", f"[tapped: {trigger}]")
 
     # Back to Menu → restart flow
     if trigger == RESERVED_BACK:
         flow = get_active_flow(project_id)
         if flow:
-            start_flow(flow, project_id, phone_number, phone_number_id, token)
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
         return
 
     # Ask a Question → send confirmation + set rag_question mode
@@ -304,12 +314,14 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             "current_node_id": session.get("current_node_id"),
             "mode": "rag_question",
         })
+        msg = "You can now ask me anything about our products and services!"
         send_whatsapp_buttons(
-            phone_number,
-            "You can now ask me anything about our products and services!",
+            phone_number, msg,
             [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
             phone_number_id, token
         )
+        if chat_id:
+            save_message(chat_id, "assistant", msg)
         return
 
     # Talk to Human → handoff
@@ -319,11 +331,10 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             "current_node_id": session.get("current_node_id"),
             "mode": "human",
         })
-        send_whatsapp_message(
-            phone_number,
-            "Connecting you to our team. Please wait...",
-            phone_number_id, token
-        )
+        msg = "Connecting you to our team. Please wait..."
+        send_whatsapp_message(phone_number, msg, phone_number_id, token)
+        if chat_id:
+            save_message(chat_id, "assistant", msg)
         return
 
     # Normal button → advance flow
@@ -339,6 +350,8 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         current_node = get_node(current_node_id)
         if current_node:
             send_node(current_node, phone_number, phone_number_id, token)
+            if chat_id:
+                save_message(chat_id, "assistant", current_node["content"].get("body", ""))
         return
 
     upsert_session(project_id, phone_number, {
@@ -349,23 +362,26 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     })
 
     if next_node["type"] in ("handoff", "talk_to_human"):
-        send_whatsapp_message(
-            phone_number,
-            next_node["content"].get("body", "Connecting you to our team..."),
-            phone_number_id, token
-        )
+        msg = next_node["content"].get("body", "Connecting you to our team...")
+        send_whatsapp_message(phone_number, msg, phone_number_id, token)
+        if chat_id:
+            save_message(chat_id, "assistant", msg)
     elif next_node["type"] == "back_to_menu":
         flow = get_active_flow(project_id)
         if flow:
-            start_flow(flow, project_id, phone_number, phone_number_id, token)
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
     else:
         send_node(next_node, phone_number, phone_number_id, token)
 
 
 def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
     """Handle a text message — behavior depends on session mode and free_questions toggle."""
-    from chat import run_chat, get_history
+    from chat import run_chat, get_history, save_message
     from usage import check_rate_limit, increment_usage
+
+    # Save user message
+    if chat_id:
+        save_message(chat_id, "user", text)
 
     # ── No session → check if flow should start ──────
     if not session:
@@ -373,7 +389,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         if flow:
             keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
             if text.lower().strip() in keywords:
-                start_flow(flow, project_id, phone_number, phone_number_id, token)
+                start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
                 return
         # Pure RAG fallback
         _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)

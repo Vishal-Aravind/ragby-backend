@@ -186,7 +186,7 @@ async def whatsapp_webhook(request: Request):
 
             session = get_session(project_id, from_number)
             if session:
-                handle_interactive(session, trigger, from_number, phone_number_id, token, project_id)
+                handle_interactive(session, trigger, from_number, phone_number_id, token, project_id, chat_id)
             return {"status": "ok"}
 
         # ── Text message ──────────────────────────────────
