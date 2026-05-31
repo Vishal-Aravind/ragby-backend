@@ -53,6 +53,8 @@ def submit_lead(req: LeadSubmitRequest):
         "email": req.email.strip(),
         "phone": req.phone.strip(),
         "source": "widget",
+        "channel": "web",
+        "last_seen_at": "now()",
     }).execute()
 
     return {"status": "captured"}
@@ -86,3 +88,38 @@ def get_leads(project_id: str, user=Depends(verify_token)):
         .order("created_at", desc=True) \
         .execute()
     return res.data
+
+
+# -------------------------------------------------
+# AUTO-SAVE CONTACT (called internally)
+# -------------------------------------------------
+def upsert_contact(project_id: str, phone: str, name: str = None, channel: str = "whatsapp"):
+    """Auto-save or update a contact when they message."""
+    try:
+        existing = supabase.table("leads") \
+            .select("id, name") \
+            .eq("project_id", project_id) \
+            .eq("phone", phone) \
+            .execute()
+
+        if existing.data:
+            # Update last_seen_at and name if we now have one
+            update = {"last_seen_at": "now()"}
+            if name and not existing.data[0].get("name"):
+                update["name"] = name
+            supabase.table("leads").update(update) \
+                .eq("id", existing.data[0]["id"]).execute()
+        else:
+            # Insert new contact
+            supabase.table("leads").insert({
+                "project_id": project_id,
+                "phone": phone,
+                "name": name or "",
+                "email": "",
+                "source": channel,
+                "channel": channel,
+                "whatsapp_number": phone if channel == "whatsapp" else None,
+                "last_seen_at": "now()",
+            }).execute()
+    except Exception as e:
+        print(f"upsert_contact error: {e}")

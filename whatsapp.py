@@ -173,6 +173,10 @@ async def whatsapp_webhook(request: Request):
             chat_id = new_chat.data[0]["id"]
 
         from flows import get_session, handle_interactive, handle_text
+        from leads import upsert_contact
+
+        # Auto-save contact
+        upsert_contact(project_id, from_number, channel="whatsapp")
 
         # ── Interactive (button/list click) ──────────────
         if msg_type == "interactive":
