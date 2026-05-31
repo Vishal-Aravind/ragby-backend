@@ -426,6 +426,8 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         unit = c.get("delay_unit", "seconds")
         amount = int(c.get("delay_seconds", 60))
         delay_secs = amount * (60 if unit == "minutes" else 3600 if unit == "hours" else 1)
+        # Cap at 22 hours — 2hr safety buffer before WhatsApp's 24h window closes
+        delay_secs = min(delay_secs, 22 * 3600)
 
         def delayed_advance():
             import time
