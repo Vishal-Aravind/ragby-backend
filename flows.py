@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from clients import supabase
 from auth import verify_token
+from config import WHATSAPP_TOKEN
 from whatsapp import (
     send_whatsapp_message,
     send_whatsapp_buttons,
@@ -285,6 +286,19 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
 
     elif t in ("handoff", "talk_to_human"):
         send_whatsapp_message(to, c.get("body", "Connecting you to our team. Please wait..."), phone_number_id, token)
+
+    elif t == "call_us":
+        phone = c.get("phone", "").replace(" ", "")
+        if phone:
+            send_whatsapp_cta_url(
+                to,
+                c.get("body", "Need help? Call us directly!"),
+                "📞 Call Us",
+                f"tel:{phone}",
+                phone_number_id, token
+            )
+        else:
+            send_whatsapp_message(to, c.get("body", ""), phone_number_id, token)
 
     elif t == "time_delay":
         pass  # Delay handled in flow execution via threading
