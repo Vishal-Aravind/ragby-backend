@@ -16,6 +16,7 @@ from whatsapp import router as whatsapp_router
 from stripe_handler import router as stripe_router
 from flows import router as flows_router
 from api_keys import router as api_keys_router
+from campaigns import router as campaigns_router
 
 # -------------------------------------------------
 # APP
@@ -46,6 +47,7 @@ app.include_router(whatsapp_router)
 app.include_router(stripe_router)
 app.include_router(flows_router)
 app.include_router(api_keys_router)
+app.include_router(campaigns_router)
 
 
 # -------------------------------------------------
