@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from clients import supabase
 from auth import verify_token
+from config import WHATSAPP_TOKEN
 from whatsapp import (
     send_whatsapp_message,
     send_whatsapp_buttons,
@@ -568,6 +569,11 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_node(next_node, phone_number, phone_number_id, token)
         else:
             send_node(current_node, phone_number, phone_number_id, token)
+
+    else:
+        # For all other node types (message, media, video, audio, location, etc.)
+        # resend current node — user is stuck here, remind them
+        send_node(current_node, phone_number, phone_number_id, token)
 
 
 def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
