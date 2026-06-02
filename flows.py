@@ -11,7 +11,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from clients import supabase
 from auth import verify_token
-from config import WHATSAPP_TOKEN
 from whatsapp import (
     send_whatsapp_message,
     send_whatsapp_buttons,
