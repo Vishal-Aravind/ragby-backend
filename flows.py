@@ -512,6 +512,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     flow_id = session.get("flow_id")
     current_node_id = session.get("current_node_id")
     current_node = get_node(current_node_id) if current_node_id else None
+    print(f"DEBUG flow mode: current_node={current_node}")
 
     if not current_node:
         # No current node — try to start flow
