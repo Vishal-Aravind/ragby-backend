@@ -322,6 +322,7 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
     """Start flow from start node."""
     from chat import save_message
     start_node = get_start_node(flow["id"])
+    print(f"DEBUG start_flow: flow_id={flow['id']} start_node={start_node}")
     if not start_node:
         print(f"No start node for flow {flow['id']}")
         return
@@ -473,11 +474,15 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     if chat_id:
         save_message(chat_id, "user", text)
 
+    print(f"DEBUG handle_text: text={text!r} project_id={project_id} session={session}")
+
     # ── No session → check if flow should start ──────
     if not session:
         flow = get_active_flow(project_id)
+        print(f"DEBUG no session: flow={flow}")
         if flow:
             keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
+            print(f"DEBUG keywords={keywords} text_lower={text.lower().strip()!r}")
             if text.lower().strip() in keywords:
                 start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
                 return
