@@ -323,7 +323,6 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
     """Start flow from start node."""
     from chat import save_message
     start_node = get_start_node(flow["id"])
-    print(f"DEBUG start_flow: flow_id={flow['id']} start_node={start_node}")
     if not start_node:
         print(f"No start node for flow {flow['id']}")
         return
@@ -475,15 +474,11 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     if chat_id:
         save_message(chat_id, "user", text)
 
-    print(f"DEBUG handle_text: text={text!r} project_id={project_id} session={session}")
-
     # ── No session → check if flow should start ──────
     if not session:
         flow = get_active_flow(project_id)
-        print(f"DEBUG no session: flow={flow}")
         if flow:
             keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
-            print(f"DEBUG keywords={keywords} text_lower={text.lower().strip()!r}")
             if text.lower().strip() in keywords:
                 start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
                 return
@@ -513,7 +508,6 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     flow_id = session.get("flow_id")
     current_node_id = session.get("current_node_id")
     current_node = get_node(current_node_id) if current_node_id else None
-    print(f"DEBUG flow mode: current_node={current_node}")
 
     if not current_node:
         # No current node — try to start flow
@@ -572,8 +566,31 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     else:
         # For all other node types (message, media, video, audio, location, etc.)
-        # resend current node — user is stuck here, remind them
-        send_node(current_node, phone_number, phone_number_id, token)
+        # Check if user typed a trigger keyword → restart flow
+        flow_data = get_active_flow(project_id)
+        if flow_data:
+            keywords = [k.lower() for k in (flow_data.get("trigger_keywords") or [])]
+            if text.lower().strip() in keywords:
+                start_flow(flow_data, project_id, phone_number, phone_number_id, token, chat_id)
+                return
+
+        # Check free_questions toggle
+        flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
+        free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
+
+        if free_q:
+            # Answer with RAG
+            rate_check = check_rate_limit(project_id)
+            if not rate_check["allowed"]:
+                send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
+                return
+            history = get_history(chat_id, limit=5)
+            result = run_chat(project_id, chat_id, text, history)
+            send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
+            increment_usage(project_id)
+        else:
+            # Resend current node as reminder
+            send_node(current_node, phone_number, phone_number_id, token)
 
 
 def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
