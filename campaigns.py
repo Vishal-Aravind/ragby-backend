@@ -59,20 +59,32 @@ async def create_campaign(data: dict, background_tasks: BackgroundTasks, user=De
     tag_filter     = data.get("tag_filter", None)
 
     # Get contacts
-    query = supabase.table("leads") \
-        .select("phone, name") \
-        .eq("project_id", project_id) \
-        .neq("phone", "")
+    csv_contacts = data.get("csv_contacts", None)
 
-    if recipient_filter == "whatsapp":
-        query = query.eq("channel", "whatsapp")
-    elif recipient_filter == "web":
-        query = query.eq("channel", "web")
-    elif recipient_filter == "tag" and tag_filter:
-        query = query.contains("tags", [tag_filter])
+    if csv_contacts is not None:
+        # Use uploaded CSV contacts
+        contacts = [{"phone": c["phone"], "name": c.get("name", "")} for c in csv_contacts if c.get("phone")]
 
-    contacts_res = query.execute()
-    contacts = contacts_res.data or []
+        # Save to leads table (upsert)
+        from leads import upsert_contact
+        for c in contacts:
+            upsert_contact(project_id, c["phone"], c.get("name") or None, channel="whatsapp")
+    else:
+        # Get from leads table
+        query = supabase.table("leads") \
+            .select("phone, name") \
+            .eq("project_id", project_id) \
+            .neq("phone", "")
+
+        if recipient_filter == "whatsapp":
+            query = query.eq("channel", "whatsapp")
+        elif recipient_filter == "web":
+            query = query.eq("channel", "web")
+        elif recipient_filter == "tag" and tag_filter:
+            query = query.contains("tags", [tag_filter])
+
+        contacts_res = query.execute()
+        contacts = contacts_res.data or []
 
     # Filter out empty phones
     contacts = [c for c in contacts if c.get("phone", "").strip()]
