@@ -17,6 +17,7 @@ from stripe_handler import router as stripe_router
 from flows import router as flows_router
 from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
+from template_library import router as template_library_router
 
 # -------------------------------------------------
 # APP
@@ -48,6 +49,7 @@ app.include_router(stripe_router)
 app.include_router(flows_router)
 app.include_router(api_keys_router)
 app.include_router(campaigns_router)
+app.include_router(template_library_router)
 
 
 # -------------------------------------------------
