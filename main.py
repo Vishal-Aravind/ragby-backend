@@ -18,6 +18,7 @@ from flows import router as flows_router
 from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
 from template_library import router as template_library_router
+from shop import router as shop_router
 
 # -------------------------------------------------
 # APP
@@ -28,7 +29,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=["*"],  # * needed for public shop page
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,6 +51,7 @@ app.include_router(flows_router)
 app.include_router(api_keys_router)
 app.include_router(campaigns_router)
 app.include_router(template_library_router)
+app.include_router(shop_router)
 
 
 # -------------------------------------------------

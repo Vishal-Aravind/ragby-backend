@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from clients import supabase
 from auth import verify_token
-from config import WHATSAPP_TOKEN
+from config import WHATSAPP_TOKEN, FRONTEND_URL
 from whatsapp import (
     send_whatsapp_message,
     send_whatsapp_buttons,
@@ -139,7 +139,6 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
 
     # ── Message + Buttons ──────────────────────────────────
     elif t in ("buttons", "message_buttons"):
-        # Build buttons list with auto-IDs from labels
         btns = []
         for btn in c.get("buttons", []):
             label = btn.get("title") or btn.get("label", "")
@@ -150,7 +149,6 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
 
     # ── Message + List ─────────────────────────────────────
     elif t in ("list", "message_list"):
-        # Build sections with auto-IDs from labels
         sections = []
         for section in c.get("sections", []):
             rows = []
@@ -266,10 +264,10 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
                 }],
             }
             req.post(url, headers=headers, json=payload)
+
+    # ── Ask a Question ─────────────────────────────────────
     elif t == "ask_a_question":
-        # Switch to RAG question mode and send confirmation
-        from clients import supabase as sb
-        project_res = sb.table("chats").select("project_id").eq("external_id", to).eq("channel", "whatsapp").limit(1).execute()
+        project_res = supabase.table("chats").select("project_id").eq("external_id", to).eq("channel", "whatsapp").limit(1).execute()
         project_id = project_res.data[0]["project_id"] if project_res.data else None
         if project_id:
             upsert_session(project_id, to, {"mode": "rag_question"})
@@ -280,13 +278,15 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
             phone_number_id, token
         )
 
+    # ── Back to Menu ───────────────────────────────────────
     elif t == "back_to_menu":
-        # Handled by the flow engine — just restart flow
-        pass
+        pass  # Handled by the flow engine
 
+    # ── Talk to Human / Handoff ────────────────────────────
     elif t in ("handoff", "talk_to_human"):
         send_whatsapp_message(to, c.get("body", "Connecting you to our team. Please wait..."), phone_number_id, token)
 
+    # ── Call Us ────────────────────────────────────────────
     elif t == "call_us":
         phone = c.get("phone", "").replace(" ", "")
         if phone:
@@ -300,11 +300,39 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
         else:
             send_whatsapp_message(to, c.get("body", ""), phone_number_id, token)
 
+    # ── Time Delay ─────────────────────────────────────────
     elif t == "time_delay":
         pass  # Delay handled in flow execution via threading
 
+    # ── RAG (legacy) ───────────────────────────────────────
     elif t == "rag":
         send_whatsapp_message(to, c["body"], phone_number_id, token)
+
+    # ── Shop ───────────────────────────────────────────────
+    elif t == "message_shop":
+        catalog_id = c.get("catalog_id", "")
+
+        # Get project_id from session
+        session_res = supabase.table("whatsapp_sessions").select("project_id").eq("phone_number", to).maybe_single().execute()
+        proj_id = session_res.data["project_id"] if session_res.data else ""
+
+        shop_url = f"{FRONTEND_URL}/shop/{proj_id}?catalog={catalog_id}&phone={to}"
+
+        send_whatsapp_cta_url(
+            to,
+            c.get("body", "Browse our menu and add items to your cart 🛒\nSelect multiple items at once"),
+            c.get("button_text", "View Menu"),
+            shop_url,
+            phone_number_id,
+            token,
+        )
+
+        # Set session to shop_browsing mode
+        if proj_id:
+            upsert_session(proj_id, to, {
+                "mode": "shop_browsing",
+                "metadata": {"catalog_id": catalog_id},
+            })
 
 
 def send_back_to_menu_button(to: str, text: str, phone_number_id: str, token: str):
@@ -363,14 +391,36 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     if chat_id:
         save_message(chat_id, "user", f"[tapped: {trigger}]")
 
-    # Back to Menu → restart flow
+    # ── Shop cart buttons ──────────────────────────────────
+    if trigger == "cart_continue":
+        handle_text(session, "continue", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
+    if trigger == "cart_add_more":
+        handle_text(session, "add more", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
+    if trigger == "cart_clear":
+        handle_text(session, "clear cart", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
+    if trigger == "skip_special_req":
+        if session and session.get("mode") == "awaiting_special_request":
+            handle_text(session, "skip", project_id, chat_id, phone_number, phone_number_id, token)
+            return
+
+    if trigger == "confirm_and_pay":
+        handle_text(session, "confirm", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
+    # ── Back to Menu → restart flow ────────────────────────
     if trigger == RESERVED_BACK:
         flow = get_active_flow(project_id)
         if flow:
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
         return
 
-    # Ask a Question → send confirmation + set rag_question mode
+    # ── Ask a Question ─────────────────────────────────────
     if trigger == RESERVED_ASK_AI:
         upsert_session(project_id, phone_number, {
             "flow_id": session.get("flow_id"),
@@ -387,7 +437,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             save_message(chat_id, "assistant", msg)
         return
 
-    # Talk to Human → handoff
+    # ── Talk to Human ──────────────────────────────────────
     if trigger == RESERVED_HANDOFF:
         upsert_session(project_id, phone_number, {
             "flow_id": session.get("flow_id"),
@@ -400,7 +450,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             save_message(chat_id, "assistant", msg)
         return
 
-    # Normal button → advance flow
+    # ── Normal button → advance flow ───────────────────────
     flow_id = session.get("flow_id")
     current_node_id = session.get("current_node_id")
 
@@ -434,19 +484,16 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         if flow:
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
     elif next_node["type"] == "time_delay":
-        # Execute delay in background thread
         import threading
         c = next_node["content"]
         unit = c.get("delay_unit", "seconds")
         amount = int(c.get("delay_seconds", 60))
         delay_secs = amount * (60 if unit == "minutes" else 3600 if unit == "hours" else 1)
-        # Cap at 22 hours — 2hr safety buffer before WhatsApp's 24h window closes
         delay_secs = min(delay_secs, 22 * 3600)
 
         def delayed_advance():
             import time
             time.sleep(delay_secs)
-            # Find next node after the delay node
             after_node = get_next_node(flow_id, next_node["id"], "next")
             if after_node:
                 upsert_session(project_id, phone_number, {
@@ -464,16 +511,19 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         if chat_id:
             save_message(chat_id, "assistant", next_node["content"].get("body", ""))
 
-        # Check if this is an end node (no outgoing edges)
-        outgoing = supabase.table("flow_edges")             .select("id")             .eq("flow_id", flow_id)             .eq("from_node_id", next_node["id"])             .limit(1)             .execute()
+        # Check if end node
+        outgoing = supabase.table("flow_edges") \
+            .select("id") \
+            .eq("flow_id", flow_id) \
+            .eq("from_node_id", next_node["id"]) \
+            .limit(1) \
+            .execute()
 
         if not outgoing.data:
-            # End node reached — check free_questions
             flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
             free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
 
             if free_q:
-                # Enter RAG mode automatically
                 upsert_session(project_id, phone_number, {
                     "flow_id": flow_id,
                     "current_node_id": next_node["id"],
@@ -488,9 +538,8 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
                 if chat_id:
                     save_message(chat_id, "assistant", msg)
             else:
-                # Restart flow from beginning
                 import time
-                time.sleep(1)  # Small delay so end node message arrives first
+                time.sleep(1)
                 active_flow = get_active_flow(project_id)
                 if active_flow:
                     start_flow(active_flow, project_id, phone_number, phone_number_id, token, chat_id)
@@ -505,7 +554,155 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     if chat_id:
         save_message(chat_id, "user", text)
 
-    # ── No session → check if flow should start ──────
+    # ── Shop browsing mode → user is on web page ───────────
+    if session and session.get("mode") == "shop_browsing":
+        send_whatsapp_message(
+            phone_number,
+            "Please complete your order on the menu page 😊\nTap the link we sent to continue.",
+            phone_number_id,
+            token,
+        )
+        return
+
+    # ── Awaiting cart confirm ──────────────────────────────
+    if session and session.get("mode") == "awaiting_cart_confirm":
+        order_id = (session.get("metadata") or {}).get("order_id")
+        catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
+        shop_url = f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}"
+
+        if "continue" in text.lower():
+            send_whatsapp_buttons(
+                phone_number,
+                "📝 *Any special requests for your order?*\n\nOnly preparation or packing notes — e.g. less spice, no onion, less oil, pack separately.\n\nTo add another dish, use the *menu* please. Type your note below, or tap *Skip* to continue.",
+                [{"id": "skip_special_req", "title": "Skip"}],
+                phone_number_id, token,
+            )
+            upsert_session(project_id, phone_number, {
+                "mode": "awaiting_special_request",
+                "metadata": {"order_id": order_id, "catalog_id": catalog_id},
+            })
+        elif "add more" in text.lower():
+            send_whatsapp_cta_url(
+                phone_number,
+                "Browse and add more items to your cart 🛍️",
+                "View Menu",
+                shop_url,
+                phone_number_id, token,
+            )
+        elif "clear cart" in text.lower():
+            if order_id:
+                supabase.table("orders").delete().eq("id", order_id).execute()
+            send_whatsapp_cta_url(
+                phone_number,
+                "Your cart has been cleared. Start fresh! 🛒",
+                "View Menu",
+                shop_url,
+                phone_number_id, token,
+            )
+            upsert_session(project_id, phone_number, {
+                "mode": "shop_browsing",
+                "metadata": {"catalog_id": catalog_id},
+            })
+        return
+
+    # ── Awaiting special request ───────────────────────────
+    if session and session.get("mode") == "awaiting_special_request":
+        order_id = (session.get("metadata") or {}).get("order_id")
+        special_request = None if text.lower().strip() in ("skip", "skip_special_req") else text
+
+        if order_id and special_request:
+            supabase.table("orders").update({"special_request": special_request}).eq("id", order_id).execute()
+
+        # Fetch order + config for summary
+        order_res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
+        order = order_res.data
+        config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+        config = config_res.data or {}
+        currency = config.get("currency", "₹")
+        store_name = config.get("store_name", "")
+        store_phone = config.get("store_phone", "")
+        terms_note = config.get("terms_note", "")
+        delivery_type = order.get("delivery_type", "Takeaway")
+
+        lines = []
+        for i, item in enumerate(order["items"], 1):
+            lines.append(f"{i}. {item['name']} x{item['quantity']} - {currency}{int(item['price'] * item['quantity'])}")
+        items_text = "\n".join(lines)
+
+        summary = f"🎉 *All set! You've picked your menu.*\nHere's a quick summary:\n\n"
+        summary += f"🧾 *Booked Items*\n\n{items_text}\n\n"
+        summary += f"{'─' * 20}\n"
+        summary += f"Subtotal: {currency}{int(order['subtotal'])}\n"
+        if order["gst_amount"] > 0:
+            gst_pct = config.get("gst_percent", 0)
+            summary += f"GST ({gst_pct}%): {currency}{order['gst_amount']:.2f}\n"
+        summary += f"\n*Total Amount: {currency}{order['total']:.2f}*\n\n"
+        if store_name:
+            summary += f"🏪 Assigned Store Name - *{store_name}*\n"
+        if store_phone:
+            summary += f"📞 Contact - {store_phone}\n\n"
+        if terms_note:
+            summary += f"ℹ️ Note - {terms_note}\n"
+        summary += f"🏃 {delivery_type}"
+
+        send_whatsapp_buttons(
+            phone_number,
+            summary,
+            [{"id": "confirm_and_pay", "title": "Confirm & Pay"}],
+            phone_number_id, token,
+        )
+        upsert_session(project_id, phone_number, {
+            "mode": "awaiting_payment_confirm",
+            "metadata": {"order_id": order_id},
+        })
+        return
+
+    # ── Awaiting payment confirm ───────────────────────────
+    if session and session.get("mode") == "awaiting_payment_confirm":
+        from shop import generate_razorpay_link
+        order_id = (session.get("metadata") or {}).get("order_id")
+
+        if "confirm" in text.lower() or "pay" in text.lower():
+            order_res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
+            order = order_res.data
+            config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+            config = config_res.data or {}
+            currency = config.get("currency", "₹")
+
+            payment_url = generate_razorpay_link(order, config)
+
+            if payment_url:
+                send_whatsapp_cta_url(
+                    phone_number,
+                    f"💳 *Complete Your Payment*\n\nYour order is confirmed! Please complete the payment of {currency}{order['total']:.2f} to proceed.\n\nTap the button below to pay securely.\n⏰ Link expires in 90 minutes",
+                    "Pay Now",
+                    payment_url,
+                    phone_number_id, token,
+                )
+                upsert_session(project_id, phone_number, {
+                    "mode": "awaiting_payment",
+                    "metadata": {"order_id": order_id},
+                })
+            else:
+                # No Razorpay configured — confirm without payment
+                send_whatsapp_message(
+                    phone_number,
+                    "✅ *Order Confirmed!*\n\nThank you! We'll contact you shortly to arrange payment.",
+                    phone_number_id, token,
+                )
+                upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        return
+
+    # ── Awaiting payment → wait for Razorpay webhook ──────
+    if session and session.get("mode") == "awaiting_payment":
+        send_whatsapp_message(
+            phone_number,
+            "⏳ Please complete your payment using the link we sent. Tap *Pay Now* to proceed.",
+            phone_number_id, token,
+        )
+        return
+
+    # ── No session → check if flow should start ───────────
     if not session:
         flow = get_active_flow(project_id)
         if flow:
@@ -519,11 +716,11 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     mode = session.get("mode", "flow")
 
-    # ── Human handoff mode → ignore, queue for human ─
+    # ── Human handoff mode → ignore ────────────────────────
     if mode == "human":
         return
 
-    # ── RAG question mode → always answer with RAG ───
+    # ── RAG question mode ──────────────────────────────────
     if mode == "rag_question":
         rate_check = check_rate_limit(project_id)
         if not rate_check["allowed"]:
@@ -535,13 +732,12 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         increment_usage(project_id)
         return
 
-    # ── Flow mode ─────────────────────────────────────
+    # ── Flow mode ──────────────────────────────────────────
     flow_id = session.get("flow_id")
     current_node_id = session.get("current_node_id")
     current_node = get_node(current_node_id) if current_node_id else None
 
     if not current_node:
-        # No current node — try to start flow
         flow = get_active_flow(project_id)
         if flow:
             keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
@@ -555,24 +751,19 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     if current_node["type"] in ("buttons", "list"):
         if free_questions:
-            # Answer with RAG then resend buttons
             rate_check = check_rate_limit(project_id)
             if not rate_check["allowed"]:
                 send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
                 return
             history = get_history(chat_id, limit=5)
             result = run_chat(project_id, chat_id, text, history)
-            # Send RAG answer first
             send_whatsapp_message(phone_number, result["answer"], phone_number_id, token)
-            # Resend current buttons node
             send_node(current_node, phone_number, phone_number_id, token)
             increment_usage(project_id)
         else:
-            # Strict mode — resend buttons, ignore text
             send_node(current_node, phone_number, phone_number_id, token)
 
     elif current_node["type"] == "rag":
-        # RAG node — always answer
         rate_check = check_rate_limit(project_id)
         if not rate_check["allowed"]:
             send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
@@ -583,7 +774,6 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         increment_usage(project_id)
 
     elif current_node["type"] == "text":
-        # Text node receiving text — advance by keyword match or just move on
         next_node = get_next_node(flow_id, current_node_id, text.lower())
         if next_node:
             upsert_session(project_id, phone_number, {
@@ -596,8 +786,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_node(current_node, phone_number, phone_number_id, token)
 
     else:
-        # For all other node types (message, media, video, audio, location, etc.)
-        # Check if user typed a trigger keyword → restart flow
+        # Check trigger keywords → restart flow
         flow_data = get_active_flow(project_id)
         if flow_data:
             keywords = [k.lower() for k in (flow_data.get("trigger_keywords") or [])]
@@ -605,12 +794,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 start_flow(flow_data, project_id, phone_number, phone_number_id, token, chat_id)
                 return
 
-        # Check free_questions toggle
         flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
         free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
 
         if free_q:
-            # Answer with RAG
             rate_check = check_rate_limit(project_id)
             if not rate_check["allowed"]:
                 send_whatsapp_message(phone_number, "⚠️ Monthly message limit reached.", phone_number_id, token)
@@ -620,7 +807,6 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
             increment_usage(project_id)
         else:
-            # Resend current node as reminder
             send_node(current_node, phone_number, phone_number_id, token)
 
 
@@ -744,27 +930,18 @@ def delete_edge(edge_id: str, user=Depends(verify_token)):
 
 @router.post("/flows/{flow_id}/sync")
 def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
-    """
-    Full sync — replaces all nodes and edges for a flow.
-    data = { nodes: [...], edges: [...] }
-    Each node: { id (optional), type, content, is_start, position }
-    Each edge: { from_node_id, trigger, to_node_id }
-    """
     import uuid as uuid_lib
 
     nodes = data.get("nodes", [])
     edges = data.get("edges", [])
 
-    # Delete all existing nodes (cascade deletes edges too)
     supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
 
     if not nodes:
         return {"status": "synced", "nodes": 0, "edges": 0}
 
-    # Build ID map: old temp/local ID → new DB ID
     id_map = {}
 
-    # Insert nodes
     for node in nodes:
         old_id = node.get("id", "")
         new_id = str(uuid_lib.uuid4())
@@ -778,7 +955,6 @@ def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
             "is_start": node.get("is_start", False),
         }).execute()
 
-    # Insert edges — remap node IDs
     edges_inserted = 0
     for edge in edges:
         from_id = id_map.get(edge["from_node_id"], edge["from_node_id"])
