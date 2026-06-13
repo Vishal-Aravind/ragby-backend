@@ -941,7 +941,9 @@ def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
     nodes = data.get("nodes", [])
     edges = data.get("edges", [])
 
+    # Always delete existing nodes AND edges first
     supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
+    supabase.table("flow_edges").delete().eq("flow_id", flow_id).execute()
 
     if not nodes:
         return {"status": "synced", "nodes": 0, "edges": 0}
