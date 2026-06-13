@@ -520,29 +520,35 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             .execute()
 
         if not outgoing.data:
-            flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
-            free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
-
-            if free_q:
-                upsert_session(project_id, phone_number, {
-                    "flow_id": flow_id,
-                    "current_node_id": next_node["id"],
-                    "mode": "rag_question",
-                })
-                msg = "💬 Feel free to ask me anything!"
-                send_whatsapp_buttons(
-                    phone_number, msg,
-                    [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
-                    phone_number_id, token
-                )
-                if chat_id:
-                    save_message(chat_id, "assistant", msg)
+            # ask_a_question already set mode to rag_question above — skip
+            if next_node["type"] == "ask_a_question":
+                pass
             else:
-                import time
-                time.sleep(1)
-                active_flow = get_active_flow(project_id)
-                if active_flow:
-                    start_flow(active_flow, project_id, phone_number, phone_number_id, token, chat_id)
+                flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
+                free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
+
+                if free_q:
+                    upsert_session(project_id, phone_number, {
+                        "flow_id": flow_id,
+                        "current_node_id": next_node["id"],
+                        "mode": "rag_question",
+                    })
+                    msg = "💬 Feel free to ask me anything!"
+                    send_whatsapp_buttons(
+                        phone_number, msg,
+                        [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+                        phone_number_id, token
+                    )
+                    if chat_id:
+                        save_message(chat_id, "assistant", msg)
+                else:
+                    # Just wait — don't restart immediately
+                    # User typing a trigger keyword will restart via handle_text()
+                    upsert_session(project_id, phone_number, {
+                        "flow_id": flow_id,
+                        "current_node_id": next_node["id"],
+                        "mode": "flow",
+                    })
 
 
 def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
