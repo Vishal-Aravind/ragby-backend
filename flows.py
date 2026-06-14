@@ -128,7 +128,7 @@ def get_next_node(flow_id: str, from_node_id: str, trigger: str) -> Optional[dic
 # -------------------------------------------------
 # NODE SENDER
 # -------------------------------------------------
-def send_node(node: dict, to: str, phone_number_id: str, token: str):
+def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id: str = None):
     """Send the right WhatsApp message type for a node."""
     t = node["type"]
     c = node["content"]
@@ -267,8 +267,6 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
 
     # ── Ask a Question ─────────────────────────────────────
     elif t == "ask_a_question":
-        project_res = supabase.table("chats").select("project_id").eq("external_id", to).eq("channel", "whatsapp").limit(1).execute()
-        project_id = project_res.data[0]["project_id"] if project_res.data else None
         if project_id:
             upsert_session(project_id, to, {"mode": "rag_question"})
         send_whatsapp_buttons(
@@ -311,11 +309,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
     # ── Shop ───────────────────────────────────────────────
     elif t == "message_shop":
         catalog_id = c.get("catalog_id", "")
-
-        # Get project_id from session
-        session_res = supabase.table("whatsapp_sessions").select("project_id").eq("phone_number", to).maybe_single().execute()
-        proj_id = session_res.data["project_id"] if session_res.data else ""
-
+        proj_id = project_id or ""
         shop_url = f"{FRONTEND_URL}/shop/{proj_id}?catalog={catalog_id}&phone={to}"
 
         send_whatsapp_cta_url(
@@ -327,7 +321,6 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str):
             token,
         )
 
-        # Set session to shop_browsing mode
         if proj_id:
             upsert_session(proj_id, to, {
                 "mode": "shop_browsing",
@@ -366,9 +359,9 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
     if flow.get("free_questions") and start_node["type"] in ("buttons", "list"):
         body = body + "\n\n💬 _Tap an option or type your question directly_"
         node_with_hint = {**start_node, "content": {**start_node["content"], "body": body}}
-        send_node(node_with_hint, phone_number, phone_number_id, token)
+        send_node(node_with_hint, phone_number, phone_number_id, token, project_id=project_id)
     else:
-        send_node(start_node, phone_number, phone_number_id, token)
+        send_node(start_node, phone_number, phone_number_id, token, project_id=project_id)
 
     # Save bot message to chat
     if chat_id and body:
@@ -462,7 +455,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         # No edge — resend current node
         current_node = get_node(current_node_id)
         if current_node:
-            send_node(current_node, phone_number, phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
             if chat_id:
                 save_message(chat_id, "assistant", current_node["content"].get("body", ""))
         return
@@ -501,13 +494,13 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
                     "current_node_id": after_node["id"],
                     "mode": "flow",
                 })
-                send_node(after_node, phone_number, phone_number_id, token)
+                send_node(after_node, phone_number, phone_number_id, token, project_id=project_id)
                 if chat_id:
                     save_message(chat_id, "assistant", after_node["content"].get("body", ""))
 
         threading.Thread(target=delayed_advance, daemon=True).start()
     else:
-        send_node(next_node, phone_number, phone_number_id, token)
+        send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
         if chat_id:
             save_message(chat_id, "assistant", next_node["content"].get("body", ""))
 
@@ -764,10 +757,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             history = get_history(chat_id, limit=5)
             result = run_chat(project_id, chat_id, text, history)
             send_whatsapp_message(phone_number, result["answer"], phone_number_id, token)
-            send_node(current_node, phone_number, phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
             increment_usage(project_id)
         else:
-            send_node(current_node, phone_number, phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
 
     elif current_node["type"] == "rag":
         rate_check = check_rate_limit(project_id)
@@ -787,9 +780,9 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 "current_node_id": next_node["id"],
                 "mode": "flow",
             })
-            send_node(next_node, phone_number, phone_number_id, token)
+            send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
         else:
-            send_node(current_node, phone_number, phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
 
     else:
         # Check trigger keywords → restart flow
@@ -813,7 +806,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
             increment_usage(project_id)
         else:
-            send_node(current_node, phone_number, phone_number_id, token)
+            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
 
 
 def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
@@ -941,9 +934,9 @@ def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
     nodes = data.get("nodes", [])
     edges = data.get("edges", [])
 
-    # Always delete existing nodes AND edges first
-    supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
+    # Always delete existing edges AND nodes first
     supabase.table("flow_edges").delete().eq("flow_id", flow_id).execute()
+    supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
 
     if not nodes:
         return {"status": "synced", "nodes": 0, "edges": 0}
