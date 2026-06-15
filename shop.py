@@ -234,8 +234,11 @@ async def submit_cart(body: CartSubmit):
     phone = body.phone.replace("+", "").replace(" ", "")
 
     # Get shop config
-    config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
-    config = config_res.data or {}
+    try:
+        config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+        config = config_res.data or {} if config_res else {}
+    except:
+        config = {}
     gst_percent = config.get("gst_percent", 0)
     currency = config.get("currency", "₹")
 
@@ -267,11 +270,15 @@ async def submit_cart(body: CartSubmit):
     summary = f"🛒 *Your Cart*\n\n{items_text}\n\nSubtotal: {currency}{int(subtotal)}"
 
     # Get WhatsApp integration
-    wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
-    if not wa_res.data:
+    try:
+        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
+        wa_data = wa_res.data if wa_res else None
+    except:
+        wa_data = None
+    if not wa_data:
         return {"status": "ok", "order_id": order["id"], "warning": "WhatsApp not connected"}
 
-    phone_number_id = wa_res.data["phone_number_id"]
+    phone_number_id = wa_data["phone_number_id"]
 
     # Send cart summary with buttons
     send_whatsapp_buttons(
