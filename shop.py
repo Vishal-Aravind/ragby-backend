@@ -92,7 +92,7 @@ class OrderStatusUpdate(BaseModel):
 @router.get("/shop-config/{project_id}")
 async def get_shop_config(project_id: str, user=Depends(verify_token)):
     res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
-    if not res.data:
+    if not res or not res.data:
         return {
             "project_id": project_id,
             "store_name": "",
@@ -112,7 +112,7 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
 async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depends(verify_token)):
     existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
     update = {k: v for k, v in body.dict().items() if v is not None}
-    if existing.data:
+    if existing and existing.data:
         res = supabase.table("shop_config").update(update).eq("project_id", project_id).select().single().execute()
     else:
         res = supabase.table("shop_config").insert({"project_id": project_id, **update}).select().single().execute()
@@ -199,14 +199,16 @@ async def public_shop_config(project_id: str):
     res = supabase.table("shop_config").select(
         "store_name,store_phone,gst_percent,currency,accent_color,delivery_types,terms_note,is_enabled"
     ).eq("project_id", project_id).maybe_single().execute()
-    return res.data or {
-        "gst_percent": 0,
-        "currency": "₹",
-        "accent_color": "#16a34a",
-        "delivery_types": ["Takeaway"],
-        "terms_note": "",
-        "is_enabled": True,
-    }
+    if not res or not res.data:
+        return {
+            "gst_percent": 0,
+            "currency": "₹",
+            "accent_color": "#16a34a",
+            "delivery_types": ["Takeaway"],
+            "terms_note": "",
+            "is_enabled": True,
+        }
+    return res.data
 
 @router.get("/public/shop/{project_id}/catalogs")
 async def public_catalogs(project_id: str):
@@ -229,6 +231,7 @@ async def public_products(project_id: str, catalog_id: Optional[str] = None):
 @router.post("/public/shop/submit-cart")
 async def submit_cart(body: CartSubmit):
     from whatsapp import send_whatsapp_buttons
+    from config import WHATSAPP_TOKEN
 
     project_id = body.project_id
     phone = body.phone.replace("+", "").replace(" ", "")
@@ -236,9 +239,11 @@ async def submit_cart(body: CartSubmit):
     # Get shop config
     try:
         config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
-        config = config_res.data or {} if config_res else {}
-    except:
+        config = (config_res.data if config_res else None) or {}
+    except Exception as e:
+        print(f"shop_config fetch error: {e}")
         config = {}
+
     gst_percent = config.get("gst_percent", 0)
     currency = config.get("currency", "₹")
 
@@ -268,19 +273,35 @@ async def submit_cart(body: CartSubmit):
         lines.append(f"{i}. {item.name} x{item.quantity} - {currency}{int(item.price * item.quantity)}")
     items_text = "\n".join(lines)
     summary = f"🛒 *Your Cart*\n\n{items_text}\n\nSubtotal: {currency}{int(subtotal)}"
+    if gst_amount > 0:
+        summary += f"\nGST: {currency}{gst_amount}"
+    summary += f"\n*Total: {currency}{total}*"
 
     # Get WhatsApp integration
     try:
         wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
-        wa_data = wa_res.data if wa_res else None
-    except:
+        wa_data = (wa_res.data if wa_res else None)
+    except Exception as e:
+        print(f"whatsapp_integrations fetch error: {e}")
         wa_data = None
+
     if not wa_data:
+        # Still update session even if WhatsApp not connected
+        supabase.table("whatsapp_sessions").upsert({
+            "project_id": project_id,
+            "phone_number": phone,
+            "mode": "awaiting_cart_confirm",
+            "metadata": {
+                "order_id": order["id"],
+                "catalog_id": body.catalog_id,
+            },
+        }, on_conflict="project_id,phone_number").execute()
         return {"status": "ok", "order_id": order["id"], "warning": "WhatsApp not connected"}
 
     phone_number_id = wa_data["phone_number_id"]
+    token = wa_data.get("access_token") or WHATSAPP_TOKEN
 
-    # Send cart summary with buttons
+    # Send cart summary with 3 buttons
     send_whatsapp_buttons(
         to=phone,
         body=summary,
@@ -290,6 +311,7 @@ async def submit_cart(body: CartSubmit):
             {"id": "cart_clear", "title": "Clear Cart 🗑️"},
         ],
         phone_number_id=phone_number_id,
+        token=token,
     )
 
     # Update WhatsApp session
@@ -329,6 +351,7 @@ async def update_order(order_id: str, body: OrderStatusUpdate, user=Depends(veri
 @router.post("/webhook/razorpay")
 async def razorpay_webhook(request: Request):
     from whatsapp import send_whatsapp_message
+    from config import WHATSAPP_TOKEN
 
     body_bytes = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
@@ -341,13 +364,17 @@ async def razorpay_webhook(request: Request):
 
         # Find order
         order_res = supabase.table("orders").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
-        if not order_res.data:
+        if not order_res or not order_res.data:
             return {"status": "ok"}
         order = order_res.data
 
         # Verify signature using this order's project razorpay secret
-        config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
-        config = config_res.data or {}
+        try:
+            config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
+            config = (config_res.data if config_res else None) or {}
+        except:
+            config = {}
+
         key_secret = config.get("razorpay_key_secret") or RAZORPAY_KEY_SECRET
         if key_secret and signature:
             expected = hmac.new(key_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
@@ -364,10 +391,17 @@ async def razorpay_webhook(request: Request):
         }).eq("id", order["id"]).execute()
 
         # Get WhatsApp integration
-        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
-        if not wa_res.data:
+        try:
+            wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
+            wa_data = (wa_res.data if wa_res else None)
+        except:
+            wa_data = None
+
+        if not wa_data:
             return {"status": "ok"}
-        phone_number_id = wa_res.data["phone_number_id"]
+
+        phone_number_id = wa_data["phone_number_id"]
+        token = wa_data.get("access_token") or WHATSAPP_TOKEN
 
         # Send confirmation to customer
         msg = f"✅ *Payment Confirmed!*\n\n"
@@ -378,7 +412,7 @@ async def razorpay_webhook(request: Request):
             msg += f"📞 Contact: {store_phone}\n\n"
         msg += "We'll notify you when your order is ready! 🎉"
 
-        send_whatsapp_message(to=order["phone_number"], text=msg, phone_number_id=phone_number_id)
+        send_whatsapp_message(to=order["phone_number"], text=msg, phone_number_id=phone_number_id, token=token)
 
         # Notify business owner
         if store_phone:
@@ -393,22 +427,21 @@ async def razorpay_webhook(request: Request):
             owner_msg += f"Order ID: #{order['id'][:8].upper()}"
 
             owner_phone = store_phone.replace("+", "").replace(" ", "")
-            send_whatsapp_message(to=owner_phone, text=owner_msg, phone_number_id=phone_number_id)
+            send_whatsapp_message(to=owner_phone, text=owner_msg, phone_number_id=phone_number_id, token=token)
 
         # Advance flow
-        _advance_flow_after_payment(order["project_id"], order["phone_number"], phone_number_id)
+        _advance_flow_after_payment(order["project_id"], order["phone_number"], phone_number_id, token)
 
     return {"status": "ok"}
 
 
-def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: str):
+def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: str, token: str):
     """Advance flow to next node after shop node once payment is confirmed."""
     try:
         from flows import get_next_node, send_node, upsert_session
-        from config import WHATSAPP_TOKEN
 
         session_res = supabase.table("whatsapp_sessions").select("*").eq("project_id", project_id).eq("phone_number", phone).maybe_single().execute()
-        if not session_res.data:
+        if not session_res or not session_res.data:
             return
 
         session = session_res.data
@@ -425,7 +458,7 @@ def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: st
                 "mode": "flow",
                 "metadata": {},
             })
-            send_node(next_node, phone, phone_number_id, WHATSAPP_TOKEN)
+            send_node(next_node, phone, phone_number_id, token, project_id=project_id)
         else:
             upsert_session(project_id, phone, {
                 "flow_id": flow_id,
