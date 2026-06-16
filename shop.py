@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
@@ -113,9 +113,10 @@ async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depen
     existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
     update = {k: v for k, v in body.dict().items() if v is not None}
     if existing and existing.data:
-        res = supabase.table("shop_config").update(update).eq("project_id", project_id).select().single().execute()
+        supabase.table("shop_config").update(update).eq("project_id", project_id).execute()
     else:
-        res = supabase.table("shop_config").insert({"project_id": project_id, **update}).select().single().execute()
+        supabase.table("shop_config").insert({"project_id": project_id, **update}).execute()
+    res = supabase.table("shop_config").select("*").eq("project_id", project_id).single().execute()
     return res.data
 
 
@@ -130,18 +131,20 @@ async def list_catalogs(project_id: str, user=Depends(verify_token)):
 
 @router.post("/catalogs")
 async def create_catalog(body: CatalogCreate, user=Depends(verify_token)):
-    res = supabase.table("catalogs").insert({
+    supabase.table("catalogs").insert({
         "project_id": body.project_id,
         "name": body.name,
         "description": body.description,
         "is_active": body.is_active,
-    }).select().single().execute()
-    return res.data
+    }).execute()
+    res = supabase.table("catalogs").select("*").eq("project_id", body.project_id).order("created_at", desc=True).limit(1).execute()
+    return res.data[0]
 
 @router.put("/catalogs/{catalog_id}")
 async def update_catalog(catalog_id: str, body: CatalogUpdate, user=Depends(verify_token)):
     update = {k: v for k, v in body.dict().items() if v is not None}
-    res = supabase.table("catalogs").update(update).eq("id", catalog_id).select().single().execute()
+    supabase.table("catalogs").update(update).eq("id", catalog_id).execute()
+    res = supabase.table("catalogs").select("*").eq("id", catalog_id).single().execute()
     return res.data
 
 @router.delete("/catalogs/{catalog_id}")
@@ -164,7 +167,7 @@ async def list_products(project_id: str, catalog_id: Optional[str] = None, user=
 
 @router.post("/products")
 async def create_product(body: ProductCreate, user=Depends(verify_token)):
-    res = supabase.table("products").insert({
+    supabase.table("products").insert({
         "project_id": body.project_id,
         "catalog_id": body.catalog_id,
         "name": body.name,
@@ -175,13 +178,15 @@ async def create_product(body: ProductCreate, user=Depends(verify_token)):
         "gst_percent": body.gst_percent,
         "is_available": body.is_available,
         "sort_order": body.sort_order,
-    }).select().single().execute()
-    return res.data
+    }).execute()
+    res = supabase.table("products").select("*").eq("project_id", body.project_id).eq("catalog_id", body.catalog_id).order("created_at", desc=True).limit(1).execute()
+    return res.data[0]
 
 @router.put("/products/{product_id}")
 async def update_product(product_id: str, body: ProductUpdate, user=Depends(verify_token)):
     update = {k: v for k, v in body.dict().items() if v is not None}
-    res = supabase.table("products").update(update).eq("id", product_id).select().single().execute()
+    supabase.table("products").update(update).eq("id", product_id).execute()
+    res = supabase.table("products").select("*").eq("id", product_id).single().execute()
     return res.data
 
 @router.delete("/products/{product_id}")
@@ -252,9 +257,9 @@ async def submit_cart(body: CartSubmit):
     gst_amount = round(subtotal * gst_percent / 100, 2)
     total = round(subtotal + gst_amount, 2)
 
-    # Save order
+    # Save order — insert then refetch (avoid .select().single() chain issue)
     items_data = [item.dict() for item in body.items]
-    order_res = supabase.table("orders").insert({
+    supabase.table("orders").insert({
         "project_id": project_id,
         "phone_number": phone,
         "items": items_data,
@@ -264,8 +269,17 @@ async def submit_cart(body: CartSubmit):
         "status": "pending",
         "payment_status": "unpaid",
         "delivery_type": body.delivery_type or "Takeaway",
-    }).select().single().execute()
-    order = order_res.data
+    }).execute()
+
+    # Refetch the order we just created
+    order_res = supabase.table("orders") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .eq("phone_number", phone) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+    order = order_res.data[0]
 
     # Build cart summary
     lines = []
@@ -340,7 +354,8 @@ async def list_orders(project_id: str, user=Depends(verify_token)):
 @router.put("/orders/{order_id}")
 async def update_order(order_id: str, body: OrderStatusUpdate, user=Depends(verify_token)):
     update = {k: v for k, v in body.dict().items() if v is not None}
-    res = supabase.table("orders").update(update).eq("id", order_id).select().single().execute()
+    supabase.table("orders").update(update).eq("id", order_id).execute()
+    res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
     return res.data
 
 
@@ -362,13 +377,11 @@ async def razorpay_webhook(request: Request):
     if event == "payment_link.paid":
         payment_link_id = payload["payload"]["payment_link"]["entity"]["id"]
 
-        # Find order
         order_res = supabase.table("orders").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
         if not order_res or not order_res.data:
             return {"status": "ok"}
         order = order_res.data
 
-        # Verify signature using this order's project razorpay secret
         try:
             config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             config = (config_res.data if config_res else None) or {}
@@ -384,13 +397,11 @@ async def razorpay_webhook(request: Request):
         currency = config.get("currency", "₹")
         store_phone = config.get("store_phone", "")
 
-        # Mark paid
         supabase.table("orders").update({
             "payment_status": "paid",
             "status": "confirmed",
         }).eq("id", order["id"]).execute()
 
-        # Get WhatsApp integration
         try:
             wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             wa_data = (wa_res.data if wa_res else None)
@@ -403,7 +414,6 @@ async def razorpay_webhook(request: Request):
         phone_number_id = wa_data["phone_number_id"]
         token = wa_data.get("access_token") or WHATSAPP_TOKEN
 
-        # Send confirmation to customer
         msg = f"✅ *Payment Confirmed!*\n\n"
         msg += f"Thank you! Your order has been confirmed.\n\n"
         msg += f"Order ID: #{order['id'][:8].upper()}\n"
@@ -414,14 +424,12 @@ async def razorpay_webhook(request: Request):
 
         send_whatsapp_message(to=order["phone_number"], text=msg, phone_number_id=phone_number_id, token=token)
 
-        # Notify business owner
         if store_phone:
             lines = []
             for i, item in enumerate(order["items"], 1):
                 lines.append(f"{i}. {item['name']} x{item['quantity']} - {currency}{int(item['price'] * item['quantity'])}")
 
-            owner_msg = f"🔔 *New Order Paid!*\n\n"
-            owner_msg += f"From: +{order['phone_number']}\n\n"
+            owner_msg = f"🔔 *New Order Paid!*\n\nFrom: +{order['phone_number']}\n\n"
             owner_msg += "\n".join(lines) + "\n\n"
             owner_msg += f"Total: {currency}{order['total']:.2f}\n"
             owner_msg += f"Order ID: #{order['id'][:8].upper()}"
@@ -429,14 +437,12 @@ async def razorpay_webhook(request: Request):
             owner_phone = store_phone.replace("+", "").replace(" ", "")
             send_whatsapp_message(to=owner_phone, text=owner_msg, phone_number_id=phone_number_id, token=token)
 
-        # Advance flow
         _advance_flow_after_payment(order["project_id"], order["phone_number"], phone_number_id, token)
 
     return {"status": "ok"}
 
 
 def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: str, token: str):
-    """Advance flow to next node after shop node once payment is confirmed."""
     try:
         from flows import get_next_node, send_node, upsert_session
 
@@ -475,7 +481,6 @@ def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: st
 # ─────────────────────────────────────────────
 
 def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
-    """Generate Razorpay payment link. Returns short_url or None."""
     try:
         import razorpay
 
