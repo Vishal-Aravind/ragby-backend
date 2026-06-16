@@ -564,6 +564,17 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 "mode": "shop_browsing",
                 "metadata": {"catalog_id": catalog_id},
             })
+        else:
+            send_whatsapp_buttons(
+                phone_number,
+                "Please choose one of the options below, or type *menu* to start over.",
+                [
+                    {"id": "cart_continue", "title": "Continue ➡️"},
+                    {"id": "cart_add_more", "title": "Add More 🛍️"},
+                    {"id": "cart_clear", "title": "Clear Cart 🗑️"},
+                ],
+                phone_number_id, token,
+            )
         return
 
     if session and session.get("mode") == "awaiting_special_request":
@@ -648,12 +659,24 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                     phone_number_id, token,
                 )
                 upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        else:
+            send_whatsapp_buttons(
+                phone_number,
+                "Please tap *Confirm & Pay* to proceed, or type *menu* to start over.",
+                [{"id": "confirm_and_pay", "title": "Confirm & Pay"}],
+                phone_number_id, token,
+            )
         return
 
     if session and session.get("mode") == "awaiting_payment":
+        flow_check = get_active_flow(project_id)
+        keywords = [k.lower() for k in (flow_check.get("trigger_keywords") or [])] if flow_check else []
+        if text.lower().strip() in keywords and flow_check:
+            start_flow(flow_check, project_id, phone_number, phone_number_id, token, chat_id)
+            return
         send_whatsapp_message(
             phone_number,
-            "⏳ Please complete your payment using the link we sent. Tap *Pay Now* to proceed.",
+            "⏳ Please complete your payment using the link we sent. Tap *Pay Now* to proceed, or type *menu* to start a new order.",
             phone_number_id, token,
         )
         return
