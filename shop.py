@@ -79,6 +79,7 @@ class CartSubmit(BaseModel):
     catalog_id: str
     items: List[CartItem]
     delivery_type: Optional[str] = "Takeaway"
+    order_id: Optional[str] = None  # if present, UPDATE existing order instead of creating new
 
 class OrderStatusUpdate(BaseModel):
     status: Optional[str] = None
@@ -228,6 +229,14 @@ async def public_products(project_id: str, catalog_id: Optional[str] = None):
     res = query.order("sort_order", desc=False).execute()
     return res.data or []
 
+@router.get("/public/shop/order/{order_id}")
+async def public_get_order(order_id: str):
+    """Fetch an existing order's items — used to pre-populate cart for 'Add More' flow."""
+    res = supabase.table("orders").select("*").eq("id", order_id).maybe_single().execute()
+    if not res or not res.data:
+        return {"items": []}
+    return {"items": res.data.get("items", []), "delivery_type": res.data.get("delivery_type", "Takeaway")}
+
 
 # ─────────────────────────────────────────────
 # CART SUBMIT — called from web shop page
@@ -256,30 +265,42 @@ async def submit_cart(body: CartSubmit):
     subtotal = sum(item.price * item.quantity for item in body.items)
     gst_amount = round(subtotal * gst_percent / 100, 2)
     total = round(subtotal + gst_amount, 2)
-
-    # Save order — insert then refetch (avoid .select().single() chain issue)
     items_data = [item.dict() for item in body.items]
-    supabase.table("orders").insert({
-        "project_id": project_id,
-        "phone_number": phone,
-        "items": items_data,
-        "subtotal": subtotal,
-        "gst_amount": gst_amount,
-        "total": total,
-        "status": "pending",
-        "payment_status": "unpaid",
-        "delivery_type": body.delivery_type or "Takeaway",
-    }).execute()
 
-    # Refetch the order we just created
-    order_res = supabase.table("orders") \
-        .select("*") \
-        .eq("project_id", project_id) \
-        .eq("phone_number", phone) \
-        .order("created_at", desc=True) \
-        .limit(1) \
-        .execute()
-    order = order_res.data[0]
+    # ── If order_id is present, UPDATE the existing order (Add More flow) ──
+    if body.order_id:
+        supabase.table("orders").update({
+            "items": items_data,
+            "subtotal": subtotal,
+            "gst_amount": gst_amount,
+            "total": total,
+            "delivery_type": body.delivery_type or "Takeaway",
+        }).eq("id", body.order_id).execute()
+
+        order_res = supabase.table("orders").select("*").eq("id", body.order_id).single().execute()
+        order = order_res.data
+    else:
+        # ── Otherwise create a new order ──
+        supabase.table("orders").insert({
+            "project_id": project_id,
+            "phone_number": phone,
+            "items": items_data,
+            "subtotal": subtotal,
+            "gst_amount": gst_amount,
+            "total": total,
+            "status": "pending",
+            "payment_status": "unpaid",
+            "delivery_type": body.delivery_type or "Takeaway",
+        }).execute()
+
+        order_res = supabase.table("orders") \
+            .select("*") \
+            .eq("project_id", project_id) \
+            .eq("phone_number", phone) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        order = order_res.data[0]
 
     # Build cart summary
     lines = []
@@ -300,7 +321,6 @@ async def submit_cart(body: CartSubmit):
         wa_data = None
 
     if not wa_data:
-        # Still update session even if WhatsApp not connected
         supabase.table("whatsapp_sessions").upsert({
             "project_id": project_id,
             "phone_number": phone,
@@ -315,7 +335,6 @@ async def submit_cart(body: CartSubmit):
     phone_number_id = wa_data["phone_number_id"]
     token = wa_data.get("access_token") or WHATSAPP_TOKEN
 
-    # Send cart summary with 3 buttons
     send_whatsapp_buttons(
         to=phone,
         body=summary,
@@ -328,7 +347,6 @@ async def submit_cart(body: CartSubmit):
         token=token,
     )
 
-    # Update WhatsApp session
     supabase.table("whatsapp_sessions").upsert({
         "project_id": project_id,
         "phone_number": phone,
