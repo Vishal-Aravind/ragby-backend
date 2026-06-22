@@ -27,11 +27,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Your appointment is confirmed for {{2}} at {{3}}. Reply CONFIRM to confirm or CANCEL to cancel.",
-                "example": {
-                    "body_text": [["John", "25 Dec 2026", "10:00 AM"]]
-                }
             }
         ],
+        "example_body": ["John", "25 Dec 2026", "10:00 AM"],
         "variables": ["Customer name", "Date", "Time"],
         "language": "en_US",
     },
@@ -47,11 +45,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Your order #{{2}} has been confirmed. Total: ₹{{3}}. We'll notify you when it ships!",
-                "example": {
-                    "body_text": [["John", "ORD123", "500"]]
-                }
             }
         ],
+        "example_body": ["John", "ORD123", "500"],
         "variables": ["Customer name", "Order ID", "Amount"],
         "language": "en_US",
     },
@@ -67,11 +63,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! We've received your payment of ₹{{2}}. Transaction ID: {{3}}. Thank you!",
-                "example": {
-                    "body_text": [["John", "500", "TXN123456"]]
-                }
             }
         ],
+        "example_body": ["John", "500", "TXN123456"],
         "variables": ["Customer name", "Amount", "Transaction ID"],
         "language": "en_US",
     },
@@ -87,11 +81,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Your order #{{2}} is out for delivery. Expected by {{3}}. Track here: {{4}}",
-                "example": {
-                    "body_text": [["John", "ORD123", "5:00 PM", "https://track.example.com/ORD123"]]
-                }
             }
         ],
+        "example_body": ["John", "ORD123", "5:00 PM", "https://track.example.com/ORD123"],
         "variables": ["Customer name", "Order ID", "Expected time", "Tracking link"],
         "language": "en_US",
     },
@@ -107,11 +99,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Your booking is confirmed. Date: {{2}}, Time: {{3}}, Ref: #{{4}}. See you soon!",
-                "example": {
-                    "body_text": [["John", "25 Dec 2026", "7:00 PM", "BK001"]]
-                }
             }
         ],
+        "example_body": ["John", "25 Dec 2026", "7:00 PM", "BK001"],
         "variables": ["Customer name", "Date", "Time", "Booking ID"],
         "language": "en_US",
     },
@@ -127,11 +117,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Welcome to {{2}}! We're excited to have you. Feel free to reply with any questions — we're here to help!",
-                "example": {
-                    "body_text": [["John", "Best Store"]]
-                }
             }
         ],
+        "example_body": ["John", "Best Store"],
         "variables": ["Customer name", "Business name"],
         "language": "en_US",
     },
@@ -147,11 +135,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! 🎉 Special offer just for you — {{2}}% off on {{3}}. Valid till {{4}}. Don't miss out!",
-                "example": {
-                    "body_text": [["John", "20", "All Products", "31 Dec 2026"]]
-                }
             }
         ],
+        "example_body": ["John", "20", "All Products", "31 Dec 2026"],
         "variables": ["Customer name", "Discount %", "Product/Service", "Expiry date"],
         "language": "en_US",
     },
@@ -167,11 +153,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! How was your experience with {{2}}? We'd love to hear from you. Share your feedback here: {{3}}",
-                "example": {
-                    "body_text": [["John", "Best Store", "https://review.example.com"]]
-                }
             }
         ],
+        "example_body": ["John", "Best Store", "https://review.example.com"],
         "variables": ["Customer name", "Business name", "Feedback link"],
         "language": "en_US",
     },
@@ -187,11 +171,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Your invoice #{{2}} for ₹{{3}} is ready. Due date: {{4}}. View here: {{5}}",
-                "example": {
-                    "body_text": [["John", "INV001", "5000", "31 Dec 2026", "https://invoice.example.com/INV001"]]
-                }
             }
         ],
+        "example_body": ["John", "INV001", "5000", "31 Dec 2026", "https://invoice.example.com/INV001"],
         "variables": ["Customer name", "Invoice ID", "Amount", "Due date", "Invoice link"],
         "language": "en_US",
     },
@@ -207,11 +189,9 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 "text": "Hi {{1}}! Time to restock {{2}}? Order now and get it delivered by {{3}}. Reply YES to reorder!",
-                "example": {
-                    "body_text": [["John", "Vitamin C Tablets", "28 Jun 2026"]]
-                }
             }
         ],
+        "example_body": ["John", "Vitamin C Tablets", "28 Jun 2026"],
         "variables": ["Customer name", "Product name", "Delivery date"],
         "language": "en_US",
     },
@@ -252,22 +232,43 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
 
     waba_id = wa.data[0]["waba_id"]
 
-    # Submit to Meta — components now include example sample text
+    # Build components — keep BODY clean, add example separately
+    components = template["components"]
+
+    # Add example to BODY component if example_body exists
+    # Meta API expects example inside the component itself but as a
+    # separate key alongside type/text — NOT nested differently
+    if template.get("example_body"):
+        components = []
+        for comp in template["components"]:
+            new_comp = dict(comp)
+            if comp["type"] == "BODY" and template.get("example_body"):
+                new_comp["example"] = {
+                    "body_text": [template["example_body"]]
+                }
+            components.append(new_comp)
+
+    # Submit to Meta
+    payload = {
+        "name": template["name"],
+        "category": template["category"],
+        "language": template["language"],
+        "components": components,
+    }
+
+    print(f"Submitting template to Meta: {payload}")
+
     res = requests.post(
         f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
         headers={
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
         },
-        json={
-            "name": template["name"],
-            "category": template["category"],
-            "language": template["language"],
-            "components": template["components"],
-        }
+        json=payload,
     )
 
     resp_data = res.json()
+    print(f"Meta template response: {resp_data}")
 
     if res.ok:
         return {
