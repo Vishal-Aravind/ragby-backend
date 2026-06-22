@@ -26,7 +26,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your appointment is confirmed for {{2}} at {{3}}. Reply CONFIRM to confirm or CANCEL to cancel."
+                "text": "Hi {{1}}! Your appointment is confirmed for {{2}} at {{3}}. Reply CONFIRM to confirm or CANCEL to cancel.",
+                "example": {
+                    "body_text": [["John", "25 Dec 2026", "10:00 AM"]]
+                }
             }
         ],
         "variables": ["Customer name", "Date", "Time"],
@@ -43,7 +46,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your order #{{2}} has been confirmed. Total: ₹{{3}}. We'll notify you when it ships!"
+                "text": "Hi {{1}}! Your order #{{2}} has been confirmed. Total: ₹{{3}}. We'll notify you when it ships!",
+                "example": {
+                    "body_text": [["John", "ORD123", "500"]]
+                }
             }
         ],
         "variables": ["Customer name", "Order ID", "Amount"],
@@ -60,7 +66,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! We've received your payment of ₹{{2}}. Transaction ID: {{3}}. Thank you!"
+                "text": "Hi {{1}}! We've received your payment of ₹{{2}}. Transaction ID: {{3}}. Thank you!",
+                "example": {
+                    "body_text": [["John", "500", "TXN123456"]]
+                }
             }
         ],
         "variables": ["Customer name", "Amount", "Transaction ID"],
@@ -77,7 +86,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your order #{{2}} is out for delivery. Expected by {{3}}. Track here: {{4}}"
+                "text": "Hi {{1}}! Your order #{{2}} is out for delivery. Expected by {{3}}. Track here: {{4}}",
+                "example": {
+                    "body_text": [["John", "ORD123", "5:00 PM", "https://track.example.com/ORD123"]]
+                }
             }
         ],
         "variables": ["Customer name", "Order ID", "Expected time", "Tracking link"],
@@ -94,7 +106,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your booking is confirmed. Date: {{2}}, Time: {{3}}, Ref: #{{4}}. See you soon!"
+                "text": "Hi {{1}}! Your booking is confirmed. Date: {{2}}, Time: {{3}}, Ref: #{{4}}. See you soon!",
+                "example": {
+                    "body_text": [["John", "25 Dec 2026", "7:00 PM", "BK001"]]
+                }
             }
         ],
         "variables": ["Customer name", "Date", "Time", "Booking ID"],
@@ -111,7 +126,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Welcome to {{2}}! We're excited to have you. Feel free to reply with any questions — we're here to help!"
+                "text": "Hi {{1}}! Welcome to {{2}}! We're excited to have you. Feel free to reply with any questions — we're here to help!",
+                "example": {
+                    "body_text": [["John", "Best Store"]]
+                }
             }
         ],
         "variables": ["Customer name", "Business name"],
@@ -128,7 +146,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! 🎉 Special offer just for you — {{2}}% off on {{3}}. Valid till {{4}}. Don't miss out!"
+                "text": "Hi {{1}}! 🎉 Special offer just for you — {{2}}% off on {{3}}. Valid till {{4}}. Don't miss out!",
+                "example": {
+                    "body_text": [["John", "20", "All Products", "31 Dec 2026"]]
+                }
             }
         ],
         "variables": ["Customer name", "Discount %", "Product/Service", "Expiry date"],
@@ -145,7 +166,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! How was your experience with {{2}}? We'd love to hear from you. Share your feedback here: {{3}}"
+                "text": "Hi {{1}}! How was your experience with {{2}}? We'd love to hear from you. Share your feedback here: {{3}}",
+                "example": {
+                    "body_text": [["John", "Best Store", "https://review.example.com"]]
+                }
             }
         ],
         "variables": ["Customer name", "Business name", "Feedback link"],
@@ -162,7 +186,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your invoice #{{2}} for ₹{{3}} is ready. Due date: {{4}}. View here: {{5}}"
+                "text": "Hi {{1}}! Your invoice #{{2}} for ₹{{3}} is ready. Due date: {{4}}. View here: {{5}}",
+                "example": {
+                    "body_text": [["John", "INV001", "5000", "31 Dec 2026", "https://invoice.example.com/INV001"]]
+                }
             }
         ],
         "variables": ["Customer name", "Invoice ID", "Amount", "Due date", "Invoice link"],
@@ -179,7 +206,10 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Time to restock {{2}}? Order now and get it delivered by {{3}}. Reply YES to reorder!"
+                "text": "Hi {{1}}! Time to restock {{2}}? Order now and get it delivered by {{3}}. Reply YES to reorder!",
+                "example": {
+                    "body_text": [["John", "Vitamin C Tablets", "28 Jun 2026"]]
+                }
             }
         ],
         "variables": ["Customer name", "Product name", "Delivery date"],
@@ -203,8 +233,8 @@ def get_template_library():
 @router.post("/template-library/add")
 def add_template_to_waba(data: dict, user=Depends(verify_token)):
     """Submit a pre-built template to the customer's WABA."""
-    project_id   = data["project_id"]
-    template_id  = data["template_id"]
+    project_id  = data["project_id"]
+    template_id = data["template_id"]
 
     # Find template
     template = next((t for t in TEMPLATE_LIBRARY if t["id"] == template_id), None)
@@ -222,7 +252,7 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
 
     waba_id = wa.data[0]["waba_id"]
 
-    # Submit to Meta
+    # Submit to Meta — components now include example sample text
     res = requests.post(
         f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
         headers={
@@ -237,16 +267,18 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
         }
     )
 
-    data = res.json()
+    resp_data = res.json()
 
     if res.ok:
         return {
             "status": "submitted",
-            "template_id": data.get("id"),
+            "template_id": resp_data.get("id"),
             "message": "Template submitted for approval. Usually approved within a few minutes to hours."
         }
     else:
-        # Template might already exist
-        if "already exists" in str(data).lower():
+        if "already exists" in str(resp_data).lower():
             return {"status": "exists", "message": "Template already exists in your account."}
-        raise HTTPException(status_code=400, detail=data.get("error", {}).get("message", "Failed to submit template"))
+        raise HTTPException(
+            status_code=400,
+            detail=resp_data.get("error", {}).get("message", "Failed to submit template")
+        )
