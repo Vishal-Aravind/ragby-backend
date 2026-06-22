@@ -1,0 +1,572 @@
+"""
+Appointments system — Calendly-style booking via WhatsApp bot.
+Supports Google Calendar integration for availability.
+"""
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional, List
+from clients import supabase
+from auth import verify_token
+from config import WHATSAPP_TOKEN, FRONTEND_URL
+import os
+import requests
+from datetime import datetime, date, timedelta, time
+import json
+
+router = APIRouter()
+
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", f"{os.getenv('BACKEND_URL', 'https://ragby-backend.onrender.com')}/appointments/google/callback")
+
+
+# -------------------------------------------------
+# MODELS
+# -------------------------------------------------
+class AppointmentSettingsUpdate(BaseModel):
+    service_name: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    buffer_minutes: Optional[int] = None
+    working_hours: Optional[dict] = None
+    advance_booking_days: Optional[int] = None
+    reminder_hours: Optional[int] = None
+    google_calendar_id: Optional[str] = None
+    accent_color: Optional[str] = None
+    is_enabled: Optional[bool] = None
+
+class BookingCreate(BaseModel):
+    project_id: str
+    customer_name: str
+    customer_phone: str
+    appointment_date: str  # YYYY-MM-DD
+    start_time: str        # HH:MM
+    notes: Optional[str] = None
+
+class AppointmentStatusUpdate(BaseModel):
+    status: str  # confirmed, cancelled, rescheduled, completed
+
+
+# -------------------------------------------------
+# HELPERS
+# -------------------------------------------------
+def get_google_access_token(refresh_token: str) -> Optional[str]:
+    """Exchange refresh token for access token."""
+    res = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    })
+    if res.ok:
+        return res.json().get("access_token")
+    print(f"Google token refresh error: {res.text}")
+    return None
+
+
+def get_busy_slots(access_token: str, calendar_id: str, date_str: str) -> List[dict]:
+    """Get busy time slots from Google Calendar for a specific date."""
+    start = f"{date_str}T00:00:00Z"
+    end   = f"{date_str}T23:59:59Z"
+
+    res = requests.post(
+        "https://www.googleapis.com/calendar/v3/freeBusy",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "timeMin": start,
+            "timeMax": end,
+            "items": [{"id": calendar_id}],
+        }
+    )
+    if res.ok:
+        calendars = res.json().get("calendars", {})
+        busy = calendars.get(calendar_id, {}).get("busy", [])
+        return busy
+    print(f"Google freeBusy error: {res.text}")
+    return []
+
+
+def create_google_event(access_token: str, calendar_id: str, event: dict) -> Optional[str]:
+    """Create a Google Calendar event and return event ID."""
+    res = requests.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json=event,
+    )
+    if res.ok:
+        return res.json().get("id")
+    print(f"Google create event error: {res.text}")
+    return None
+
+
+def delete_google_event(access_token: str, calendar_id: str, event_id: str):
+    """Delete a Google Calendar event."""
+    requests.delete(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+
+def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> List[str]:
+    """Generate available time slots for a given date."""
+    import re
+
+    # Get day of week
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    day_map = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
+    day_key = day_map[dt.weekday()]
+
+    working_hours = settings.get("working_hours", {})
+    day_config = working_hours.get(day_key, {})
+
+    if not day_config.get("enabled", False):
+        return []
+
+    start_str = day_config.get("start", "09:00")
+    end_str   = day_config.get("end", "18:00")
+    duration  = settings.get("duration_minutes", 30)
+    buffer    = settings.get("buffer_minutes", 0)
+
+    # Parse start/end times
+    start_h, start_m = map(int, start_str.split(":"))
+    end_h, end_m     = map(int, end_str.split(":"))
+
+    start_dt = datetime(dt.year, dt.month, dt.day, start_h, start_m)
+    end_dt   = datetime(dt.year, dt.month, dt.day, end_h, end_m)
+
+    # Parse busy slots into datetime ranges
+    busy_ranges = []
+    for b in busy_slots:
+        b_start = datetime.fromisoformat(b["start"].replace("Z", "+00:00")).replace(tzinfo=None)
+        b_end   = datetime.fromisoformat(b["end"].replace("Z", "+00:00")).replace(tzinfo=None)
+        # Adjust for IST (UTC+5:30) if needed — approximate, since no timezone handling in MVP
+        b_start = b_start + timedelta(hours=5, minutes=30)
+        b_end   = b_end   + timedelta(hours=5, minutes=30)
+        busy_ranges.append((b_start, b_end))
+
+    # Generate slots
+    slots = []
+    current = start_dt
+    now = datetime.now()
+
+    while current + timedelta(minutes=duration) <= end_dt:
+        slot_end = current + timedelta(minutes=duration)
+
+        # Skip past slots
+        if current <= now:
+            current += timedelta(minutes=duration + buffer)
+            continue
+
+        # Check if slot overlaps with any busy period
+        is_busy = False
+        for b_start, b_end in busy_ranges:
+            if not (slot_end <= b_start or current >= b_end):
+                is_busy = True
+                break
+
+        if not is_busy:
+            slots.append(current.strftime("%H:%M"))
+
+        current += timedelta(minutes=duration + buffer)
+
+    return slots
+
+
+# -------------------------------------------------
+# GOOGLE OAUTH
+# -------------------------------------------------
+@router.get("/appointments/google/auth/{project_id}")
+def google_auth(project_id: str, user=Depends(verify_token)):
+    """Start Google OAuth flow for calendar access."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="Google OAuth not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to env vars.")
+
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        "&response_type=code"
+        "&scope=https://www.googleapis.com/auth/calendar"
+        "&access_type=offline"
+        "&prompt=consent"
+        f"&state={project_id}"
+    )
+    return {"auth_url": auth_url}
+
+
+@router.get("/appointments/google/callback")
+def google_callback(code: str, state: str):
+    """Handle Google OAuth callback — exchange code for tokens."""
+    project_id = state
+
+    res = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    })
+
+    if not res.ok:
+        return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'{res.text}'}}, '*'); window.close();</script></body></html>"
+
+    token_data = res.json()
+    refresh_token = token_data.get("refresh_token")
+
+    if not refresh_token:
+        return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'No refresh token returned. Try disconnecting and reconnecting.'}}, '*'); window.close();</script></body></html>"
+
+    # Save refresh token
+    existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
+    if existing and existing.data:
+        supabase.table("appointment_settings").update({
+            "google_refresh_token": refresh_token,
+        }).eq("project_id", project_id).execute()
+    else:
+        supabase.table("appointment_settings").insert({
+            "project_id": project_id,
+            "google_refresh_token": refresh_token,
+        }).execute()
+
+    return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'FINISH'}}, '*'); window.close();</script></body></html>"
+
+
+@router.delete("/appointments/google/disconnect/{project_id}")
+def google_disconnect(project_id: str, user=Depends(verify_token)):
+    supabase.table("appointment_settings").update({
+        "google_refresh_token": None,
+        "google_calendar_id": "primary",
+    }).eq("project_id", project_id).execute()
+    return {"success": True}
+
+
+# -------------------------------------------------
+# SETTINGS
+# -------------------------------------------------
+@router.get("/appointment-settings/{project_id}")
+def get_settings(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
+    if not res or not res.data:
+        return {
+            "project_id": project_id,
+            "service_name": "Appointment",
+            "duration_minutes": 30,
+            "buffer_minutes": 0,
+            "working_hours": {
+                "mon": {"start": "09:00", "end": "18:00", "enabled": True},
+                "tue": {"start": "09:00", "end": "18:00", "enabled": True},
+                "wed": {"start": "09:00", "end": "18:00", "enabled": True},
+                "thu": {"start": "09:00", "end": "18:00", "enabled": True},
+                "fri": {"start": "09:00", "end": "18:00", "enabled": True},
+                "sat": {"start": "09:00", "end": "14:00", "enabled": False},
+                "sun": {"start": "09:00", "end": "14:00", "enabled": False},
+            },
+            "advance_booking_days": 30,
+            "reminder_hours": 24,
+            "google_refresh_token": None,
+            "google_calendar_id": "primary",
+            "accent_color": "#6366f1",
+            "is_enabled": False,
+            "google_connected": False,
+        }
+    data = res.data
+    data["google_connected"] = bool(data.get("google_refresh_token"))
+    data.pop("google_refresh_token", None)  # never expose token to frontend
+    return data
+
+
+@router.put("/appointment-settings/{project_id}")
+def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depends(verify_token)):
+    update = {k: v for k, v in body.dict().items() if v is not None}
+    existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
+    if existing and existing.data:
+        supabase.table("appointment_settings").update(update).eq("project_id", project_id).execute()
+    else:
+        supabase.table("appointment_settings").insert({"project_id": project_id, **update}).execute()
+    res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).single().execute()
+    data = res.data
+    data["google_connected"] = bool(data.get("google_refresh_token"))
+    data.pop("google_refresh_token", None)
+    return data
+
+
+# -------------------------------------------------
+# PUBLIC — Booking page APIs
+# -------------------------------------------------
+@router.get("/public/appointments/{project_id}/settings")
+def public_settings(project_id: str):
+    res = supabase.table("appointment_settings").select(
+        "service_name,duration_minutes,working_hours,advance_booking_days,accent_color,is_enabled,google_refresh_token,google_calendar_id"
+    ).eq("project_id", project_id).maybe_single().execute()
+    if not res or not res.data:
+        raise HTTPException(status_code=404, detail="Booking not configured")
+    data = res.data
+    if not data.get("is_enabled"):
+        raise HTTPException(status_code=403, detail="Booking not enabled")
+    data.pop("google_refresh_token", None)
+    return data
+
+
+@router.get("/public/appointments/{project_id}/slots")
+def public_slots(project_id: str, date: str):
+    """Get available slots for a specific date."""
+    # Validate date format
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    # Get settings including refresh token
+    res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
+    if not res or not res.data:
+        raise HTTPException(status_code=404, detail="Settings not found")
+
+    settings = res.data
+    refresh_token = settings.get("google_refresh_token")
+    calendar_id   = settings.get("google_calendar_id", "primary")
+
+    # Get busy slots from Google Calendar if connected
+    busy_slots = []
+    if refresh_token:
+        access_token = get_google_access_token(refresh_token)
+        if access_token:
+            busy_slots = get_busy_slots(access_token, calendar_id, date)
+
+    # Also get busy slots from our own appointments table
+    our_appointments = supabase.table("appointments") \
+        .select("start_time, end_time") \
+        .eq("project_id", project_id) \
+        .eq("appointment_date", date) \
+        .neq("status", "cancelled") \
+        .execute()
+
+    for appt in (our_appointments.data or []):
+        busy_slots.append({
+            "start": f"{date}T{appt['start_time']}Z",
+            "end":   f"{date}T{appt['end_time']}Z",
+        })
+
+    slots = generate_slots(date, settings, busy_slots)
+    return {"date": date, "slots": slots}
+
+
+@router.post("/public/appointments/book")
+def book_appointment(body: BookingCreate):
+    """Create a new appointment."""
+    from whatsapp import send_whatsapp_message, send_whatsapp_buttons
+    from config import WHATSAPP_TOKEN
+
+    project_id = body.project_id
+
+    # Get settings
+    res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
+    if not res or not res.data:
+        raise HTTPException(status_code=404, detail="Settings not found")
+
+    settings = res.data
+    duration  = settings.get("duration_minutes", 30)
+    service   = settings.get("service_name", "Appointment")
+
+    # Calculate end time
+    start_dt = datetime.strptime(f"{body.appointment_date} {body.start_time}", "%Y-%m-%d %H:%M")
+    end_dt   = start_dt + timedelta(minutes=duration)
+    end_time = end_dt.strftime("%H:%M")
+
+    # Create Google Calendar event if connected
+    google_event_id = None
+    refresh_token   = settings.get("google_refresh_token")
+    calendar_id     = settings.get("google_calendar_id", "primary")
+
+    if refresh_token:
+        access_token = get_google_access_token(refresh_token)
+        if access_token:
+            event = {
+                "summary": f"{service} — {body.customer_name}",
+                "description": f"Customer: {body.customer_name}\nPhone: {body.customer_phone}\nNotes: {body.notes or 'None'}",
+                "start": {
+                    "dateTime": f"{body.appointment_date}T{body.start_time}:00",
+                    "timeZone": "Asia/Kolkata",
+                },
+                "end": {
+                    "dateTime": f"{body.appointment_date}T{end_time}:00",
+                    "timeZone": "Asia/Kolkata",
+                },
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [{"method": "popup", "minutes": 30}],
+                },
+            }
+            google_event_id = create_google_event(access_token, calendar_id, event)
+
+    # Save appointment to DB
+    appt_res = supabase.table("appointments").insert({
+        "project_id": project_id,
+        "customer_name": body.customer_name,
+        "customer_phone": body.customer_phone.replace("+", ""),
+        "service_name": service,
+        "appointment_date": body.appointment_date,
+        "start_time": body.start_time,
+        "end_time": end_time,
+        "status": "confirmed",
+        "google_event_id": google_event_id,
+        "notes": body.notes,
+    }).execute()
+
+    appointment = appt_res.data[0]
+
+    # Format date nicely
+    date_obj = datetime.strptime(body.appointment_date, "%Y-%m-%d")
+    date_formatted = date_obj.strftime("%A, %d %B %Y")
+
+    # Send WhatsApp confirmation
+    try:
+        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
+        wa_data = (wa_res.data if wa_res else None)
+
+        if wa_data:
+            phone_number_id = wa_data["phone_number_id"]
+            token = wa_data.get("access_token") or WHATSAPP_TOKEN
+            phone = body.customer_phone.replace("+", "").replace(" ", "")
+
+            msg = f"✅ *Booking Confirmed!*\n\n"
+            msg += f"📋 Service: {service}\n"
+            msg += f"📅 Date: {date_formatted}\n"
+            msg += f"⏰ Time: {body.start_time}\n"
+            msg += f"👤 Name: {body.customer_name}\n\n"
+            msg += f"Booking ID: #{appointment['id'][:8].upper()}"
+
+            send_whatsapp_buttons(
+                to=phone,
+                body=msg,
+                buttons=[
+                    {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
+                    {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
+                ],
+                phone_number_id=phone_number_id,
+                token=token,
+            )
+
+            # Update session to track this appointment
+            supabase.table("whatsapp_sessions").upsert({
+                "project_id": project_id,
+                "phone_number": phone,
+                "mode": "appointment_confirmed",
+                "metadata": {"appointment_id": appointment["id"]},
+            }, on_conflict="project_id,phone_number").execute()
+
+    except Exception as e:
+        print(f"WhatsApp confirmation error: {e}")
+
+    return {
+        "status": "confirmed",
+        "appointment_id": appointment["id"],
+        "date": date_formatted,
+        "time": body.start_time,
+        "service": service,
+    }
+
+
+# -------------------------------------------------
+# APPOINTMENTS CRUD (dashboard)
+# -------------------------------------------------
+@router.get("/appointments")
+def list_appointments(project_id: str, user=Depends(verify_token)):
+    res = supabase.table("appointments") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .order("appointment_date", desc=False) \
+        .order("start_time", desc=False) \
+        .execute()
+    return res.data or []
+
+
+@router.put("/appointments/{appointment_id}")
+def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=Depends(verify_token)):
+    # If cancelling, delete Google Calendar event
+    if body.status == "cancelled":
+        appt_res = supabase.table("appointments").select("*").eq("id", appointment_id).maybe_single().execute()
+        if appt_res and appt_res.data:
+            appt = appt_res.data
+            settings_res = supabase.table("appointment_settings").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
+            settings = (settings_res.data if settings_res else None) or {}
+            refresh_token = settings.get("google_refresh_token")
+            if refresh_token and appt.get("google_event_id"):
+                access_token = get_google_access_token(refresh_token)
+                if access_token:
+                    delete_google_event(access_token, settings.get("google_calendar_id", "primary"), appt["google_event_id"])
+
+            # Notify customer
+            try:
+                wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
+                wa_data = (wa_res.data if wa_res else None)
+                if wa_data:
+                    from whatsapp import send_whatsapp_message
+                    send_whatsapp_message(
+                        to=appt["customer_phone"],
+                        text=f"❌ *Appointment Cancelled*\n\nYour {appt['service_name']} on {appt['appointment_date']} at {appt['start_time']} has been cancelled.\n\nReply *book* to schedule a new appointment.",
+                        phone_number_id=wa_data["phone_number_id"],
+                        token=wa_data.get("access_token") or WHATSAPP_TOKEN,
+                    )
+            except Exception as e:
+                print(f"Cancel notification error: {e}")
+
+    supabase.table("appointments").update({"status": body.status}).eq("id", appointment_id).execute()
+    res = supabase.table("appointments").select("*").eq("id", appointment_id).single().execute()
+    return res.data
+
+
+# -------------------------------------------------
+# REMINDER SENDER (called by a cron job or manually)
+# -------------------------------------------------
+@router.post("/appointments/send-reminders")
+def send_reminders(user=Depends(verify_token)):
+    """Send reminders for upcoming appointments. Call this every hour via a cron job."""
+    from whatsapp import send_whatsapp_message
+
+    now = datetime.now()
+    sent = 0
+
+    # Get all confirmed, unreminded appointments
+    appts_res = supabase.table("appointments") \
+        .select("*, appointment_settings(reminder_hours)") \
+        .eq("status", "confirmed") \
+        .eq("reminder_sent", False) \
+        .execute()
+
+    for appt in (appts_res.data or []):
+        try:
+            reminder_hours = 24
+            settings_res = supabase.table("appointment_settings").select("reminder_hours").eq("project_id", appt["project_id"]).maybe_single().execute()
+            if settings_res and settings_res.data:
+                reminder_hours = settings_res.data.get("reminder_hours", 24)
+
+            appt_dt = datetime.strptime(f"{appt['appointment_date']} {appt['start_time']}", "%Y-%m-%d %H:%M")
+            hours_until = (appt_dt - now).total_seconds() / 3600
+
+            if 0 < hours_until <= reminder_hours:
+                wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
+                wa_data = (wa_res.data if wa_res else None)
+
+                if wa_data:
+                    date_obj = datetime.strptime(appt["appointment_date"], "%Y-%m-%d")
+                    date_formatted = date_obj.strftime("%A, %d %B %Y")
+
+                    msg = f"⏰ *Appointment Reminder*\n\n"
+                    msg += f"Hi {appt['customer_name']}! Your {appt['service_name']} is tomorrow.\n\n"
+                    msg += f"📅 {date_formatted}\n"
+                    msg += f"⏰ {appt['start_time']}\n\n"
+                    msg += f"Reply *CANCEL* if you need to cancel."
+
+                    send_whatsapp_message(
+                        to=appt["customer_phone"],
+                        text=msg,
+                        phone_number_id=wa_data["phone_number_id"],
+                        token=wa_data.get("access_token") or WHATSAPP_TOKEN,
+                    )
+
+                    supabase.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
+                    sent += 1
+
+        except Exception as e:
+            print(f"Reminder error for {appt['id']}: {e}")
+
+    return {"status": "done", "reminders_sent": sent}

@@ -287,6 +287,23 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
     elif t == "rag":
         send_whatsapp_message(to, c["body"], phone_number_id, token)
 
+    elif t == "message_booking":
+        proj_id = project_id or ""
+        booking_url = f"{FRONTEND_URL}/book/{proj_id}?phone={to}"
+        send_whatsapp_cta_url(
+            to,
+            c.get("body", "Book your appointment 📅\nChoose a date and time that works for you."),
+            c.get("button_text", "Book Appointment"),
+            booking_url,
+            phone_number_id,
+            token,
+        )
+        if proj_id:
+            upsert_session(proj_id, to, {
+                "mode": "shop_browsing",
+                "metadata": {},
+            })
+
     elif t == "message_shop":
         catalog_id = c.get("catalog_id", "")
         proj_id = project_id or ""
@@ -356,6 +373,30 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
 
     if chat_id:
         save_message(chat_id, "user", f"[tapped: {trigger}]")
+
+    # Handle appointment reschedule/cancel button triggers
+    if trigger.startswith("reschedule_"):
+        appointment_id = trigger.replace("reschedule_", "")
+        booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}"
+        send_whatsapp_cta_url(
+            phone_number,
+            "Tap below to pick a new date and time 📅",
+            "Reschedule",
+            booking_url,
+            phone_number_id, token,
+        )
+        return
+
+    if trigger.startswith("cancel_appt_"):
+        appointment_id = trigger.replace("cancel_appt_", "")
+        supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
+        send_whatsapp_message(
+            phone_number,
+            "✅ Your appointment has been cancelled.\n\nReply *book* to schedule a new one.",
+            phone_number_id, token,
+        )
+        upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        return
 
     if trigger == "cart_continue":
         handle_text(session, "continue", project_id, chat_id, phone_number, phone_number_id, token)
@@ -514,6 +555,38 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     if chat_id:
         save_message(chat_id, "user", text)
+
+    if session and session.get("mode") == "appointment_confirmed":
+        appointment_id = (session.get("metadata") or {}).get("appointment_id")
+        if "cancel" in text.lower():
+            if appointment_id:
+                supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
+            send_whatsapp_message(
+                phone_number,
+                "✅ Your appointment has been cancelled.\n\nReply *book* to schedule a new one.",
+                phone_number_id, token,
+            )
+            upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        elif any(w in text.lower() for w in ["reschedule", "book", "change"]):
+            booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}"
+            send_whatsapp_cta_url(
+                phone_number,
+                "Tap below to pick a new date and time 📅",
+                "Reschedule",
+                booking_url,
+                phone_number_id, token,
+            )
+        else:
+            send_whatsapp_buttons(
+                phone_number,
+                "Your appointment is confirmed. What would you like to do?",
+                [
+                    {"id": f"reschedule_{appointment_id}", "title": "Reschedule 🔄"},
+                    {"id": f"cancel_appt_{appointment_id}", "title": "Cancel ❌"},
+                ],
+                phone_number_id, token,
+            )
+        return
 
     if session and session.get("mode") == "shop_browsing":
         send_whatsapp_message(

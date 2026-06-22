@@ -20,6 +20,7 @@ from campaigns import router as campaigns_router
 from template_library import router as template_library_router
 from shop import router as shop_router
 from send_template_api import router as send_template_router
+from appointments import router as appointments_router
 
 
 # -------------------------------------------------
@@ -55,6 +56,7 @@ app.include_router(campaigns_router)
 app.include_router(template_library_router)
 app.include_router(shop_router)
 app.include_router(send_template_router)
+app.include_router(appointments_router)
 
 
 
