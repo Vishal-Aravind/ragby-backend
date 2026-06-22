@@ -19,6 +19,8 @@ from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
 from template_library import router as template_library_router
 from shop import router as shop_router
+from send_template_api import router as send_template_router
+
 
 # -------------------------------------------------
 # APP
@@ -52,6 +54,8 @@ app.include_router(api_keys_router)
 app.include_router(campaigns_router)
 app.include_router(template_library_router)
 app.include_router(shop_router)
+app.include_router(send_template_router)
+
 
 
 # -------------------------------------------------
