@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 
 from config import FRONTEND_URL
 
@@ -24,9 +25,42 @@ from appointments import router as appointments_router
 
 
 # -------------------------------------------------
+# BACKGROUND SCHEDULER — appointment reminders
+# -------------------------------------------------
+def run_appointment_reminders():
+    """Runs every hour — sends WhatsApp reminders for upcoming appointments."""
+    try:
+        from appointments import send_reminders_job
+        send_reminders_job()
+    except Exception as e:
+        print(f"Scheduler: reminder job error: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start scheduler on app startup
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
+        scheduler.start()
+        print("Appointment reminder scheduler started — runs every hour")
+    except Exception as e:
+        print(f"Scheduler failed to start: {e}")
+
+    yield  # app runs here
+
+    # Shutdown scheduler on app stop
+    try:
+        scheduler.shutdown()
+    except Exception:
+        pass
+
+
+# -------------------------------------------------
 # APP
 # -------------------------------------------------
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -57,7 +91,6 @@ app.include_router(template_library_router)
 app.include_router(shop_router)
 app.include_router(send_template_router)
 app.include_router(appointments_router)
-
 
 
 # -------------------------------------------------

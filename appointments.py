@@ -570,26 +570,26 @@ def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=
 @router.post("/appointments/send-reminders")
 def send_reminders(user=Depends(verify_token)):
     """Send reminders for upcoming appointments. Call this every hour via a cron job."""
-    from whatsapp import send_whatsapp_message
-
     now = datetime.now()
     sent = 0
+    failed = 0
 
     # Get all confirmed, unreminded appointments
     appts_res = supabase.table("appointments") \
-        .select("*, appointment_settings(reminder_hours)") \
+        .select("*") \
         .eq("status", "confirmed") \
         .eq("reminder_sent", False) \
         .execute()
 
     for appt in (appts_res.data or []):
         try:
-            reminder_hours = 24
             settings_res = supabase.table("appointment_settings").select("reminder_hours").eq("project_id", appt["project_id"]).maybe_single().execute()
-            if settings_res and settings_res.data:
-                reminder_hours = settings_res.data.get("reminder_hours", 24)
+            settings = (settings_res.data if settings_res else None) or {}
+            reminder_hours = settings.get("reminder_hours", 24)
 
-            appt_dt = datetime.strptime(f"{appt['appointment_date']} {appt['start_time']}", "%Y-%m-%d %H:%M")
+            # Parse start_time — handle both "HH:MM:SS" and "HH:MM" formats
+            start_time_str = str(appt["start_time"])[:5]
+            appt_dt = datetime.strptime(f"{appt['appointment_date']} {start_time_str}", "%Y-%m-%d %H:%M")
             hours_until = (appt_dt - now).total_seconds() / 3600
 
             if 0 < hours_until <= reminder_hours:
@@ -597,26 +597,175 @@ def send_reminders(user=Depends(verify_token)):
                 wa_data = (wa_res.data if wa_res else None)
 
                 if wa_data:
+                    phone_number_id = wa_data["phone_number_id"]
+                    token = wa_data.get("access_token") or WHATSAPP_TOKEN
                     date_obj = datetime.strptime(appt["appointment_date"], "%Y-%m-%d")
-                    date_formatted = date_obj.strftime("%A, %d %B %Y")
+                    date_formatted = date_obj.strftime("%d %B %Y")
 
-                    msg = f"⏰ *Appointment Reminder*\n\n"
-                    msg += f"Hi {appt['customer_name']}! Your {appt['service_name']} is tomorrow.\n\n"
-                    msg += f"📅 {date_formatted}\n"
-                    msg += f"⏰ {appt['start_time']}\n\n"
-                    msg += f"Reply *CANCEL* if you need to cancel."
-
-                    send_whatsapp_message(
+                    # Try approved template first (works outside 24hr window)
+                    template_sent = _send_reminder_template(
                         to=appt["customer_phone"],
-                        text=msg,
-                        phone_number_id=wa_data["phone_number_id"],
-                        token=wa_data.get("access_token") or WHATSAPP_TOKEN,
+                        customer_name=appt["customer_name"],
+                        date=date_formatted,
+                        time=start_time_str,
+                        phone_number_id=phone_number_id,
+                        token=token,
                     )
+
+                    if not template_sent:
+                        # Fallback to plain text (only works within 24hr window)
+                        from whatsapp import send_whatsapp_message
+                        msg = (
+                            f"\u23f0 *Appointment Reminder*\n\n"
+                            f"Hi {appt['customer_name']}! Your {appt['service_name']} is coming up.\n\n"
+                            f"\U0001f4c5 {date_formatted}\n"
+                            f"\u23f0 {start_time_str}\n\n"
+                            f"Reply *CANCEL* if you need to cancel."
+                        )
+                        send_whatsapp_message(
+                            to=appt["customer_phone"],
+                            text=msg,
+                            phone_number_id=phone_number_id,
+                            token=token,
+                        )
 
                     supabase.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
                     sent += 1
 
         except Exception as e:
             print(f"Reminder error for {appt['id']}: {e}")
+            failed += 1
 
-    return {"status": "done", "reminders_sent": sent}
+    return {"status": "done", "reminders_sent": sent, "failed": failed}
+
+
+def _send_reminder_template(to: str, customer_name: str, date: str, time: str, phone_number_id: str, token: str) -> bool:
+    """
+    Send appointment_reminder template message.
+    Template body: Hi {{1}}! Your appointment is confirmed for {{2}} at {{3}}.
+                   Reply CONFIRM to confirm or CANCEL to cancel.
+    Returns True if sent successfully, False if template not approved or failed.
+    """
+    try:
+        res = requests.post(
+            f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "template",
+                "template": {
+                    "name": "appointment_reminder",
+                    "language": {"code": "en_US"},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": customer_name},
+                                {"type": "text", "text": date},
+                                {"type": "text", "text": time},
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        if res.ok:
+            print(f"Reminder template sent to {to}")
+            return True
+        else:
+            print(f"Reminder template failed for {to}: {res.text}")
+            return False
+    except Exception as e:
+        print(f"Reminder template error: {e}")
+        return False
+
+
+# -------------------------------------------------
+# STANDALONE JOB — called by background scheduler in main.py
+# -------------------------------------------------
+def send_reminders_job():
+    """
+    Called directly by APScheduler every hour.
+    Same logic as the /appointments/send-reminders endpoint
+    but runs internally without needing an HTTP request.
+    """
+    from datetime import datetime
+    now = datetime.now()
+    sent = 0
+    failed = 0
+
+    try:
+        appts_res = supabase.table("appointments") \
+            .select("*") \
+            .eq("status", "confirmed") \
+            .eq("reminder_sent", False) \
+            .execute()
+
+        for appt in (appts_res.data or []):
+            try:
+                settings_res = supabase.table("appointment_settings") \
+                    .select("reminder_hours") \
+                    .eq("project_id", appt["project_id"]) \
+                    .maybe_single() \
+                    .execute()
+                settings = (settings_res.data if settings_res else None) or {}
+                reminder_hours = settings.get("reminder_hours", 24)
+
+                start_time_str = str(appt["start_time"])[:5]
+                appt_dt = datetime.strptime(f"{appt['appointment_date']} {start_time_str}", "%Y-%m-%d %H:%M")
+                hours_until = (appt_dt - now).total_seconds() / 3600
+
+                if 0 < hours_until <= reminder_hours:
+                    wa_res = supabase.table("whatsapp_integrations") \
+                        .select("*") \
+                        .eq("project_id", appt["project_id"]) \
+                        .maybe_single() \
+                        .execute()
+                    wa_data = (wa_res.data if wa_res else None)
+
+                    if wa_data:
+                        phone_number_id = wa_data["phone_number_id"]
+                        token = wa_data.get("access_token") or WHATSAPP_TOKEN
+                        date_obj = datetime.strptime(appt["appointment_date"], "%Y-%m-%d")
+                        date_formatted = date_obj.strftime("%d %B %Y")
+
+                        template_sent = _send_reminder_template(
+                            to=appt["customer_phone"],
+                            customer_name=appt["customer_name"],
+                            date=date_formatted,
+                            time=start_time_str,
+                            phone_number_id=phone_number_id,
+                            token=token,
+                        )
+
+                        if not template_sent:
+                            from whatsapp import send_whatsapp_message
+                            msg = (
+                                f"\u23f0 *Appointment Reminder*\n\n"
+                                f"Hi {appt['customer_name']}! Your {appt['service_name']} is coming up.\n\n"
+                                f"\U0001f4c5 {date_formatted}\n"
+                                f"\u23f0 {start_time_str}\n\n"
+                                f"Reply *CANCEL* if you need to cancel."
+                            )
+                            send_whatsapp_message(
+                                to=appt["customer_phone"],
+                                text=msg,
+                                phone_number_id=phone_number_id,
+                                token=token,
+                            )
+
+                        supabase.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
+                        sent += 1
+
+            except Exception as e:
+                print(f"Reminder job error for appointment {appt.get('id')}: {e}")
+                failed += 1
+
+        print(f"Reminder job done — sent: {sent}, failed: {failed}")
+
+    except Exception as e:
+        print(f"Reminder job fatal error: {e}")
