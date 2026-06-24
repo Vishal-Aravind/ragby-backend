@@ -27,6 +27,7 @@ class AppointmentSettingsUpdate(BaseModel):
     service_name: Optional[str] = None
     duration_minutes: Optional[int] = None
     buffer_minutes: Optional[int] = None
+    slot_capacity: Optional[int] = None
     working_hours: Optional[dict] = None
     advance_booking_days: Optional[int] = None
     reminder_hours: Optional[int] = None
@@ -41,6 +42,7 @@ class BookingCreate(BaseModel):
     appointment_date: str  # YYYY-MM-DD
     start_time: str        # HH:MM
     notes: Optional[str] = None
+    reschedule_id: Optional[str] = None  # old appointment ID being rescheduled
 
 class AppointmentStatusUpdate(BaseModel):
     status: str  # confirmed, cancelled, rescheduled, completed
@@ -143,6 +145,17 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
         b_end   = b_end   + timedelta(hours=5, minutes=30)
         busy_ranges.append((b_start, b_end))
 
+    slot_capacity = settings.get("slot_capacity", 1)
+
+    # Count existing confirmed bookings per slot from our own DB
+    existing_bookings_res = supabase.table("appointments")         .select("start_time")         .eq("project_id", settings.get("project_id", ""))         .eq("appointment_date", date_str)         .in_("status", ["confirmed", "rescheduled"])         .execute()
+
+    # Build a count map: {start_time_str: count}
+    booking_counts = {}
+    for b in (existing_bookings_res.data or []):
+        t = str(b["start_time"])[:5]  # "HH:MM"
+        booking_counts[t] = booking_counts.get(t, 0) + 1
+
     # Generate slots
     slots = []
     current = start_dt
@@ -150,21 +163,39 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
 
     while current + timedelta(minutes=duration) <= end_dt:
         slot_end = current + timedelta(minutes=duration)
+        slot_str = current.strftime("%H:%M")
 
         # Skip past slots
         if current <= now:
             current += timedelta(minutes=duration + buffer)
             continue
 
-        # Check if slot overlaps with any busy period
+        # Check capacity — if existing bookings >= capacity, slot is full
+        existing_count = booking_counts.get(slot_str, 0)
+        if existing_count >= slot_capacity:
+            current += timedelta(minutes=duration + buffer)
+            continue
+
+        # Check Google Calendar busy only if capacity is 1 (exclusive slots)
+        # For capacity > 1, Google Calendar is used as a personal block-out only
         is_busy = False
-        for b_start, b_end in busy_ranges:
-            if not (slot_end <= b_start or current >= b_end):
-                is_busy = True
-                break
+        if slot_capacity == 1:
+            for b_start, b_end in busy_ranges:
+                if not (slot_end <= b_start or current >= b_end):
+                    is_busy = True
+                    break
+        else:
+            # For capacity > 1, only block if entire capacity would be exceeded
+            # Google Calendar events still block the slot completely (owner blocked)
+            for b_start, b_end in busy_ranges:
+                if not (slot_end <= b_start or current >= b_end):
+                    is_busy = True
+                    break
 
         if not is_busy:
-            slots.append(current.strftime("%H:%M"))
+            remaining = slot_capacity - existing_count
+            slot_label = slot_str if slot_capacity == 1 else f"{slot_str} ({remaining} left)"
+            slots.append(slot_label)
 
         current += timedelta(minutes=duration + buffer)
 
@@ -262,6 +293,7 @@ def get_settings(project_id: str, user=Depends(verify_token)):
             },
             "advance_booking_days": 30,
             "reminder_hours": 24,
+            "slot_capacity": 1,
             "google_refresh_token": None,
             "google_calendar_id": "primary",
             "accent_color": "#6366f1",
@@ -345,6 +377,7 @@ def public_slots(project_id: str, date: str):
             "end":   f"{date}T{appt['end_time']}Z",
         })
 
+    settings["project_id"] = project_id
     slots = generate_slots(date, settings, busy_slots)
     return {"date": date, "slots": slots}
 
@@ -397,6 +430,22 @@ def book_appointment(body: BookingCreate):
             }
             google_event_id = create_google_event(access_token, calendar_id, event)
 
+    # If rescheduling, mark old appointment as rescheduled
+    if body.reschedule_id:
+        try:
+            old_appt = supabase.table("appointments").select("*").eq("id", body.reschedule_id).maybe_single().execute()
+            if old_appt and old_appt.data:
+                supabase.table("appointments").update({"status": "rescheduled"}).eq("id", body.reschedule_id).execute()
+                # Delete old Google Calendar event
+                old_refresh = (supabase.table("appointment_settings").select("google_refresh_token,google_calendar_id").eq("project_id", project_id).maybe_single().execute())
+                old_settings = (old_refresh.data if old_refresh else None) or {}
+                if old_settings.get("google_refresh_token") and old_appt.data.get("google_event_id"):
+                    old_token = get_google_access_token(old_settings["google_refresh_token"])
+                    if old_token:
+                        delete_google_event(old_token, old_settings.get("google_calendar_id", "primary"), old_appt.data["google_event_id"])
+        except Exception as e:
+            print(f"Reschedule old appointment error: {e}")
+
     # Save appointment to DB
     appt_res = supabase.table("appointments").insert({
         "project_id": project_id,
@@ -427,7 +476,8 @@ def book_appointment(body: BookingCreate):
             token = wa_data.get("access_token") or WHATSAPP_TOKEN
             phone = body.customer_phone.replace("+", "").replace(" ", "")
 
-            msg = f"✅ *Booking Confirmed!*\n\n"
+            action = "Rescheduled" if body.reschedule_id else "Confirmed"
+            msg = f"✅ *Booking {action}!*\n\n"
             msg += f"📋 Service: {service}\n"
             msg += f"📅 Date: {date_formatted}\n"
             msg += f"⏰ Time: {body.start_time}\n"

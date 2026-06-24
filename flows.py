@@ -377,10 +377,10 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     # Handle appointment reschedule/cancel button triggers
     if trigger.startswith("reschedule_"):
         appointment_id = trigger.replace("reschedule_", "")
-        booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}"
+        booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}&reschedule={appointment_id}"
         send_whatsapp_cta_url(
             phone_number,
-            "Tap below to pick a new date and time 📅",
+            "Tap below to pick a new date and time 📅\nYour previous appointment will be cancelled once you confirm the new one.",
             "Reschedule",
             booking_url,
             phone_number_id, token,
@@ -568,10 +568,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             )
             upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
         elif any(w in text.lower() for w in ["reschedule", "book", "change"]):
-            booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}"
+            booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}&reschedule={appointment_id}"
             send_whatsapp_cta_url(
                 phone_number,
-                "Tap below to pick a new date and time 📅",
+                "Tap below to pick a new date and time 📅\nYour previous appointment will be cancelled once you confirm the new one.",
                 "Reschedule",
                 booking_url,
                 phone_number_id, token,
