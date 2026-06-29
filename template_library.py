@@ -282,3 +282,36 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
             status_code=400,
             detail=resp_data.get("error", {}).get("message", "Failed to submit template")
         )
+
+
+# -------------------------------------------------
+# SYNC TEMPLATES FROM META
+# -------------------------------------------------
+@router.get("/template-library/sync/{project_id}")
+def sync_templates_from_meta(project_id: str, user=Depends(verify_token)):
+    """Fetch all templates from the merchant's WABA and return with approval status."""
+
+    # Get WABA ID
+    wa = supabase.table("whatsapp_integrations") \
+        .select("waba_id") \
+        .eq("project_id", project_id) \
+        .maybe_single() \
+        .execute()
+
+    if not wa or not wa.data or not wa.data.get("waba_id"):
+        raise HTTPException(status_code=400, detail="WhatsApp not connected")
+
+    waba_id = wa.data["waba_id"]
+
+    # Fetch all templates from Meta
+    res = requests.get(
+        f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        params={"fields": "name,status,category,language,components", "limit": 100},
+    )
+
+    if not res.ok:
+        raise HTTPException(status_code=400, detail=res.json().get("error", {}).get("message", "Failed to fetch templates"))
+
+    templates = res.json().get("data", [])
+    return {"templates": templates, "total": len(templates)}
