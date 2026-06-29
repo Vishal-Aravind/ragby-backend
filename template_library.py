@@ -40,11 +40,12 @@ TEMPLATE_LIBRARY = [
         "name": "order_confirmation",
         "display_name": "Order Confirmation",
         "description": "Confirm customer orders automatically",
-        "preview": "Hi {Name}! Your order #{Order ID} has been confirmed. Total: ₹{Amount}. We'll notify you when it ships!",
+        "preview": "Hi {Name}! Your order {Order ID} has been confirmed. Total: ₹{Amount}. We will notify you when it ships!",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your order #{{2}} has been confirmed. Total: ₹{{3}}. We'll notify you when it ships!",
+                # Removed # before {{2}} — Meta rejects #{{ pattern
+                "text": "Hi {{1}}! Your order {{2}} has been confirmed. Total: {{3}}. We will notify you when it ships!",
             }
         ],
         "example_body": ["John", "ORD123", "500"],
@@ -58,11 +59,11 @@ TEMPLATE_LIBRARY = [
         "name": "payment_received",
         "display_name": "Payment Received",
         "description": "Confirm payment receipt to customers",
-        "preview": "Hi {Name}! We've received your payment of ₹{Amount}. Transaction ID: {Transaction ID}. Thank you!",
+        "preview": "Hi {Name}! We have received your payment of ₹{Amount}. Transaction ID: {Transaction ID}. Thank you!",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! We've received your payment of ₹{{2}}. Transaction ID: {{3}}. Thank you!",
+                "text": "Hi {{1}}! We have received your payment of {{2}}. Transaction ID: {{3}}. Thank you for your business!",
             }
         ],
         "example_body": ["John", "500", "TXN123456"],
@@ -76,15 +77,16 @@ TEMPLATE_LIBRARY = [
         "name": "delivery_update",
         "display_name": "Delivery Update",
         "description": "Keep customers updated on their delivery",
-        "preview": "Hi {Name}! Your order #{Order ID} is out for delivery. Expected by {Time}. Track: {Link}",
+        "preview": "Hi {Name}! Your order {Order ID} is out for delivery. Expected by {Time}. Please be available to receive it.",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your order #{{2}} is out for delivery. Expected by {{3}}. Track here: {{4}}",
+                # Removed #{{ and URL variable — both cause Meta rejections
+                "text": "Hi {{1}}! Your order {{2}} is out for delivery. Expected by {{3}}. Please be available to receive it.",
             }
         ],
-        "example_body": ["John", "ORD123", "5:00 PM", "https://track.example.com/ORD123"],
-        "variables": ["Customer name", "Order ID", "Expected time", "Tracking link"],
+        "example_body": ["John", "ORD123", "5:00 PM"],
+        "variables": ["Customer name", "Order ID", "Expected time"],
         "language": "en_US",
     },
     {
@@ -94,11 +96,12 @@ TEMPLATE_LIBRARY = [
         "name": "booking_confirmation",
         "display_name": "Booking Confirmation",
         "description": "Confirm table, room, or service bookings",
-        "preview": "Hi {Name}! Your booking is confirmed. Date: {Date}, Time: {Time}, Ref: #{Booking ID}. See you soon!",
+        "preview": "Hi {Name}! Your booking is confirmed. Date: {Date}, Time: {Time}, Reference: {Booking ID}. See you soon!",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your booking is confirmed. Date: {{2}}, Time: {{3}}, Ref: #{{4}}. See you soon!",
+                # Removed #{{ before {{4}}
+                "text": "Hi {{1}}! Your booking is confirmed. Date: {{2}}, Time: {{3}}, Reference: {{4}}. See you soon!",
             }
         ],
         "example_body": ["John", "25 Dec 2026", "7:00 PM", "BK001"],
@@ -112,11 +115,11 @@ TEMPLATE_LIBRARY = [
         "name": "welcome_message",
         "display_name": "Welcome Message",
         "description": "Welcome new customers to your business",
-        "preview": "Hi {Name}! Welcome to {Business}! We're excited to have you. Reply with any questions.",
+        "preview": "Hi {Name}! Welcome to {Business}! We are excited to have you. Reply with any questions.",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Welcome to {{2}}! We're excited to have you. Feel free to reply with any questions — we're here to help!",
+                "text": "Hi {{1}}! Welcome to {{2}}! We are excited to have you. Feel free to reply with any questions — we are here to help!",
             }
         ],
         "example_body": ["John", "Best Store"],
@@ -130,11 +133,11 @@ TEMPLATE_LIBRARY = [
         "name": "special_offer",
         "display_name": "Special Offer",
         "description": "Send promotional offers to customers",
-        "preview": "Hi {Name}! 🎉 Special offer just for you — {Discount}% off on {Product}. Valid till {Date}. Shop now!",
+        "preview": "Hi {Name}! Special offer just for you — {Discount}% off on {Product}. Valid till {Date}. Do not miss out!",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! 🎉 Special offer just for you — {{2}}% off on {{3}}. Valid till {{4}}. Don't miss out!",
+                "text": "Hi {{1}}! Special offer just for you — {{2}}% off on {{3}}. Valid till {{4}}. Do not miss out!",
             }
         ],
         "example_body": ["John", "20", "All Products", "31 Dec 2026"],
@@ -148,15 +151,16 @@ TEMPLATE_LIBRARY = [
         "name": "feedback_request",
         "display_name": "Feedback Request",
         "description": "Ask customers for reviews and feedback",
-        "preview": "Hi {Name}! How was your experience with {Business}? Share your feedback: {Link}",
+        "preview": "Hi {Name}! How was your experience with {Business}? Reply with a rating from 1 to 5 and your comments.",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! How was your experience with {{2}}? We'd love to hear from you. Share your feedback here: {{3}}",
+                # Removed URL variable — Meta flags link variables in UTILITY templates
+                "text": "Hi {{1}}! How was your experience with {{2}}? Please reply with a rating from 1 to 5 and share your feedback. We appreciate your time!",
             }
         ],
-        "example_body": ["John", "Best Store", "https://review.example.com"],
-        "variables": ["Customer name", "Business name", "Feedback link"],
+        "example_body": ["John", "Best Store"],
+        "variables": ["Customer name", "Business name"],
         "language": "en_US",
     },
     {
@@ -166,15 +170,16 @@ TEMPLATE_LIBRARY = [
         "name": "invoice_ready",
         "display_name": "Invoice Ready",
         "description": "Notify customers when their invoice is ready",
-        "preview": "Hi {Name}! Your invoice #{Invoice ID} for ₹{Amount} is ready. Due date: {Date}. View: {Link}",
+        "preview": "Hi {Name}! Your invoice {Invoice ID} for ₹{Amount} is ready. Due date: {Date}. Please contact us to make payment.",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! Your invoice #{{2}} for ₹{{3}} is ready. Due date: {{4}}. View here: {{5}}",
+                # Removed #{{ and URL variable, reduced to 4 variables
+                "text": "Hi {{1}}! Your invoice {{2}} for {{3}} is ready. Due date: {{4}}. Please contact us to make payment.",
             }
         ],
-        "example_body": ["John", "INV001", "5000", "31 Dec 2026", "https://invoice.example.com/INV001"],
-        "variables": ["Customer name", "Invoice ID", "Amount", "Due date", "Invoice link"],
+        "example_body": ["John", "INV001", "5000", "31 Dec 2026"],
+        "variables": ["Customer name", "Invoice ID", "Amount", "Due date"],
         "language": "en_US",
     },
     {
@@ -184,7 +189,7 @@ TEMPLATE_LIBRARY = [
         "name": "reorder_reminder",
         "display_name": "Reorder Reminder",
         "description": "Remind customers to restock their products",
-        "preview": "Hi {Name}! Time to restock {Product}? Order now and get it delivered by {Date}.",
+        "preview": "Hi {Name}! Time to restock {Product}? Order now and get it delivered by {Date}. Reply YES to reorder!",
         "components": [
             {
                 "type": "BODY",
@@ -232,21 +237,15 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
 
     waba_id = wa.data[0]["waba_id"]
 
-    # Build components — keep BODY clean, add example separately
-    components = template["components"]
-
-    # Add example to BODY component if example_body exists
-    # Meta API expects example inside the component itself but as a
-    # separate key alongside type/text — NOT nested differently
-    if template.get("example_body"):
-        components = []
-        for comp in template["components"]:
-            new_comp = dict(comp)
-            if comp["type"] == "BODY" and template.get("example_body"):
-                new_comp["example"] = {
-                    "body_text": [template["example_body"]]
-                }
-            components.append(new_comp)
+    # Build components with examples
+    components = []
+    for comp in template["components"]:
+        new_comp = dict(comp)
+        if comp["type"] == "BODY" and template.get("example_body"):
+            new_comp["example"] = {
+                "body_text": [template["example_body"]]
+            }
+        components.append(new_comp)
 
     # Submit to Meta
     payload = {
