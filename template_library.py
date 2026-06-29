@@ -45,7 +45,7 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 # Removed # before {{2}} — Meta rejects #{{ pattern
-                "text": "Hi {{1}}! Your order {{2}} has been confirmed. Total: {{3}}. We will notify you when it ships!",
+                "text": "Hi {{1}}! Your order {{2}} has been confirmed. Total amount: {{3}}. We will notify you when it ships!",
             }
         ],
         "example_body": ["John", "ORD123", "500"],
@@ -63,7 +63,7 @@ TEMPLATE_LIBRARY = [
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}! We have received your payment of {{2}}. Transaction ID: {{3}}. Thank you for your business!",
+                "text": "Hi {{1}}! We have received your payment. Amount: {{2}}. Transaction ID: {{3}}. Thank you for your business!",
             }
         ],
         "example_body": ["John", "500", "TXN123456"],
@@ -175,7 +175,7 @@ TEMPLATE_LIBRARY = [
             {
                 "type": "BODY",
                 # Removed #{{ and URL variable, reduced to 4 variables
-                "text": "Hi {{1}}! Your invoice {{2}} for {{3}} is ready. Due date: {{4}}. Please contact us to make payment.",
+                "text": "Hi {{1}}! Your invoice {{2}} is ready. Amount: {{3}}. Due date: {{4}}. Please contact us to make payment.",
             }
         ],
         "example_body": ["John", "INV001", "5000", "31 Dec 2026"],
