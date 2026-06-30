@@ -28,6 +28,8 @@ class EventCreate(BaseModel):
     registration_deadline: Optional[str] = None
     contact_phone: Optional[str] = None
     accent_color: Optional[str] = "#6366f1"
+    page_json: Optional[list] = None
+    form_schema: Optional[list] = None
 
 class EventUpdate(BaseModel):
     title: Optional[str] = None
@@ -41,14 +43,13 @@ class EventUpdate(BaseModel):
     contact_phone: Optional[str] = None
     accent_color: Optional[str] = None
     is_active: Optional[bool] = None
+    page_json: Optional[list] = None
+    form_schema: Optional[list] = None
 
 class RegistrationCreate(BaseModel):
     event_id: str
     project_id: str
-    name: str
-    phone: str
-    email: Optional[str] = None
-    notes: Optional[str] = None
+    data: dict   # dynamic — keyed by form field id, e.g. {"name": "John", "phone": "919...", "dietary": "Veg"}
 
 
 # -------------------------------------------------
@@ -174,6 +175,13 @@ def register_for_event(body: RegistrationCreate):
     if not event.get("is_active"):
         raise HTTPException(status_code=403, detail="Registration closed")
 
+    data = body.data or {}
+    name = data.get("name", "")
+    phone = str(data.get("phone", "")).replace("+", "").replace(" ", "")
+
+    if not name or not phone:
+        raise HTTPException(status_code=400, detail="Name and phone are required")
+
     # Check capacity
     if event.get("capacity"):
         count_res = supabase.table("event_registrations") \
@@ -188,24 +196,35 @@ def register_for_event(body: RegistrationCreate):
     existing = supabase.table("event_registrations") \
         .select("id") \
         .eq("event_id", body.event_id) \
-        .eq("phone", body.phone.replace("+", "")) \
+        .eq("phone", phone) \
         .neq("status", "cancelled") \
         .maybe_single() \
         .execute()
     if existing and existing.data:
         raise HTTPException(status_code=400, detail="You are already registered for this event")
 
-    # Insert registration
+    # Insert into event_registrations (legacy columns, kept for compatibility)
     reg_res = supabase.table("event_registrations").insert({
         "event_id": body.event_id,
         "project_id": body.project_id,
-        "name": body.name,
-        "phone": body.phone.replace("+", ""),
-        "email": body.email,
-        "notes": body.notes,
+        "name": name,
+        "phone": phone,
+        "email": data.get("email"),
+        "notes": data.get("notes"),
     }).execute()
 
     registration = reg_res.data[0]
+
+    # Also insert full dynamic data into form_submissions for custom fields
+    try:
+        supabase.table("form_submissions").insert({
+            "entity_type": "event",
+            "entity_id": body.event_id,
+            "project_id": body.project_id,
+            "data": data,
+        }).execute()
+    except Exception as e:
+        print(f"form_submissions insert error: {e}")
 
     # Send WhatsApp confirmation
     try:
@@ -234,11 +253,11 @@ def register_for_event(body: RegistrationCreate):
                 msg += "\n"
             if event.get("location"):
                 msg += f"📍 {event['location']}\n"
-            msg += f"\n👤 {body.name}\n"
+            msg += f"\n👤 {name}\n"
             msg += f"\nBooking ID: #{registration['id'][:8].upper()}\n\nSee you there!"
 
             send_whatsapp_message(
-                to=body.phone.replace("+", ""),
+                to=phone,
                 text=msg,
                 phone_number_id=phone_number_id,
                 token=token,
