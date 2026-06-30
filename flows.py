@@ -287,6 +287,44 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
     elif t == "rag":
         send_whatsapp_message(to, c["body"], phone_number_id, token)
 
+    elif t == "message_event":
+        event_id = c.get("event_id", "")
+        proj_id = project_id or ""
+        reg_url = f"{FRONTEND_URL}/event/{event_id}"
+
+        # Send rich card — image + body + Register button (+ optional Call button)
+        if c.get("banner_url"):
+            import requests as req
+            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+            payload = {
+                "messaging_product": "whatsapp", "to": to,
+                "type": "image",
+                "image": {"link": c["banner_url"], "caption": c.get("body", "")},
+            }
+            req.post(url, headers=headers, json=payload)
+
+        send_whatsapp_cta_url(
+            to,
+            c.get("body", "Register now — limited spots available!"),
+            c.get("button_text", "Register Now"),
+            reg_url,
+            phone_number_id,
+            token,
+        )
+
+        # Optional second message — Call to Attend
+        if c.get("contact_phone"):
+            phone_clean = c["contact_phone"].replace(" ", "")
+            send_whatsapp_cta_url(
+                to,
+                "Prefer to call instead?",
+                "📞 Call to Attend",
+                f"tel:{phone_clean}",
+                phone_number_id,
+                token,
+            )
+
     elif t == "message_booking":
         proj_id = project_id or ""
         booking_url = f"{FRONTEND_URL}/book/{proj_id}?phone={to}"
