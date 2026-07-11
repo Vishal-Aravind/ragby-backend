@@ -26,7 +26,7 @@ from events import router as events_router
 
 
 # -------------------------------------------------
-# BACKGROUND SCHEDULER — appointment reminders
+# BACKGROUND SCHEDULER — appointment reminders + scheduled campaigns
 # -------------------------------------------------
 def run_appointment_reminders():
     """Runs every hour — sends WhatsApp reminders for upcoming appointments."""
@@ -37,6 +37,15 @@ def run_appointment_reminders():
         print(f"Scheduler: reminder job error: {e}")
 
 
+def run_scheduled_campaigns():
+    """Runs every 2 minutes — sends any campaign whose scheduled time has arrived."""
+    try:
+        from campaigns import dispatch_scheduled_campaigns
+        dispatch_scheduled_campaigns()
+    except Exception as e:
+        print(f"Scheduler: campaign dispatch error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start scheduler on app startup
@@ -44,8 +53,9 @@ async def lifespan(app: FastAPI):
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
         scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
+        scheduler.add_job(run_scheduled_campaigns, 'interval', minutes=2, id='scheduled_campaigns')
         scheduler.start()
-        print("Appointment reminder scheduler started — runs every hour")
+        print("Schedulers started — appointment reminders hourly, campaign dispatch every 2 minutes")
     except Exception as e:
         print(f"Scheduler failed to start: {e}")
 
