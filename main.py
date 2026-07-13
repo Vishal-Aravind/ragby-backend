@@ -23,6 +23,7 @@ from shop import router as shop_router
 from send_template_api import router as send_template_router
 from appointments import router as appointments_router
 from events import router as events_router
+from content_gaps import router as content_gaps_router
 
 
 # -------------------------------------------------
@@ -103,6 +104,7 @@ app.include_router(shop_router)
 app.include_router(send_template_router)
 app.include_router(appointments_router)
 app.include_router(events_router)
+app.include_router(content_gaps_router)
 
 
 # -------------------------------------------------
