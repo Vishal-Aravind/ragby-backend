@@ -39,7 +39,7 @@ def run_appointment_reminders():
 
 
 def run_scheduled_campaigns():
-    """Runs every 2 minutes — sends any campaign whose scheduled time has arrived."""
+    """Runs every 30 seconds — sends any campaign whose scheduled time has arrived."""
     try:
         from campaigns import dispatch_scheduled_campaigns
         dispatch_scheduled_campaigns()
@@ -54,9 +54,9 @@ async def lifespan(app: FastAPI):
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
         scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
-        scheduler.add_job(run_scheduled_campaigns, 'interval', minutes=2, id='scheduled_campaigns')
+        scheduler.add_job(run_scheduled_campaigns, 'interval', seconds=30, id='scheduled_campaigns')
         scheduler.start()
-        print("Schedulers started — appointment reminders hourly, campaign dispatch every 2 minutes")
+        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s")
     except Exception as e:
         print(f"Scheduler failed to start: {e}")
 

@@ -96,8 +96,9 @@ class LeadTagsUpdate(BaseModel):
 
 @router.put("/leads/{lead_id}")
 def update_lead_tags(lead_id: str, req: LeadTagsUpdate, user=Depends(verify_token)):
-    # Normalize: trim, drop empties, dedupe — keeps campaign tag filtering exact-match friendly.
-    clean_tags = sorted(set(t.strip() for t in req.tags if t.strip()))
+    # Normalize: trim, lowercase, drop empties, dedupe — "VIP" and "vip" must
+    # collapse into one tag, or campaign tag filtering silently misses people.
+    clean_tags = sorted(set(t.strip().lower() for t in req.tags if t.strip()))
     supabase.table("leads").update({"tags": clean_tags}).eq("id", lead_id).execute()
     res = supabase.table("leads").select("*").eq("id", lead_id).single().execute()
     return res.data
