@@ -82,6 +82,134 @@ def save_message(chat_id: str, role: str, content: str):
 
 
 # -------------------------------------------------
+# AGENTIC ACTIONS — bot-can-book (opt-in, see appointment_settings.bot_can_book)
+# -------------------------------------------------
+def get_appointment_settings_if_bookable(project_id: str):
+    """None unless the merchant has explicitly turned on in-chat booking."""
+    res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
+    data = res.data if res else None
+    return data if data and data.get("bot_can_book") else None
+
+
+APPOINTMENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_appointment_availability",
+            "description": "Check which appointment time slots are free on a given date. Always call this before proposing a specific time to the customer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"},
+                },
+                "required": ["date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_appointment",
+            "description": (
+                "Book a confirmed appointment slot. Only call this AFTER the customer has explicitly "
+                "agreed to a specific date and time you already checked and proposed to them. Never call "
+                "this on the first mention of wanting an appointment, and never guess or assume a "
+                "date/time the customer hasn't confirmed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Confirmed date, format YYYY-MM-DD"},
+                    "time": {"type": "string", "description": "Confirmed start time, format HH:MM (24-hour)"},
+                    "customer_name": {"type": "string", "description": "The customer's name"},
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                },
+                "required": ["date", "time", "customer_name"],
+            },
+        },
+    },
+]
+
+
+def execute_appointment_tool(name: str, args: dict, project_id: str, chat_id: str) -> dict:
+    """Runs a tool call. Never trusts the model's parameters as final —
+    create_appointment re-validates the slot is actually still free."""
+    from appointments import get_available_slots, create_appointment
+
+    chat_row = supabase.table("chats").select("channel, external_id").eq("id", chat_id).maybe_single().execute()
+    chat_data = (chat_row.data if chat_row else None) or {}
+    channel = chat_data.get("channel")
+    external_id = chat_data.get("external_id")
+
+    try:
+        if name == "check_appointment_availability":
+            slots = get_available_slots(project_id, args["date"])
+            return {"date": args["date"], "available_slots": slots}
+
+        if name == "book_appointment":
+            # WhatsApp's own sender number is authoritative — never rely on
+            # the model to transcribe a phone number correctly when we
+            # already know it for certain from the channel itself.
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need a phone number from the customer to confirm this booking."}
+            return create_appointment(
+                project_id=project_id,
+                customer_name=args["customer_name"],
+                customer_phone=phone,
+                appointment_date=args["date"],
+                start_time=args["time"],
+                notes=None,
+            )
+
+        return {"error": f"Unknown tool {name}"}
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        print(f"execute_appointment_tool error: {e}")
+        return {"error": "Something went wrong trying to do that — please try again."}
+
+
+def run_completion(messages: list, tools_enabled: bool, project_id: str, chat_id: str, temperature: float, max_tokens: int) -> str:
+    """Runs one OpenAI completion, transparently looping through any tool
+    calls the model makes (max 3 rounds — a real conversation never needs
+    more than that, and it caps the blast radius of a runaway loop)."""
+    kwargs = {"model": "gpt-4o-mini", "temperature": temperature, "max_tokens": max_tokens}
+    if tools_enabled:
+        kwargs["tools"] = APPOINTMENT_TOOLS
+        kwargs["tool_choice"] = "auto"
+
+    for _ in range(3):
+        completion = openai_client.chat.completions.create(messages=messages, **kwargs)
+        msg = completion.choices[0].message
+
+        if not msg.tool_calls:
+            return (msg.content or "").strip()
+
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+        })
+
+        for tc in msg.tool_calls:
+            import json as _json
+            args = _json.loads(tc.function.arguments or "{}")
+            result = execute_appointment_tool(tc.function.name, args, project_id, chat_id)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": _json.dumps(result),
+            })
+
+    # Ran out of rounds — ask the model for a final plain answer, no more tools.
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages, temperature=temperature, max_tokens=max_tokens,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+# -------------------------------------------------
 # INTENT DETECTION
 # -------------------------------------------------
 def classify_intent(message: str) -> str:
@@ -149,6 +277,16 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         if domain:
             system_prompt += f"\n\nDomain:\n- You are specialized in {domain}."
 
+        appointment_settings = get_appointment_settings_if_bookable(project_id)
+        if appointment_settings:
+            system_prompt += (
+                "\n\nBooking:\n"
+                "- You can check appointment availability and book one using the tools provided.\n"
+                "- Always check availability before proposing a time.\n"
+                "- Always get the customer's explicit yes on a specific date/time before calling book_appointment.\n"
+                "- If a slot turns out to be unavailable, apologize briefly and offer to check another time."
+            )
+
         intent = classify_intent(message)
 
         if intent == "greeting":
@@ -165,13 +303,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 messages.append({"role": h["role"], "content": h["content"]})
             messages.append({"role": "user", "content": message})
 
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=500,
-            )
-            answer = completion.choices[0].message.content.strip()
+            answer = run_completion(messages, bool(appointment_settings), project_id, chat_id, temperature=0.3, max_tokens=500)
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
@@ -239,7 +371,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: document]\n{h.payload.get('text', '')}" for h in hits
                 )
 
-        if not context:
+        if not context and not appointment_settings:
             answer = "I couldn't find that in your documents or data sources."
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
@@ -249,17 +381,10 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({
             "role": "user",
-            "content": f"Context:\n{context}\n\nQuestion:\n{message}"
+            "content": f"Context:\n{context or '(none — this may be a booking request rather than a document question)'}\n\nQuestion:\n{message}"
         })
 
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.2,
-            max_tokens=300,
-        )
-
-        answer = completion.choices[0].message.content.strip()
+        answer = run_completion(messages, bool(appointment_settings), project_id, chat_id, temperature=0.2, max_tokens=300)
         save_message(chat_id, "assistant", answer)
         return {"answer": answer, "sources": []}
 

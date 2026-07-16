@@ -34,6 +34,7 @@ class AppointmentSettingsUpdate(BaseModel):
     google_calendar_id: Optional[str] = None
     accent_color: Optional[str] = None
     is_enabled: Optional[bool] = None
+    bot_can_book: Optional[bool] = None
 
 class BookingCreate(BaseModel):
     project_id: str
@@ -338,32 +339,32 @@ def public_settings(project_id: str):
     return data
 
 
-@router.get("/public/appointments/{project_id}/slots")
-def public_slots(project_id: str, date: str):
-    """Get available slots for a specific date."""
-    # Validate date format
+def get_available_slots(project_id: str, date: str) -> list:
+    """
+    Core slot-lookup logic — used by the public booking page AND by the
+    in-chat booking tool (backend/chat.py). Single source of truth so both
+    paths can never disagree about what's actually free.
+    Raises ValueError on a bad date or missing settings.
+    """
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+        raise ValueError("Invalid date format. Use YYYY-MM-DD")
 
-    # Get settings including refresh token
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
-        raise HTTPException(status_code=404, detail="Settings not found")
+        raise ValueError("Appointment settings not found for this project")
 
     settings = res.data
     refresh_token = settings.get("google_refresh_token")
     calendar_id   = settings.get("google_calendar_id", "primary")
 
-    # Get busy slots from Google Calendar if connected
     busy_slots = []
     if refresh_token:
         access_token = get_google_access_token(refresh_token)
         if access_token:
             busy_slots = get_busy_slots(access_token, calendar_id, date)
 
-    # Also get busy slots from our own appointments table
     our_appointments = supabase.table("appointments") \
         .select("start_time, end_time") \
         .eq("project_id", project_id) \
@@ -378,33 +379,49 @@ def public_slots(project_id: str, date: str):
         })
 
     settings["project_id"] = project_id
-    slots = generate_slots(date, settings, busy_slots)
-    return {"date": date, "slots": slots}
+    return generate_slots(date, settings, busy_slots)
 
 
-@router.post("/public/appointments/book")
-def book_appointment(body: BookingCreate):
-    """Create a new appointment."""
-    from whatsapp import send_whatsapp_message, send_whatsapp_buttons
+def create_appointment(
+    project_id: str,
+    customer_name: str,
+    customer_phone: str,
+    appointment_date: str,
+    start_time: str,
+    notes: str = None,
+    reschedule_id: str = None,
+) -> dict:
+    """
+    Core booking logic — used by the public booking page AND by the in-chat
+    booking tool (backend/chat.py). Callers are responsible for confirming
+    the slot with the customer BEFORE calling this — this function books
+    unconditionally once called. Raises ValueError if settings are missing
+    or the slot is no longer free (re-checked here, not trusted from the
+    caller, since an AI-proposed slot could be stale by the time it's used).
+    """
+    from whatsapp import send_whatsapp_buttons
     from config import WHATSAPP_TOKEN
 
-    project_id = body.project_id
-
-    # Get settings
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
-        raise HTTPException(status_code=404, detail="Settings not found")
+        raise ValueError("Appointment settings not found for this project")
 
     settings = res.data
     duration  = settings.get("duration_minutes", 30)
     service   = settings.get("service_name", "Appointment")
 
-    # Calculate end time
-    start_dt = datetime.strptime(f"{body.appointment_date} {body.start_time}", "%Y-%m-%d %H:%M")
+    # Re-validate the slot is still actually free — never trust a
+    # previously-computed slot list as still true at execution time.
+    if not reschedule_id:
+        available = get_available_slots(project_id, appointment_date)
+        available_times = {s.split(" ")[0] for s in available}  # strip "(N left)" suffix
+        if start_time not in available_times:
+            raise ValueError(f"{start_time} on {appointment_date} is no longer available")
+
+    start_dt = datetime.strptime(f"{appointment_date} {start_time}", "%Y-%m-%d %H:%M")
     end_dt   = start_dt + timedelta(minutes=duration)
     end_time = end_dt.strftime("%H:%M")
 
-    # Create Google Calendar event if connected
     google_event_id = None
     refresh_token   = settings.get("google_refresh_token")
     calendar_id     = settings.get("google_calendar_id", "primary")
@@ -413,14 +430,14 @@ def book_appointment(body: BookingCreate):
         access_token = get_google_access_token(refresh_token)
         if access_token:
             event = {
-                "summary": f"{service} — {body.customer_name}",
-                "description": f"Customer: {body.customer_name}\nPhone: {body.customer_phone}\nNotes: {body.notes or 'None'}",
+                "summary": f"{service} — {customer_name}",
+                "description": f"Customer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes or 'None'}",
                 "start": {
-                    "dateTime": f"{body.appointment_date}T{body.start_time}:00",
+                    "dateTime": f"{appointment_date}T{start_time}:00",
                     "timeZone": "Asia/Kolkata",
                 },
                 "end": {
-                    "dateTime": f"{body.appointment_date}T{end_time}:00",
+                    "dateTime": f"{appointment_date}T{end_time}:00",
                     "timeZone": "Asia/Kolkata",
                 },
                 "reminders": {
@@ -430,13 +447,11 @@ def book_appointment(body: BookingCreate):
             }
             google_event_id = create_google_event(access_token, calendar_id, event)
 
-    # If rescheduling, mark old appointment as rescheduled
-    if body.reschedule_id:
+    if reschedule_id:
         try:
-            old_appt = supabase.table("appointments").select("*").eq("id", body.reschedule_id).maybe_single().execute()
+            old_appt = supabase.table("appointments").select("*").eq("id", reschedule_id).maybe_single().execute()
             if old_appt and old_appt.data:
-                supabase.table("appointments").update({"status": "rescheduled"}).eq("id", body.reschedule_id).execute()
-                # Delete old Google Calendar event
+                supabase.table("appointments").update({"status": "rescheduled"}).eq("id", reschedule_id).execute()
                 old_refresh = (supabase.table("appointment_settings").select("google_refresh_token,google_calendar_id").eq("project_id", project_id).maybe_single().execute())
                 old_settings = (old_refresh.data if old_refresh else None) or {}
                 if old_settings.get("google_refresh_token") and old_appt.data.get("google_event_id"):
@@ -446,27 +461,24 @@ def book_appointment(body: BookingCreate):
         except Exception as e:
             print(f"Reschedule old appointment error: {e}")
 
-    # Save appointment to DB
     appt_res = supabase.table("appointments").insert({
         "project_id": project_id,
-        "customer_name": body.customer_name,
-        "customer_phone": body.customer_phone.replace("+", ""),
+        "customer_name": customer_name,
+        "customer_phone": customer_phone.replace("+", ""),
         "service_name": service,
-        "appointment_date": body.appointment_date,
-        "start_time": body.start_time,
+        "appointment_date": appointment_date,
+        "start_time": start_time,
         "end_time": end_time,
         "status": "confirmed",
         "google_event_id": google_event_id,
-        "notes": body.notes,
+        "notes": notes,
     }).execute()
 
     appointment = appt_res.data[0]
 
-    # Format date nicely
-    date_obj = datetime.strptime(body.appointment_date, "%Y-%m-%d")
+    date_obj = datetime.strptime(appointment_date, "%Y-%m-%d")
     date_formatted = date_obj.strftime("%A, %d %B %Y")
 
-    # Send WhatsApp confirmation
     try:
         wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
         wa_data = (wa_res.data if wa_res else None)
@@ -474,14 +486,14 @@ def book_appointment(body: BookingCreate):
         if wa_data:
             phone_number_id = wa_data["phone_number_id"]
             token = wa_data.get("access_token") or WHATSAPP_TOKEN
-            phone = body.customer_phone.replace("+", "").replace(" ", "")
+            phone = customer_phone.replace("+", "").replace(" ", "")
 
-            action = "Rescheduled" if body.reschedule_id else "Confirmed"
+            action = "Rescheduled" if reschedule_id else "Confirmed"
             msg = f"✅ *Booking {action}!*\n\n"
             msg += f"📋 Service: {service}\n"
             msg += f"📅 Date: {date_formatted}\n"
-            msg += f"⏰ Time: {body.start_time}\n"
-            msg += f"👤 Name: {body.customer_name}\n\n"
+            msg += f"⏰ Time: {start_time}\n"
+            msg += f"👤 Name: {customer_name}\n\n"
             msg += f"Booking ID: #{appointment['id'][:8].upper()}"
 
             send_whatsapp_buttons(
@@ -495,7 +507,6 @@ def book_appointment(body: BookingCreate):
                 token=token,
             )
 
-            # Update session to track this appointment
             supabase.table("whatsapp_sessions").upsert({
                 "project_id": project_id,
                 "phone_number": phone,
@@ -510,9 +521,38 @@ def book_appointment(body: BookingCreate):
         "status": "confirmed",
         "appointment_id": appointment["id"],
         "date": date_formatted,
-        "time": body.start_time,
+        "time": start_time,
         "service": service,
     }
+
+
+@router.get("/public/appointments/{project_id}/slots")
+def public_slots(project_id: str, date: str):
+    """Get available slots for a specific date."""
+    try:
+        slots = get_available_slots(project_id, date)
+    except ValueError as e:
+        status = 400 if "format" in str(e) else 404
+        raise HTTPException(status_code=status, detail=str(e))
+    return {"date": date, "slots": slots}
+
+
+@router.post("/public/appointments/book")
+def book_appointment(body: BookingCreate):
+    """Create a new appointment."""
+    try:
+        return create_appointment(
+            project_id=body.project_id,
+            customer_name=body.customer_name,
+            customer_phone=body.customer_phone,
+            appointment_date=body.appointment_date,
+            start_time=body.start_time,
+            notes=body.notes,
+            reschedule_id=body.reschedule_id,
+        )
+    except ValueError as e:
+        status = 404 if "not found" in str(e) else 409
+        raise HTTPException(status_code=status, detail=str(e))
 
 
 # -------------------------------------------------
