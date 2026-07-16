@@ -131,15 +131,36 @@ APPOINTMENT_TOOLS = [
 ]
 
 
-def execute_appointment_tool(name: str, args: dict, project_id: str, chat_id: str) -> dict:
-    """Runs a tool call. Never trusts the model's parameters as final —
-    create_appointment re-validates the slot is actually still free."""
-    from appointments import get_available_slots, create_appointment
+SHOP_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_order_status",
+            "description": "Look up the customer's own recent orders (status, payment, items, total) by their phone number. Read-only — cannot place or change an order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_shop_catalog",
+            "description": "Get the list of available products (name, price, description) to answer questions like 'what do you sell' or recommend an item. Read-only — cannot add items to a cart or place an order.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
 
-    chat_row = supabase.table("chats").select("channel, external_id").eq("id", chat_id).maybe_single().execute()
-    chat_data = (chat_row.data if chat_row else None) or {}
-    channel = chat_data.get("channel")
-    external_id = chat_data.get("external_id")
+
+def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
+    """Never trusts the model's parameters as final — create_appointment
+    re-validates the slot is actually still free."""
+    from appointments import get_available_slots, create_appointment
 
     try:
         if name == "check_appointment_availability":
@@ -170,14 +191,55 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, chat_id: st
         return {"error": "Something went wrong trying to do that — please try again."}
 
 
-def run_completion(messages: list, tools_enabled: bool, project_id: str, chat_id: str, temperature: float, max_tokens: int) -> str:
+def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
+    """Read-only tools only — see 20260716100000_shop_bot_assist.sql for why."""
+    from shop import get_recent_orders_for_phone, get_active_catalog_summary
+
+    try:
+        if name == "check_order_status":
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need the customer's phone number to look up their order."}
+            orders = get_recent_orders_for_phone(project_id, phone)
+            if not orders:
+                return {"message": "No orders found for this phone number."}
+            return {"orders": orders}
+
+        if name == "browse_shop_catalog":
+            products = get_active_catalog_summary(project_id)
+            if not products:
+                return {"message": "No products currently available."}
+            return {"products": products}
+
+        return {"error": f"Unknown tool {name}"}
+    except Exception as e:
+        print(f"execute_shop_tool error: {e}")
+        return {"error": "Something went wrong trying to do that — please try again."}
+
+
+def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
+    if name in ("check_appointment_availability", "book_appointment"):
+        return execute_appointment_tool(name, args, project_id, channel, external_id)
+    if name in ("check_order_status", "browse_shop_catalog"):
+        return execute_shop_tool(name, args, project_id, channel, external_id)
+    return {"error": f"Unknown tool {name}"}
+
+
+def run_completion(messages: list, tools: list, project_id: str, chat_id: str, temperature: float, max_tokens: int) -> str:
     """Runs one OpenAI completion, transparently looping through any tool
     calls the model makes (max 3 rounds — a real conversation never needs
     more than that, and it caps the blast radius of a runaway loop)."""
     kwargs = {"model": "gpt-4o-mini", "temperature": temperature, "max_tokens": max_tokens}
-    if tools_enabled:
-        kwargs["tools"] = APPOINTMENT_TOOLS
+    if tools:
+        kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
+
+    channel, external_id = None, None
+    if tools:
+        chat_row = supabase.table("chats").select("channel, external_id").eq("id", chat_id).maybe_single().execute()
+        chat_data = (chat_row.data if chat_row else None) or {}
+        channel = chat_data.get("channel")
+        external_id = chat_data.get("external_id")
 
     for _ in range(3):
         completion = openai_client.chat.completions.create(messages=messages, **kwargs)
@@ -195,7 +257,7 @@ def run_completion(messages: list, tools_enabled: bool, project_id: str, chat_id
         for tc in msg.tool_calls:
             import json as _json
             args = _json.loads(tc.function.arguments or "{}")
-            result = execute_appointment_tool(tc.function.name, args, project_id, chat_id)
+            result = execute_tool(tc.function.name, args, project_id, channel, external_id)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -277,14 +339,28 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         if domain:
             system_prompt += f"\n\nDomain:\n- You are specialized in {domain}."
 
+        active_tools = []
+
         appointment_settings = get_appointment_settings_if_bookable(project_id)
         if appointment_settings:
+            active_tools += APPOINTMENT_TOOLS
             system_prompt += (
                 "\n\nBooking:\n"
                 "- You can check appointment availability and book one using the tools provided.\n"
                 "- Always check availability before proposing a time.\n"
                 "- Always get the customer's explicit yes on a specific date/time before calling book_appointment.\n"
                 "- If a slot turns out to be unavailable, apologize briefly and offer to check another time."
+            )
+
+        from shop import get_shop_settings_if_assistable
+        shop_settings = get_shop_settings_if_assistable(project_id)
+        if shop_settings:
+            active_tools += SHOP_TOOLS
+            system_prompt += (
+                "\n\nShop:\n"
+                "- You can look up the customer's own past orders and browse the product catalog using the tools provided.\n"
+                "- These tools are read-only — you cannot place, change, or cancel an order this way.\n"
+                "- If a customer wants to place a new order, point them to the shop link instead of trying to do it yourself."
             )
 
         intent = classify_intent(message)
@@ -303,7 +379,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 messages.append({"role": h["role"], "content": h["content"]})
             messages.append({"role": "user", "content": message})
 
-            answer = run_completion(messages, bool(appointment_settings), project_id, chat_id, temperature=0.3, max_tokens=500)
+            answer = run_completion(messages, active_tools, project_id, chat_id, temperature=0.3, max_tokens=500)
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
@@ -371,7 +447,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: document]\n{h.payload.get('text', '')}" for h in hits
                 )
 
-        if not context and not appointment_settings:
+        if not context and not active_tools:
             answer = "I couldn't find that in your documents or data sources."
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
@@ -381,10 +457,10 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({
             "role": "user",
-            "content": f"Context:\n{context or '(none — this may be a booking request rather than a document question)'}\n\nQuestion:\n{message}"
+            "content": f"Context:\n{context or '(none — this may be a booking/order/catalog request rather than a document question)'}\n\nQuestion:\n{message}"
         })
 
-        answer = run_completion(messages, bool(appointment_settings), project_id, chat_id, temperature=0.2, max_tokens=300)
+        answer = run_completion(messages, active_tools, project_id, chat_id, temperature=0.2, max_tokens=300)
         save_message(chat_id, "assistant", answer)
         return {"answer": answer, "sources": []}
 

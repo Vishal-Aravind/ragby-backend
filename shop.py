@@ -31,6 +31,7 @@ class ShopConfigUpdate(BaseModel):
     razorpay_key_id: Optional[str] = None
     razorpay_key_secret: Optional[str] = None
     is_enabled: Optional[bool] = None
+    bot_can_assist: Optional[bool] = None
 
 class CatalogCreate(BaseModel):
     project_id: str
@@ -86,6 +87,67 @@ class OrderStatusUpdate(BaseModel):
     payment_status: Optional[str] = None
 
 
+# -------------------------------------------------
+# AGENTIC ACTIONS — bot-can-assist (opt-in, see shop_config.bot_can_assist)
+# Read-only: order lookup + catalog browsing only. See migration
+# 20260716100000_shop_bot_assist.sql for why ordering itself isn't included.
+# -------------------------------------------------
+def get_shop_settings_if_assistable(project_id: str):
+    res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+    data = res.data if res else None
+    return data if data and data.get("bot_can_assist") else None
+
+
+def get_recent_orders_for_phone(project_id: str, phone: str, limit: int = 3) -> list:
+    """Used by the in-chat 'check my order' tool — read-only, no writes."""
+    clean_phone = phone.replace("+", "").replace(" ", "")
+    res = supabase.table("orders") \
+        .select("id, items, subtotal, gst_amount, total, status, payment_status, delivery_type, created_at") \
+        .eq("project_id", project_id) \
+        .eq("phone_number", clean_phone) \
+        .order("created_at", desc=True) \
+        .limit(limit) \
+        .execute()
+    orders = []
+    for o in (res.data or []):
+        orders.append({
+            "order_id": f"#{o['id'][:8].upper()}",
+            "items": [f"{it['name']} x{it['quantity']}" for it in (o.get("items") or [])],
+            "total": o["total"],
+            "status": o["status"],
+            "payment_status": o["payment_status"],
+            "delivery_type": o.get("delivery_type"),
+            "placed_at": o["created_at"],
+        })
+    return orders
+
+
+def get_active_catalog_summary(project_id: str) -> list:
+    """Used by the in-chat 'what do you sell' tool — read-only, no writes."""
+    catalogs = supabase.table("catalogs").select("id, name").eq("project_id", project_id).eq("is_active", True).execute()
+    catalog_map = {c["id"]: c["name"] for c in (catalogs.data or [])}
+    if not catalog_map:
+        return []
+
+    products = supabase.table("products") \
+        .select("catalog_id, name, description, price") \
+        .eq("project_id", project_id) \
+        .eq("is_available", True) \
+        .in_("catalog_id", list(catalog_map.keys())) \
+        .order("sort_order", desc=False) \
+        .execute()
+
+    result = []
+    for p in (products.data or []):
+        result.append({
+            "catalog": catalog_map.get(p["catalog_id"], "Menu"),
+            "name": p["name"],
+            "price": p["price"],
+            "description": p.get("description") or "",
+        })
+    return result
+
+
 # ─────────────────────────────────────────────
 # SHOP CONFIG
 # ─────────────────────────────────────────────
@@ -106,6 +168,7 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
             "razorpay_key_id": "",
             "razorpay_key_secret": "",
             "is_enabled": False,
+            "bot_can_assist": False,
         }
     return res.data
 
