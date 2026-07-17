@@ -32,6 +32,7 @@ class ShopConfigUpdate(BaseModel):
     razorpay_key_secret: Optional[str] = None
     is_enabled: Optional[bool] = None
     bot_can_assist: Optional[bool] = None
+    bot_can_order: Optional[bool] = None
 
 class CatalogCreate(BaseModel):
     project_id: str
@@ -169,6 +170,7 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
             "razorpay_key_secret": "",
             "is_enabled": False,
             "bot_can_assist": False,
+            "bot_can_order": False,
         }
     return res.data
 
@@ -305,11 +307,156 @@ async def public_get_order(order_id: str):
 # CART SUBMIT — called from web shop page
 # ─────────────────────────────────────────────
 
-@router.post("/public/shop/submit-cart")
-async def submit_cart(body: CartSubmit):
+def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data: list, currency: str, subtotal: float, gst_amount: float, total: float, catalog_id: Optional[str]) -> dict:
+    """Shared by the web-shop-page checkout AND the in-chat ordering tool —
+    single source of truth for the cart summary text + Continue/Add
+    More/Clear Cart buttons + session handoff, so both paths land the
+    customer in the exact same, already-proven confirm/payment flow."""
     from whatsapp import send_whatsapp_buttons
     from config import WHATSAPP_TOKEN
 
+    lines = []
+    for i, item in enumerate(items_data, 1):
+        lines.append(f"{i}. {item['name']} x{item['quantity']} - {currency}{int(item['price'] * item['quantity'])}")
+    items_text = "\n".join(lines)
+    summary = f"🛒 *Your Cart*\n\n{items_text}\n\nSubtotal: {currency}{int(subtotal)}"
+    if gst_amount > 0:
+        summary += f"\nGST: {currency}{gst_amount}"
+    summary += f"\n*Total: {currency}{total}*"
+
+    try:
+        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
+        wa_data = (wa_res.data if wa_res else None)
+    except Exception as e:
+        print(f"whatsapp_integrations fetch error: {e}")
+        wa_data = None
+
+    if not wa_data:
+        supabase.table("whatsapp_sessions").upsert({
+            "project_id": project_id,
+            "phone_number": phone,
+            "mode": "awaiting_cart_confirm",
+            "metadata": {"order_id": order["id"], "catalog_id": catalog_id},
+        }, on_conflict="project_id,phone_number").execute()
+        return {"status": "ok", "order_id": order["id"], "warning": "WhatsApp not connected", "summary": summary}
+
+    phone_number_id = wa_data["phone_number_id"]
+    token = wa_data.get("access_token") or WHATSAPP_TOKEN
+
+    send_whatsapp_buttons(
+        to=phone,
+        body=summary,
+        buttons=[
+            {"id": "cart_continue", "title": "Continue ➡️"},
+            {"id": "cart_add_more", "title": "Add More 🛍️"},
+            {"id": "cart_clear", "title": "Clear Cart 🗑️"},
+        ],
+        phone_number_id=phone_number_id,
+        token=token,
+    )
+
+    supabase.table("whatsapp_sessions").upsert({
+        "project_id": project_id,
+        "phone_number": phone,
+        "mode": "awaiting_cart_confirm",
+        "metadata": {"order_id": order["id"], "catalog_id": catalog_id},
+    }, on_conflict="project_id,phone_number").execute()
+
+    return {"status": "ok", "order_id": order["id"], "summary": summary}
+
+
+def find_product_by_name(project_id: str, name: str) -> Optional[dict]:
+    """Case-insensitive, substring-tolerant match against real catalog
+    products — used by the in-chat ordering tool. Never trusts a product
+    name/price supplied by the model as final; this looks up the real row.
+    Returns None if there's no match OR more than one equally-good match
+    (ambiguous — caller should ask the customer to clarify rather than guess)."""
+    res = supabase.table("products").select("*").eq("project_id", project_id).eq("is_available", True).execute()
+    products = res.data or []
+    name_lower = name.strip().lower()
+
+    exact = [p for p in products if p["name"].strip().lower() == name_lower]
+    if len(exact) == 1:
+        return exact[0]
+
+    partial = [p for p in products if name_lower in p["name"].lower() or p["name"].lower() in name_lower]
+    if len(partial) == 1:
+        return partial[0]
+
+    return None
+
+
+def create_order_from_chat(project_id: str, phone: str, requested_items: list, delivery_type: Optional[str] = None) -> dict:
+    """
+    In-chat equivalent of submit_cart — builds a fresh order from items the
+    AI understood in conversation, then hands off to the SAME
+    confirm/payment flow the web shop page already uses. Every item is
+    re-resolved against the real product catalog here — the model only
+    supplies a product name + quantity, never a price.
+    """
+    unmatched = []
+    items_data = []
+    catalog_id = None
+
+    for req in requested_items:
+        product = find_product_by_name(project_id, req["product_name"])
+        if not product:
+            unmatched.append(req["product_name"])
+            continue
+        qty = max(1, int(req.get("quantity", 1)))
+        items_data.append({
+            "product_id": product["id"],
+            "name": product["name"],
+            "price": product["price"],
+            "quantity": qty,
+            "image_url": product.get("image_url"),
+        })
+        catalog_id = catalog_id or product.get("catalog_id")
+
+    if unmatched:
+        raise ValueError(f"Couldn't find these items in the menu: {', '.join(unmatched)}. Ask the customer to confirm the exact item name.")
+    if not items_data:
+        raise ValueError("No valid items to order.")
+
+    config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+    config = (config_res.data if config_res else None) or {}
+    gst_percent = config.get("gst_percent", 0)
+    currency = config.get("currency", "₹")
+
+    subtotal = sum(it["price"] * it["quantity"] for it in items_data)
+    gst_amount = round(subtotal * gst_percent / 100, 2)
+    total = round(subtotal + gst_amount, 2)
+
+    supabase.table("orders").insert({
+        "project_id": project_id,
+        "phone_number": phone,
+        "items": items_data,
+        "subtotal": subtotal,
+        "gst_amount": gst_amount,
+        "total": total,
+        "status": "pending",
+        "payment_status": "unpaid",
+        "delivery_type": delivery_type or "Takeaway",
+    }).execute()
+
+    order_res = supabase.table("orders") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .eq("phone_number", phone) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+    order = order_res.data[0]
+
+    result = _send_cart_confirmation(project_id, phone, order, items_data, currency, subtotal, gst_amount, total, catalog_id)
+    result["items"] = [f"{it['name']} x{it['quantity']}" for it in items_data]
+    result["total"] = total
+    result["currency"] = currency
+    return result
+
+
+@router.post("/public/shop/submit-cart")
+async def submit_cart(body: CartSubmit):
     project_id = body.project_id
     phone = body.phone.replace("+", "").replace(" ", "")
 
@@ -365,62 +512,12 @@ async def submit_cart(body: CartSubmit):
             .execute()
         order = order_res.data[0]
 
-    # Build cart summary
-    lines = []
-    for i, item in enumerate(body.items, 1):
-        lines.append(f"{i}. {item.name} x{item.quantity} - {currency}{int(item.price * item.quantity)}")
-    items_text = "\n".join(lines)
-    summary = f"🛒 *Your Cart*\n\n{items_text}\n\nSubtotal: {currency}{int(subtotal)}"
-    if gst_amount > 0:
-        summary += f"\nGST: {currency}{gst_amount}"
-    summary += f"\n*Total: {currency}{total}*"
-
-    # Get WhatsApp integration
-    try:
-        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
-        wa_data = (wa_res.data if wa_res else None)
-    except Exception as e:
-        print(f"whatsapp_integrations fetch error: {e}")
-        wa_data = None
-
-    if not wa_data:
-        supabase.table("whatsapp_sessions").upsert({
-            "project_id": project_id,
-            "phone_number": phone,
-            "mode": "awaiting_cart_confirm",
-            "metadata": {
-                "order_id": order["id"],
-                "catalog_id": body.catalog_id,
-            },
-        }, on_conflict="project_id,phone_number").execute()
-        return {"status": "ok", "order_id": order["id"], "warning": "WhatsApp not connected"}
-
-    phone_number_id = wa_data["phone_number_id"]
-    token = wa_data.get("access_token") or WHATSAPP_TOKEN
-
-    send_whatsapp_buttons(
-        to=phone,
-        body=summary,
-        buttons=[
-            {"id": "cart_continue", "title": "Continue ➡️"},
-            {"id": "cart_add_more", "title": "Add More 🛍️"},
-            {"id": "cart_clear", "title": "Clear Cart 🗑️"},
-        ],
-        phone_number_id=phone_number_id,
-        token=token,
-    )
-
-    supabase.table("whatsapp_sessions").upsert({
-        "project_id": project_id,
-        "phone_number": phone,
-        "mode": "awaiting_cart_confirm",
-        "metadata": {
-            "order_id": order["id"],
-            "catalog_id": body.catalog_id,
-        },
-    }, on_conflict="project_id,phone_number").execute()
-
-    return {"status": "ok", "order_id": order["id"]}
+    result = _send_cart_confirmation(project_id, phone, order, items_data, currency, subtotal, gst_amount, total, body.catalog_id)
+    return {
+        "status": result["status"],
+        "order_id": order["id"],
+        **({"warning": result["warning"]} if "warning" in result else {}),
+    }
 
 
 # ─────────────────────────────────────────────
