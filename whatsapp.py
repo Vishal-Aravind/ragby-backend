@@ -138,6 +138,12 @@ async def whatsapp_webhook(request: Request):
         from_number = message["from"]
         waba_id = value.get("metadata", {}).get("phone_number_id")
 
+        # WhatsApp includes the sender's real profile name on every message —
+        # previously never captured anywhere, so bookings/orders had no real
+        # name to fall back on and leads showed no name either.
+        contacts = value.get("contacts", [])
+        profile_name = contacts[0].get("profile", {}).get("name") if contacts else None
+
         # Look up project
         res = supabase.table("whatsapp_integrations") \
             .select("project_id, phone_number_id") \
@@ -176,7 +182,7 @@ async def whatsapp_webhook(request: Request):
         from leads import upsert_contact
 
         # Auto-save contact
-        upsert_contact(project_id, from_number, channel="whatsapp")
+        upsert_contact(project_id, from_number, name=profile_name, channel="whatsapp")
 
         # ── Interactive (button/list click) ──────────────
         if msg_type == "interactive":

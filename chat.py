@@ -122,10 +122,10 @@ APPOINTMENT_TOOLS = [
                 "properties": {
                     "date": {"type": "string", "description": "Confirmed date, format YYYY-MM-DD"},
                     "time": {"type": "string", "description": "Confirmed start time, format HH:MM (24-hour)"},
-                    "customer_name": {"type": "string", "description": "The customer's name"},
+                    "customer_name": {"type": "string", "description": "The customer's name — only ask for this if it isn't already known from this conversation channel"},
                     "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
                 },
-                "required": ["date", "time", "customer_name"],
+                "required": ["date", "time"],
             },
         },
     },
@@ -196,6 +196,17 @@ SHOP_ORDER_TOOLS = [
 ]
 
 
+def _get_known_customer_name(project_id: str, channel: str, external_id: str) -> Optional[str]:
+    """WhatsApp already knows the sender's real profile name (captured at
+    message time — see whatsapp.py) — use that instead of making the model
+    ask for or guess a name."""
+    if channel != "whatsapp" or not external_id:
+        return None
+    res = supabase.table("leads").select("name").eq("project_id", project_id).eq("phone", external_id).maybe_single().execute()
+    data = res.data if res else None
+    return (data or {}).get("name")
+
+
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
     re-validates the slot is actually still free."""
@@ -213,9 +224,14 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             phone = external_id if channel == "whatsapp" else args.get("customer_phone")
             if not phone:
                 return {"error": "Still need a phone number from the customer to confirm this booking."}
+
+            customer_name = _get_known_customer_name(project_id, channel, external_id) or args.get("customer_name")
+            if not customer_name:
+                return {"error": "Still need the customer's name to confirm this booking."}
+
             return create_appointment(
                 project_id=project_id,
-                customer_name=args["customer_name"],
+                customer_name=customer_name,
                 customer_phone=phone,
                 appointment_date=args["date"],
                 start_time=args["time"],
@@ -407,6 +423,10 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "phrase as the date.\n"
                 "- You can check appointment availability and book one using the tools provided.\n"
                 "- Always check availability before proposing a time.\n"
+                "- If the customer confirms a time without repeating the date (e.g. just says 'book 9am'), "
+                "book it against the date from the MOST RECENT availability check or proposal in this "
+                "conversation — never an earlier date mentioned before that. If it's ambiguous which date "
+                "they mean, ask them to confirm the date explicitly rather than guessing.\n"
                 "- Always get the customer's explicit yes on a specific date/time before calling book_appointment.\n"
                 "- If a slot turns out to be unavailable, apologize briefly and offer to check another time."
             )
