@@ -427,7 +427,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "book it against the date from the MOST RECENT availability check or proposal in this "
                 "conversation — never an earlier date mentioned before that. If it's ambiguous which date "
                 "they mean, ask them to confirm the date explicitly rather than guessing.\n"
-                "- Always get the customer's explicit yes on a specific date/time before calling book_appointment.\n"
+                "- Confirmation is MANDATORY and always takes two separate messages, no exceptions: first you "
+                "state the exact date and time back to the customer and ask them to confirm; only on their "
+                "NEXT reply, if it's a clear yes, do you call book_appointment. A message that merely names "
+                "a date/time (even one containing the word 'book') is the REQUEST, not the confirmation — "
+                "always propose it back and wait for their next reply before booking.\n"
                 "- If a slot turns out to be unavailable, apologize briefly and offer to check another time."
             )
 
