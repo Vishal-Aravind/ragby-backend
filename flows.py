@@ -615,15 +615,12 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 phone_number_id, token,
             )
         else:
-            send_whatsapp_buttons(
-                phone_number,
-                "Your appointment is confirmed. What would you like to do?",
-                [
-                    {"id": f"reschedule_{appointment_id}", "title": "Reschedule 🔄"},
-                    {"id": f"cancel_appt_{appointment_id}", "title": "Cancel ❌"},
-                ],
-                phone_number_id, token,
-            )
+            # Anything that isn't about cancelling/rescheduling (a "thanks",
+            # a "hello", a real question) shouldn't get trapped here forever
+            # — clear the mode and answer it normally instead of repeating
+            # the same buttons every time.
+            upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+            _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
         return
 
     if session and session.get("mode") == "shop_browsing":
