@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -394,8 +395,16 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         appointment_settings = get_appointment_settings_if_bookable(project_id)
         if appointment_settings:
             active_tools += APPOINTMENT_TOOLS
+            # The model has no built-in sense of "today" — without this,
+            # relative dates like "tomorrow" get resolved to an arbitrary
+            # guess, which silently produces wrong availability checks.
+            today_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30))
             system_prompt += (
                 "\n\nBooking:\n"
+                f"- Today's date is {today_ist.strftime('%A, %Y-%m-%d')} (India time). Always resolve relative "
+                "dates like 'tomorrow', 'next Monday', or 'this weekend' into an actual YYYY-MM-DD date "
+                "yourself, based on today's date, before calling any booking tool — never pass a relative "
+                "phrase as the date.\n"
                 "- You can check appointment availability and book one using the tools provided.\n"
                 "- Always check availability before proposing a time.\n"
                 "- Always get the customer's explicit yes on a specific date/time before calling book_appointment.\n"
