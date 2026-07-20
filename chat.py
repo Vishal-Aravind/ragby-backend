@@ -129,6 +129,25 @@ APPOINTMENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_appointment",
+            "description": (
+                "Cancel the customer's upcoming appointment. Always state which appointment (date, time, "
+                "service) you're about to cancel and get the customer's explicit yes on THIS SPECIFIC action "
+                "before calling this — cancelling is its own separate confirmation, never reuse a 'yes' from "
+                "earlier in the conversation that was about something else (like booking)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -210,7 +229,7 @@ def _get_known_customer_name(project_id: str, channel: str, external_id: str) ->
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
     re-validates the slot is actually still free."""
-    from appointments import get_available_slots, create_appointment
+    from appointments import get_available_slots, create_appointment, get_latest_upcoming_appointment, cancel_appointment as cancel_appointment_fn
 
     try:
         if name == "check_appointment_availability":
@@ -237,6 +256,26 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
                 start_time=args["time"],
                 notes=None,
             )
+
+        if name == "cancel_appointment":
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need the customer's phone number to find their appointment."}
+
+            appt = get_latest_upcoming_appointment(project_id, phone)
+            if not appt:
+                return {"message": "No upcoming appointment found for this customer."}
+
+            # notify_customer=False — they're the one cancelling it right
+            # here in this conversation, a second templated WhatsApp message
+            # on top of the AI's own reply would just be noise.
+            result = cancel_appointment_fn(appt["id"], notify_customer=False)
+            return {
+                "status": "cancelled",
+                "date": result["appointment_date"],
+                "time": result["start_time"],
+                "service": result["service_name"],
+            }
 
         return {"error": f"Unknown tool {name}"}
     except ValueError as e:
@@ -443,7 +482,12 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "NEXT reply, if it's a clear yes, do you call book_appointment. A message that merely names "
                 "a date/time (even one containing the word 'book') is the REQUEST, not the confirmation — "
                 "always propose it back and wait for their next reply before booking.\n"
-                "- If a slot turns out to be unavailable, apologize briefly and offer to check another time."
+                "- If a slot turns out to be unavailable, apologize briefly and offer to check another time.\n"
+                "- You can also cancel the customer's upcoming appointment using the tool provided. This needs "
+                "its OWN separate two-message confirmation, exactly like booking — state which appointment "
+                "you're about to cancel, wait for their next reply to be a clear yes, then call "
+                "cancel_appointment. Never treat a 'yes' about booking as also confirming a cancellation, or "
+                "vice versa — they are different actions and each needs its own confirmation."
             )
 
         from shop import get_shop_settings_if_assistable

@@ -569,35 +569,70 @@ def list_appointments(project_id: str, user=Depends(verify_token)):
     return res.data or []
 
 
+def get_latest_upcoming_appointment(project_id: str, phone: str) -> Optional[dict]:
+    """Used by the in-chat 'cancel my appointment' tool — finds the one
+    appointment a customer would mean by 'my appointment' without needing
+    them to specify an ID."""
+    clean_phone = phone.replace("+", "").replace(" ", "")
+    today = date.today().isoformat()
+    res = supabase.table("appointments") \
+        .select("*") \
+        .eq("project_id", project_id) \
+        .eq("customer_phone", clean_phone) \
+        .in_("status", ["confirmed", "rescheduled"]) \
+        .gte("appointment_date", today) \
+        .order("appointment_date", desc=False) \
+        .order("start_time", desc=False) \
+        .limit(1) \
+        .execute()
+    return res.data[0] if res.data else None
+
+
+def cancel_appointment(appointment_id: str, notify_customer: bool = True) -> dict:
+    """Core cancel logic — used by the dashboard PUT route AND the in-chat
+    cancel tool. notify_customer=False when the customer is the one
+    cancelling it themselves in the same conversation — they don't need a
+    separate notification for something they just did."""
+    appt_res = supabase.table("appointments").select("*").eq("id", appointment_id).maybe_single().execute()
+    if not appt_res or not appt_res.data:
+        raise ValueError("Appointment not found")
+    appt = appt_res.data
+
+    settings_res = supabase.table("appointment_settings").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
+    settings = (settings_res.data if settings_res else None) or {}
+    refresh_token = settings.get("google_refresh_token")
+    if refresh_token and appt.get("google_event_id"):
+        access_token = get_google_access_token(refresh_token)
+        if access_token:
+            delete_google_event(access_token, settings.get("google_calendar_id", "primary"), appt["google_event_id"])
+
+    if notify_customer:
+        try:
+            wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
+            wa_data = (wa_res.data if wa_res else None)
+            if wa_data:
+                from whatsapp import send_whatsapp_message
+                send_whatsapp_message(
+                    to=appt["customer_phone"],
+                    text=f"❌ *Appointment Cancelled*\n\nYour {appt['service_name']} on {appt['appointment_date']} at {appt['start_time']} has been cancelled.\n\nReply *book* to schedule a new appointment.",
+                    phone_number_id=wa_data["phone_number_id"],
+                    token=wa_data.get("access_token") or WHATSAPP_TOKEN,
+                )
+        except Exception as e:
+            print(f"Cancel notification error: {e}")
+
+    supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
+    res = supabase.table("appointments").select("*").eq("id", appointment_id).single().execute()
+    return res.data
+
+
 @router.put("/appointments/{appointment_id}")
 def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=Depends(verify_token)):
-    # If cancelling, delete Google Calendar event
     if body.status == "cancelled":
-        appt_res = supabase.table("appointments").select("*").eq("id", appointment_id).maybe_single().execute()
-        if appt_res and appt_res.data:
-            appt = appt_res.data
-            settings_res = supabase.table("appointment_settings").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
-            settings = (settings_res.data if settings_res else None) or {}
-            refresh_token = settings.get("google_refresh_token")
-            if refresh_token and appt.get("google_event_id"):
-                access_token = get_google_access_token(refresh_token)
-                if access_token:
-                    delete_google_event(access_token, settings.get("google_calendar_id", "primary"), appt["google_event_id"])
-
-            # Notify customer
-            try:
-                wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
-                wa_data = (wa_res.data if wa_res else None)
-                if wa_data:
-                    from whatsapp import send_whatsapp_message
-                    send_whatsapp_message(
-                        to=appt["customer_phone"],
-                        text=f"❌ *Appointment Cancelled*\n\nYour {appt['service_name']} on {appt['appointment_date']} at {appt['start_time']} has been cancelled.\n\nReply *book* to schedule a new appointment.",
-                        phone_number_id=wa_data["phone_number_id"],
-                        token=wa_data.get("access_token") or WHATSAPP_TOKEN,
-                    )
-            except Exception as e:
-                print(f"Cancel notification error: {e}")
+        try:
+            return cancel_appointment(appointment_id, notify_customer=True)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
 
     supabase.table("appointments").update({"status": body.status}).eq("id", appointment_id).execute()
     res = supabase.table("appointments").select("*").eq("id", appointment_id).single().execute()

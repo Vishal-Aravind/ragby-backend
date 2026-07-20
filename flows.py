@@ -426,14 +426,21 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         return
 
     if trigger.startswith("cancel_appt_"):
+        from appointments import cancel_appointment
         appointment_id = trigger.replace("cancel_appt_", "")
-        supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
+        try:
+            # notify_customer=False — the message right below already tells
+            # them; reuses the same logic that also cleans up the Google
+            # Calendar event, which this button previously skipped.
+            cancel_appointment(appointment_id, notify_customer=False)
+        except ValueError:
+            pass
         send_whatsapp_message(
             phone_number,
             "✅ Your appointment has been cancelled.\n\nReply *book* to schedule a new one.",
             phone_number_id, token,
         )
-        upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        delete_session(project_id, phone_number)
         return
 
     if trigger == "cart_continue":
@@ -595,32 +602,19 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         save_message(chat_id, "user", text)
 
     if session and session.get("mode") == "appointment_confirmed":
-        appointment_id = (session.get("metadata") or {}).get("appointment_id")
-        if "cancel" in text.lower():
-            if appointment_id:
-                supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
-            send_whatsapp_message(
-                phone_number,
-                "✅ Your appointment has been cancelled.\n\nReply *book* to schedule a new one.",
-                phone_number_id, token,
-            )
-            upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
-        elif any(w in text.lower() for w in ["reschedule", "book", "change"]):
-            booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}&reschedule={appointment_id}"
-            send_whatsapp_cta_url(
-                phone_number,
-                "Tap below to pick a new date and time 📅\nYour previous appointment will be cancelled once you confirm the new one.",
-                "Reschedule",
-                booking_url,
-                phone_number_id, token,
-            )
-        else:
-            # Anything that isn't about cancelling/rescheduling (a "thanks",
-            # a "hello", a real question) shouldn't get trapped here forever
-            # — clear the mode and answer it normally instead of repeating
-            # the same buttons every time.
-            upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
-            _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
+        # Only unambiguous BUTTON taps (Reschedule/Cancel — handled in
+        # handle_interactive by exact button ID) get special-cased for this
+        # mode. Free text of ANY kind hands off cleanly to open AI chat,
+        # which now has its own book_appointment/cancel_appointment tools
+        # and can handle "reschedule"/"cancel"/a brand new booking through
+        # normal conversation. Loosely keyword-matching free text here was
+        # the actual bug: "book for thursday" (a brand new booking request)
+        # got misread as "reschedule my last appointment" just because it
+        # contained the word "book". The session gets fully cleared (not
+        # just its mode) so no stale flow_id/current_node_id from earlier
+        # in the conversation can leak back in on the next message.
+        delete_session(project_id, phone_number)
+        _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
         return
 
     if session and session.get("mode") == "shop_browsing":
