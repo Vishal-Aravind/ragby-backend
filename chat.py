@@ -344,6 +344,17 @@ def classify_intent(message: str) -> str:
     if len(words) <= 4 and any(w in msg for w in ["thanks", "thank you", "thx"]):
         return "thanks"
 
+    # A bare confirmation ("okay", "yes", "sure") has no real content to
+    # search documents for — running it through document search anyway
+    # risks pulling in unrelated content and derailing a pending
+    # confirmation (e.g. for a booking). Treat it as conversational instead
+    # — same lightweight path, but it still has the tools and full history.
+    if msg.strip(".!") in {
+        "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm", "confirmed",
+        "correct", "proceed", "go ahead", "sounds good", "book it", "do it", "that works"
+    }:
+        return "conversational"
+
     if any(k in msg for k in [
         "earlier", "previous", "you said", "we talked",
         "last message", "first question"
