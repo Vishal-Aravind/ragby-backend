@@ -509,6 +509,14 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             today_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30))
             system_prompt += (
                 "\n\nBooking:\n"
+                "- IMPORTANT: appointment/booking information (whether a slot is free, what the customer has "
+                "booked, etc.) NEVER lives in your documents — it only exists through the tools below. If a "
+                "message is about checking, booking, or cancelling an appointment, always use the matching "
+                "tool. Never respond with 'I couldn't find that in your documents' or ask generic clarifying "
+                "questions for this category — that fallback is for document questions, not this.\n"
+                "- If the customer asks to see/check their existing bookings or appointments (e.g. 'show my "
+                "bookings', 'what do I have booked'), call check_my_appointments immediately — it's read-only, "
+                "needs no confirmation, and needs no other information from the customer first on WhatsApp.\n"
                 f"- Today's date is {today_ist.strftime('%A, %Y-%m-%d')} (India time). Always resolve relative "
                 "dates like 'tomorrow', 'next Monday', or 'this weekend' into an actual YYYY-MM-DD date "
                 "yourself, based on today's date, before calling any booking tool — never pass a relative "
@@ -531,10 +539,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "its OWN separate two-message confirmation, exactly like booking — state which appointment "
                 "you're about to cancel, wait for their next reply to be a clear yes, then call "
                 "cancel_appointment. Never treat a 'yes' about booking as also confirming a cancellation, or "
-                "vice versa — they are different actions and each needs its own confirmation.\n"
-                "- If the customer asks to see/check their bookings or appointments, use "
-                "check_my_appointments — this is read-only and needs no confirmation, just show them what "
-                "you find."
+                "vice versa — they are different actions and each needs its own confirmation."
             )
 
         from shop import get_shop_settings_if_assistable
