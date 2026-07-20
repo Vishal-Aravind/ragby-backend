@@ -148,6 +148,20 @@ APPOINTMENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_my_appointments",
+            "description": "Look up the customer's own upcoming appointments (date, time, service). Read-only — cannot book, change, or cancel anything.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -244,7 +258,7 @@ def _normalize_time_str(time_str: str) -> str:
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
     re-validates the slot is actually still free."""
-    from appointments import get_available_slots, create_appointment, get_latest_upcoming_appointment, cancel_appointment as cancel_appointment_fn
+    from appointments import get_available_slots, create_appointment, get_latest_upcoming_appointment, get_upcoming_appointments, cancel_appointment as cancel_appointment_fn
 
     try:
         if name == "check_appointment_availability":
@@ -291,6 +305,19 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
                 "time": result["start_time"],
                 "service": result["service_name"],
             }
+
+        if name == "check_my_appointments":
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need the customer's phone number to look up their appointments."}
+
+            appts = get_upcoming_appointments(project_id, phone)
+            if not appts:
+                return {"message": "No upcoming appointments found for this customer."}
+            return {"appointments": [
+                {"date": a["appointment_date"], "time": a["start_time"], "service": a["service_name"], "status": a["status"]}
+                for a in appts
+            ]}
 
         return {"error": f"Unknown tool {name}"}
     except ValueError as e:
@@ -504,7 +531,10 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "its OWN separate two-message confirmation, exactly like booking — state which appointment "
                 "you're about to cancel, wait for their next reply to be a clear yes, then call "
                 "cancel_appointment. Never treat a 'yes' about booking as also confirming a cancellation, or "
-                "vice versa — they are different actions and each needs its own confirmation."
+                "vice versa — they are different actions and each needs its own confirmation.\n"
+                "- If the customer asks to see/check their bookings or appointments, use "
+                "check_my_appointments — this is read-only and needs no confirmation, just show them what "
+                "you find."
             )
 
         from shop import get_shop_settings_if_assistable

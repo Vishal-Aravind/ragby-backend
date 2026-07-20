@@ -569,10 +569,9 @@ def list_appointments(project_id: str, user=Depends(verify_token)):
     return res.data or []
 
 
-def get_latest_upcoming_appointment(project_id: str, phone: str) -> Optional[dict]:
-    """Used by the in-chat 'cancel my appointment' tool — finds the one
-    appointment a customer would mean by 'my appointment' without needing
-    them to specify an ID."""
+def get_upcoming_appointments(project_id: str, phone: str, limit: int = 5) -> list:
+    """Used by the in-chat 'show my bookings' tool, and by
+    get_latest_upcoming_appointment below."""
     clean_phone = phone.replace("+", "").replace(" ", "")
     today = date.today().isoformat()
     res = supabase.table("appointments") \
@@ -583,9 +582,17 @@ def get_latest_upcoming_appointment(project_id: str, phone: str) -> Optional[dic
         .gte("appointment_date", today) \
         .order("appointment_date", desc=False) \
         .order("start_time", desc=False) \
-        .limit(1) \
+        .limit(limit) \
         .execute()
-    return res.data[0] if res.data else None
+    return res.data or []
+
+
+def get_latest_upcoming_appointment(project_id: str, phone: str) -> Optional[dict]:
+    """Used by the in-chat 'cancel my appointment' tool — finds the one
+    appointment a customer would mean by 'my appointment' without needing
+    them to specify an ID."""
+    results = get_upcoming_appointments(project_id, phone, limit=1)
+    return results[0] if results else None
 
 
 def cancel_appointment(appointment_id: str, notify_customer: bool = True) -> dict:
