@@ -226,6 +226,21 @@ def _get_known_customer_name(project_id: str, channel: str, external_id: str) ->
     return (data or {}).get("name")
 
 
+def _normalize_time_str(time_str: str) -> str:
+    """The model is told to always send 24-hour 'HH:MM', but doesn't
+    reliably do so. A silent format mismatch here (e.g. '4:30 PM' or
+    '16:30:00' instead of exactly '16:30') would make a genuinely available
+    slot fail the availability re-check below and silently reject a real
+    booking — so normalize common variants instead of trusting the model."""
+    cleaned = time_str.strip()
+    for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p", "%H:%M:%S"):
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    raise ValueError(f"Couldn't understand the time '{time_str}' — ask the customer for a clear time like 3:30 PM.")
+
+
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
     re-validates the slot is actually still free."""
@@ -253,7 +268,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
                 customer_name=customer_name,
                 customer_phone=phone,
                 appointment_date=args["date"],
-                start_time=args["time"],
+                start_time=_normalize_time_str(args["time"]),
                 notes=None,
             )
 
@@ -477,11 +492,13 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "book it against the date from the MOST RECENT availability check or proposal in this "
                 "conversation — never an earlier date mentioned before that. If it's ambiguous which date "
                 "they mean, ask them to confirm the date explicitly rather than guessing.\n"
-                "- Confirmation is MANDATORY and always takes two separate messages, no exceptions: first you "
-                "state the exact date and time back to the customer and ask them to confirm; only on their "
-                "NEXT reply, if it's a clear yes, do you call book_appointment. A message that merely names "
-                "a date/time (even one containing the word 'book') is the REQUEST, not the confirmation — "
-                "always propose it back and wait for their next reply before booking.\n"
+                "- Confirmation is MANDATORY and always takes two separate messages, no exceptions — this "
+                "applies EVERY time, including when the customer just picks one of several times YOU offered "
+                "(e.g. after telling them a time was unavailable and listing alternatives). Picking an option "
+                "is still only the request. First you state the exact date and time back to the customer and "
+                "ask them to confirm; only on their NEXT reply, if it's a clear yes, do you call "
+                "book_appointment. A message that merely names or selects a date/time (even one containing "
+                "the word 'book') is the REQUEST, not the confirmation.\n"
                 "- If a slot turns out to be unavailable, apologize briefly and offer to check another time.\n"
                 "- You can also cancel the customer's upcoming appointment using the tool provided. This needs "
                 "its OWN separate two-message confirmation, exactly like booking — state which appointment "
@@ -510,6 +527,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     "\n- These tools are read-only — you cannot place, change, or cancel an order this way. "
                     "If a customer wants to place a new order, point them to the shop link instead."
                 )
+
+        if active_tools:
+            system_prompt += (
+                "\n\nTool honesty — this overrides everything else:\n"
+                "- NEVER tell the customer an action succeeded (booked, cancelled, ordered) unless the tool's "
+                "result actually confirms success. If a tool call returns an error, tell the customer honestly "
+                "that it didn't work and why (in plain terms), then offer to try again — do not claim it "
+                "worked, do not make up a confirmation message or booking ID."
+            )
 
         intent = classify_intent(message)
 
