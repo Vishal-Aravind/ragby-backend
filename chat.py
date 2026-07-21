@@ -366,7 +366,7 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
 
 
 def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
-    if name in ("check_appointment_availability", "book_appointment"):
+    if name in ("check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
         return execute_appointment_tool(name, args, project_id, channel, external_id)
     if name in ("check_order_status", "browse_shop_catalog", "place_order"):
         return execute_shop_tool(name, args, project_id, channel, external_id)
