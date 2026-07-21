@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from clients import supabase, openai_client, embeddings, qdrant
-from config import QDRANT_COLLECTION
+from config import QDRANT_COLLECTION, FRONTEND_URL
 from auth import verify_token
 from usage import check_rate_limit, increment_usage
 from qdrant_client import models
@@ -239,6 +239,87 @@ SHOP_ORDER_TOOLS = [
 ]
 
 
+# Only ever added when the project has at least one event with
+# bot_can_register on (see get_bot_registrable_events in events.py) —
+# per-event opt-in, not project-wide, since a merchant may want automation
+# on a public webinar but not an invite-only event running the same week.
+EVENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_upcoming_events",
+            "description": (
+                "Get the list of events currently open for registration via chat (title, date, day of week, "
+                "time, location, spots left if capacity-limited, and any extra fields required to register) to "
+                "answer questions like 'what events do you have coming up' or to find a specific event by name "
+                "before registering. Only shows events the merchant has enabled for chat registration — if the "
+                "customer names an event not in this list, don't guess; tell them it may not be available for "
+                "chat registration. Read-only — cannot register or cancel anything."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_event_registration_link",
+            "description": (
+                "Get the direct registration link for a specific event, to send to a customer who wants to "
+                "register or sign up. This does NOT register them itself — it only looks up the correct link. "
+                "Call browse_upcoming_events first if you haven't already, so the event title is accurate — "
+                "never invent an event name. No confirmation needed, just send the link back to the customer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_title": {
+                        "type": "string",
+                        "description": "The event's title, as close as possible to how browse_upcoming_events listed it — never invent or guess a title the customer didn't say and browse hasn't shown.",
+                    },
+                },
+                "required": ["event_title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_my_event_registrations",
+            "description": "Look up the customer's own event registrations (event title, date, day of week, status) across all events. Read-only — cannot register or cancel anything.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_event_registration",
+            "description": (
+                "Cancel the customer's registration for a specific event. If the customer is registered for "
+                "more than one event, you MUST call check_my_event_registrations first (if you haven't already) "
+                "and pass the exact event title of the ONE they mean — never omit it when more than one exists, "
+                "and never guess based on wording alone. Always state which event's registration you're about "
+                "to cancel and get the customer's explicit yes on THIS SPECIFIC action before calling this — "
+                "never reuse a 'yes' from earlier in the conversation about something else (like registering)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                    "event_title": {"type": "string", "description": "The exact title of the event whose registration to cancel — required if the customer has more than one registration. If you already stated a specific event to the customer, always include it here."},
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
 def _get_known_customer_name(project_id: str, channel: str, external_id: str) -> Optional[str]:
     """WhatsApp already knows the sender's real profile name (captured at
     message time — see whatsapp.py) — use that instead of making the model
@@ -281,6 +362,45 @@ def _with_day_of_week(appts: list) -> list:
             "status": a["status"],
         })
     return result
+
+
+def _event_day_of_week(date_str: Optional[str]) -> Optional[str]:
+    """Same reasoning as _with_day_of_week — never let the model compute a
+    weekday itself. event_date is optional (some events are undated/ongoing),
+    so this tolerates a missing or unparseable date."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
+    except Exception:
+        return None
+
+
+def _shape_event_for_ai(e: dict) -> dict:
+    """Strips internal ids/raw form_schema before handing an event to the
+    model — only what's needed to browse and to build a registration link.
+    Registration itself always happens on the real page (get_event_
+    registration_link), so custom form fields aren't surfaced here."""
+    return {
+        "title": e.get("title"),
+        "description": e.get("description"),
+        "date": e.get("event_date"),
+        "day_of_week": _event_day_of_week(e.get("event_date")),
+        "time": e.get("event_time"),
+        "location": e.get("location"),
+        "spots_left": e.get("spots_left"),
+    }
+
+
+def _shape_registration_for_ai(r: dict) -> dict:
+    return {
+        "event_title": r.get("event_title"),
+        "date": r.get("event_date"),
+        "day_of_week": _event_day_of_week(r.get("event_date")),
+        "time": r.get("event_time"),
+        "location": r.get("location"),
+        "status": r.get("status"),
+    }
 
 
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
@@ -422,11 +542,109 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
         return {"error": "Something went wrong trying to do that — please try again."}
 
 
+def execute_event_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
+    from events import (
+        get_upcoming_events_for_ai, find_event_by_title, get_registrations_for_phone,
+        cancel_registration_core,
+    )
+
+    try:
+        if name == "browse_upcoming_events":
+            events = get_upcoming_events_for_ai(project_id)
+            if not events:
+                return {"message": "No events currently open for registration."}
+            return {"events": [_shape_event_for_ai(e) for e in events]}
+
+        if name == "get_event_registration_link":
+            matches = find_event_by_title(project_id, args.get("event_title", ""))
+            if not matches:
+                return {"error": f"Couldn't find an open event matching '{args.get('event_title', '')}'. Call browse_upcoming_events and confirm the exact title with the customer."}
+            if len(matches) > 1:
+                return {
+                    "error": "More than one open event matches that name — if you already stated a specific "
+                             "event's exact title to the customer, retry this exact call now with that exact "
+                             "title. Otherwise ask the customer which one they mean.",
+                    "candidates": [_shape_event_for_ai(e) for e in matches],
+                }
+            event = matches[0]
+            return {
+                "event_title": event["title"],
+                "registration_link": f"{FRONTEND_URL}/event/{event['id']}",
+            }
+
+        if name == "check_my_event_registrations":
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need the customer's phone number to look up their registrations."}
+            regs = get_registrations_for_phone(project_id, phone)
+            if not regs:
+                return {"message": "No event registrations found for this customer."}
+            return {"registrations": [_shape_registration_for_ai(r) for r in regs]}
+
+        if name == "cancel_event_registration":
+            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            if not phone:
+                return {"error": "Still need the customer's phone number to find their registration."}
+
+            regs = get_registrations_for_phone(project_id, phone)
+            if not regs:
+                return {"message": "No event registrations found for this customer."}
+
+            if len(regs) == 1:
+                target = regs[0]
+            else:
+                title_arg = (args.get("event_title") or "").strip().lower()
+                if not title_arg:
+                    return {
+                        "error": "This customer has more than one event registration, and no event title was "
+                                 "given. If you already stated a specific event's exact title to the customer in "
+                                 "your last message, retry this exact call now with that title — do not ask the "
+                                 "customer again. Otherwise, call check_my_event_registrations and ask which one "
+                                 "they mean.",
+                        "registrations": [_shape_registration_for_ai(r) for r in regs],
+                    }
+                matches = [
+                    r for r in regs
+                    if title_arg == r["event_title"].strip().lower() or title_arg in r["event_title"].strip().lower()
+                ]
+                if not matches:
+                    return {
+                        "error": f"No registration found matching '{args.get('event_title')}'.",
+                        "registrations": [_shape_registration_for_ai(r) for r in regs],
+                    }
+                if len(matches) > 1:
+                    return {
+                        "error": "More than one registration matches that title — ask the customer to be more specific.",
+                        "registrations": [_shape_registration_for_ai(r) for r in matches],
+                    }
+                target = matches[0]
+
+            # notify_customer=False — they're the one cancelling it right
+            # here in this conversation, a second templated WhatsApp message
+            # on top of the AI's own reply would just be noise.
+            cancel_registration_core(target["registration_id"], notify_customer=False)
+            return {
+                "status": "cancelled",
+                "event_title": target["event_title"],
+                "date": target["event_date"],
+                "day_of_week": _event_day_of_week(target["event_date"]),
+            }
+
+        return {"error": f"Unknown tool {name}"}
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        print(f"execute_event_tool error: {e}")
+        return {"error": "Something went wrong trying to do that — please try again."}
+
+
 def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     if name in ("check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
         return execute_appointment_tool(name, args, project_id, channel, external_id)
     if name in ("check_order_status", "browse_shop_catalog", "place_order"):
         return execute_shop_tool(name, args, project_id, channel, external_id)
+    if name in ("browse_upcoming_events", "get_event_registration_link", "check_my_event_registrations", "cancel_event_registration"):
+        return execute_event_tool(name, args, project_id, channel, external_id)
     return {"error": f"Unknown tool {name}"}
 
 
@@ -557,13 +775,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         channel = chat_data.get("channel")
         external_id = chat_data.get("external_id")
 
+        # The model has no built-in sense of "today" — without this, relative
+        # dates ("tomorrow", "next Monday") get resolved to an arbitrary
+        # guess. Hoisted here (not just inside Booking) so Registrations can
+        # use it too even when Appointments isn't enabled for this project.
+        today_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30))
+
         appointment_settings = get_appointment_settings_if_bookable(project_id)
         if appointment_settings:
             active_tools += APPOINTMENT_TOOLS
-            # The model has no built-in sense of "today" — without this,
-            # relative dates like "tomorrow" get resolved to an arbitrary
-            # guess, which silently produces wrong availability checks.
-            today_ist = (datetime.utcnow() + timedelta(hours=5, minutes=30))
             system_prompt += (
                 "\n\nBooking:\n"
                 "- IMPORTANT: appointment/booking information (whether a slot is free, what the customer has "
@@ -625,6 +845,35 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     "\n- These tools are read-only — you cannot place, change, or cancel an order this way. "
                     "If a customer wants to place a new order, point them to the shop link instead."
                 )
+
+        from events import get_bot_registrable_events
+        if get_bot_registrable_events(project_id):
+            active_tools += EVENT_TOOLS
+            system_prompt += (
+                "\n\nRegistrations:\n"
+                "- IMPORTANT: event/registration information (which events are open, what a customer has "
+                "registered for, etc.) NEVER lives in your documents — it only exists through the tools below. "
+                "If a message is about browsing events, getting a registration link, checking, or cancelling an "
+                "event registration, always use the matching tool, never the document fallback.\n"
+                f"- Today's date is {today_ist.strftime('%A, %Y-%m-%d')} (India time) — use it to judge whether "
+                "an event the customer names is still upcoming.\n"
+                "- Always call browse_upcoming_events (or let get_event_registration_link tell you if a title "
+                "doesn't match) before assuming an event exists — never invent an event name, date, or location.\n"
+                "- You do NOT register the customer yourself — actual registration always happens on the "
+                "event's own page, which can collect whatever information that specific event needs. If a "
+                "customer wants to register or sign up for an event, use get_event_registration_link and send "
+                "them that link — no confirmation needed for this, it's just a lookup.\n"
+                "- If more than one open event matches what the customer said, or the customer has "
+                "registrations for more than one event when cancelling, the tool will tell you so — ask the "
+                "customer to clarify, or if you already stated one specific event's exact title in your last "
+                "message, retry with that exact title included, don't ask again.\n"
+                "- Cancelling IS an action that needs confirmation — state which registration you're about to "
+                "cancel and get an explicit yes on THIS SPECIFIC action on the customer's NEXT reply before "
+                "calling cancel_event_registration; never reuse a 'yes' from a different action (like getting "
+                "a registration link).\n"
+                "- When tool results include a 'day_of_week' field, always use it verbatim — never compute the "
+                "weekday yourself."
+            )
 
         if active_tools:
             system_prompt += (
