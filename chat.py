@@ -141,14 +141,18 @@ APPOINTMENT_TOOLS = [
                 "appointment (date, time, service) you're about to cancel and get the customer's explicit yes "
                 "on THIS SPECIFIC action before calling this — cancelling is its own separate confirmation, "
                 "never reuse a 'yes' from earlier in the conversation that was about something else (like "
-                "booking)."
+                "booking). CRITICAL: once you've stated a specific date AND time back to the customer (e.g. "
+                "'you have an appointment at 3:30 PM on Thursday'), you already know both — when they confirm, "
+                "pass BOTH that exact date and that exact time in this same call. Never call with only the "
+                "date once you've already stated a specific time out loud; dropping the time you just "
+                "mentioned is a bug, not a safe default."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
                     "date": {"type": "string", "description": "The exact date (YYYY-MM-DD) of the appointment to cancel — required if the customer has more than one upcoming appointment"},
-                    "time": {"type": "string", "description": "The exact start time of the appointment to cancel — required if the customer has more than one appointment on that date"},
+                    "time": {"type": "string", "description": "The exact start time of the appointment to cancel — required if the customer has more than one appointment on that date. If you already stated a specific time to the customer, always include it here."},
                 },
                 "required": [],
             },
@@ -325,8 +329,10 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
                 date_arg = args.get("date")
                 if not date_arg:
                     return {
-                        "error": "This customer has more than one upcoming appointment — call check_my_appointments, "
-                                 "ask which one they mean, then call cancel_appointment again with its exact date and time.",
+                        "error": "This customer has more than one upcoming appointment, and no date was given. "
+                                 "If you already stated a specific date/time to the customer in your last message, "
+                                 "retry this exact call now with that date and time — do not ask the customer "
+                                 "again. Otherwise, call check_my_appointments and ask which one they mean.",
                         "appointments": _with_day_of_week(appts),
                     }
                 time_arg = _normalize_time_str(args["time"]) if args.get("time") else None
@@ -341,7 +347,9 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
                     }
                 if len(matches) > 1:
                     return {
-                        "error": "More than one appointment matches that date — ask for the specific time too.",
+                        "error": "More than one appointment matches that date, and no time was given. If you "
+                                 "already stated a specific time to the customer in your last message, retry "
+                                 "this exact call now with that time included — do not ask the customer again.",
                         "appointments": _with_day_of_week(matches),
                     }
                 target = matches[0]
