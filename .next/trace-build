@@ -1,1 +1,1 @@
-[{"name":"next-build","duration":173330,"timestamp":600738001202,"id":1,"tags":{"buildMode":"default","version":"16.0.10","bundler":"turbopack"},"startTime":1783956075801,"traceId":"6d655c5c1172e3ff"}]
+[{"name":"next-build","duration":337866,"timestamp":338168278713,"id":1,"tags":{"buildMode":"default","version":"16.0.10","bundler":"turbopack"},"startTime":1784640687438,"traceId":"20013e7cda6177c3"}]

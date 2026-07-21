@@ -134,15 +134,21 @@ APPOINTMENT_TOOLS = [
         "function": {
             "name": "cancel_appointment",
             "description": (
-                "Cancel the customer's upcoming appointment. Always state which appointment (date, time, "
-                "service) you're about to cancel and get the customer's explicit yes on THIS SPECIFIC action "
-                "before calling this — cancelling is its own separate confirmation, never reuse a 'yes' from "
-                "earlier in the conversation that was about something else (like booking)."
+                "Cancel the customer's upcoming appointment. If the customer has more than one upcoming "
+                "appointment, you MUST call check_my_appointments first (if you haven't already) and pass the "
+                "exact date and time of the ONE they mean — never omit date/time when more than one exists, "
+                "and never guess which one based on the customer's wording alone. Always state which "
+                "appointment (date, time, service) you're about to cancel and get the customer's explicit yes "
+                "on THIS SPECIFIC action before calling this — cancelling is its own separate confirmation, "
+                "never reuse a 'yes' from earlier in the conversation that was about something else (like "
+                "booking)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
+                    "date": {"type": "string", "description": "The exact date (YYYY-MM-DD) of the appointment to cancel — required if the customer has more than one upcoming appointment"},
+                    "time": {"type": "string", "description": "The exact start time of the appointment to cancel — required if the customer has more than one appointment on that date"},
                 },
                 "required": [],
             },
@@ -255,6 +261,24 @@ def _normalize_time_str(time_str: str) -> str:
     raise ValueError(f"Couldn't understand the time '{time_str}' — ask the customer for a clear time like 3:30 PM.")
 
 
+def _with_day_of_week(appts: list) -> list:
+    """LLMs are unreliable at computing which weekday an arbitrary date
+    falls on — left to guess, the model will happily echo back whatever
+    day name the customer said, even when it doesn't match the actual
+    date. Compute it deterministically here instead of trusting the model."""
+    result = []
+    for a in appts:
+        day_name = datetime.strptime(a["appointment_date"], "%Y-%m-%d").strftime("%A")
+        result.append({
+            "date": a["appointment_date"],
+            "day_of_week": day_name,
+            "time": a["start_time"],
+            "service": a["service_name"],
+            "status": a["status"],
+        })
+    return result
+
+
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
     re-validates the slot is actually still free."""
@@ -291,17 +315,45 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             if not phone:
                 return {"error": "Still need the customer's phone number to find their appointment."}
 
-            appt = get_latest_upcoming_appointment(project_id, phone)
-            if not appt:
+            appts = get_upcoming_appointments(project_id, phone, limit=20)
+            if not appts:
                 return {"message": "No upcoming appointment found for this customer."}
+
+            if len(appts) == 1:
+                target = appts[0]
+            else:
+                date_arg = args.get("date")
+                if not date_arg:
+                    return {
+                        "error": "This customer has more than one upcoming appointment — call check_my_appointments, "
+                                 "ask which one they mean, then call cancel_appointment again with its exact date and time.",
+                        "appointments": _with_day_of_week(appts),
+                    }
+                time_arg = _normalize_time_str(args["time"]) if args.get("time") else None
+                matches = [
+                    a for a in appts
+                    if a["appointment_date"] == date_arg and (not time_arg or a["start_time"][:5] == time_arg)
+                ]
+                if not matches:
+                    return {
+                        "error": f"No upcoming appointment found matching {date_arg}" + (f" at {time_arg}" if time_arg else "") + ".",
+                        "appointments": _with_day_of_week(appts),
+                    }
+                if len(matches) > 1:
+                    return {
+                        "error": "More than one appointment matches that date — ask for the specific time too.",
+                        "appointments": _with_day_of_week(matches),
+                    }
+                target = matches[0]
 
             # notify_customer=False — they're the one cancelling it right
             # here in this conversation, a second templated WhatsApp message
             # on top of the AI's own reply would just be noise.
-            result = cancel_appointment_fn(appt["id"], notify_customer=False)
+            result = cancel_appointment_fn(target["id"], notify_customer=False)
             return {
                 "status": "cancelled",
                 "date": result["appointment_date"],
+                "day_of_week": datetime.strptime(result["appointment_date"], "%Y-%m-%d").strftime("%A"),
                 "time": result["start_time"],
                 "service": result["service_name"],
             }
@@ -314,10 +366,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             appts = get_upcoming_appointments(project_id, phone)
             if not appts:
                 return {"message": "No upcoming appointments found for this customer."}
-            return {"appointments": [
-                {"date": a["appointment_date"], "time": a["start_time"], "service": a["service_name"], "status": a["status"]}
-                for a in appts
-            ]}
+            return {"appointments": _with_day_of_week(appts)}
 
         return {"error": f"Unknown tool {name}"}
     except ValueError as e:
@@ -538,8 +587,14 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "- You can also cancel the customer's upcoming appointment using the tool provided. This needs "
                 "its OWN separate two-message confirmation, exactly like booking — state which appointment "
                 "you're about to cancel, wait for their next reply to be a clear yes, then call "
-                "cancel_appointment. Never treat a 'yes' about booking as also confirming a cancellation, or "
-                "vice versa — they are different actions and each needs its own confirmation."
+                "cancel_appointment. If the customer has multiple upcoming appointments, you MUST pass the "
+                "exact date and time to cancel_appointment — never omit them, never guess which one they mean.\n"
+                "- Never treat a 'yes' about booking as also confirming a cancellation, or vice versa — they "
+                "are different actions and each needs its own confirmation.\n"
+                "- When the tools return appointment information, they include a 'day_of_week' field (e.g. "
+                "'Wednesday'). Always use this computed field when speaking back to the customer — do NOT "
+                "compute the day of week yourself from the date, because you will almost certainly get it wrong. "
+                "Use the tool's day_of_week value verbatim."
             )
 
         from shop import get_shop_settings_if_assistable
