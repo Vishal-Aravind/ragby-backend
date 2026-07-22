@@ -9,7 +9,7 @@ from typing import Optional
 from clients import supabase
 from auth import verify_token
 from config import WHATSAPP_TOKEN, FRONTEND_URL
-from datetime import datetime
+from datetime import datetime, timedelta
 
 router = APIRouter()
 
@@ -153,7 +153,9 @@ def get_upcoming_events_for_ai(project_id: str) -> list:
         .execute()
     events = res.data or []
 
-    today = datetime.now().date()
+    # event_date is an IST wall-clock date — datetime.now() would read the
+    # server's UTC clock, which can lag IST by up to a day near midnight.
+    today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
     open_events = []
     for event in events:
         if event.get("event_date"):
@@ -231,7 +233,7 @@ def get_registrations_for_phone(project_id: str, phone: str, limit: int = 20) ->
     events_res = supabase.table("events").select("id, title, event_date, event_time, location").in_("id", event_ids).execute()
     events_by_id = {e["id"]: e for e in (events_res.data or [])}
 
-    today = datetime.now().date()
+    today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
     result = []
     for r in registrations:
         event = events_by_id.get(r["event_id"])

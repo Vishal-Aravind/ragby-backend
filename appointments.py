@@ -160,7 +160,12 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
     # Generate slots
     slots = []
     current = start_dt
-    now = datetime.now()
+    # datetime.now() reads the SERVER's clock, which runs on UTC — 5.5
+    # hours behind India time. That silently let already-passed times
+    # today (e.g. 5:45 PM asked for at 11 PM IST) look "still upcoming"
+    # to this filter. Match the IST conversion already used elsewhere
+    # (see chat.py's date-grounding) so "past" is judged correctly.
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
 
     while current + timedelta(minutes=duration) <= end_dt:
         slot_end = current + timedelta(minutes=duration)
@@ -652,7 +657,9 @@ def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=
 @router.post("/appointments/send-reminders")
 def send_reminders(user=Depends(verify_token)):
     """Send reminders for upcoming appointments. Call this every hour via a cron job."""
-    now = datetime.now()
+    # appointment_date/start_time are IST wall-clock values — datetime.now()
+    # would read the server's UTC clock instead, same bug as generate_slots.
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     sent = 0
     failed = 0
 
@@ -775,8 +782,9 @@ def send_reminders_job():
     Same logic as the /appointments/send-reminders endpoint
     but runs internally without needing an HTTP request.
     """
-    from datetime import datetime
-    now = datetime.now()
+    from datetime import datetime, timedelta
+    # Same IST-vs-server-UTC fix as generate_slots/send_reminders above.
+    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     sent = 0
     failed = 0
 
