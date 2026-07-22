@@ -194,7 +194,11 @@ SHOP_READONLY_TOOLS = [
         "type": "function",
         "function": {
             "name": "browse_shop_catalog",
-            "description": "Get the list of available products (name, price, description) to answer questions like 'what do you sell' or recommend an item. Read-only — cannot add items to a cart or place an order.",
+            "description": (
+                "Get the shop link plus the list of available products (name, price, description). Always "
+                "call this before answering any catalog-related question — never guess or invent an item or "
+                "price. Read-only — cannot add items to a cart or place an order."
+            ),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -519,9 +523,12 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
 
         if name == "browse_shop_catalog":
             products = get_active_catalog_summary(project_id)
+            shop_link = f"{FRONTEND_URL}/shop/{project_id}"
+            if channel == "whatsapp" and external_id:
+                shop_link += f"?phone={external_id}"
             if not products:
-                return {"message": "No products currently available."}
-            return {"products": products}
+                return {"shop_link": shop_link, "message": "No products currently available."}
+            return {"shop_link": shop_link, "products": products}
 
         if name == "place_order":
             # Belt-and-suspenders: only ever reachable when channel ==
@@ -831,7 +838,22 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             active_tools += SHOP_READONLY_TOOLS
             system_prompt += (
                 "\n\nShop:\n"
-                "- You can look up the customer's own past orders and browse the product catalog using the tools provided."
+                "- You can look up the customer's own past orders and browse the product catalog using the "
+                "tools provided.\n"
+                "- If the customer asks broadly what you sell, to see the menu, or to browse (no specific "
+                "product or preference stated), call browse_shop_catalog and just send them the shop_link — "
+                "don't enumerate every item in chat text, the real shop page is a much better browsing "
+                "experience (photos, categories, cart).\n"
+                "- If the customer asks about a specific product, or wants a recommendation with any stated "
+                "preference (budget, dietary need, occasion, 'what's cheapest', 'what's good for X'), call "
+                "browse_shop_catalog and answer directly using its product data — recommend by name and price, "
+                "don't just deflect to the link. Only ever mention products that actually appear in that "
+                "result — never invent an item or price.\n"
+                "- Keep any single recommendation reply to at most 3-5 items even if more match — offer to "
+                "share more if they want.\n"
+                "- If a recommendation request is genuinely vague (just 'what's good?' with no stated "
+                "preference at all), ask ONE clarifying question (budget, dietary need, occasion) before "
+                "recommending, rather than immediately listing items."
             )
             if shop_settings.get("bot_can_order") and channel == "whatsapp":
                 active_tools += SHOP_ORDER_TOOLS
