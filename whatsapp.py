@@ -32,6 +32,11 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
 def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: str, token: str):
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # WhatsApp rejects the ENTIRE message if the body exceeds 1024 chars —
+    # a last-resort safety net so a too-long body (e.g. a merchant-authored
+    # flow node) fails as a truncated message, not a completely silent one.
+    if len(body) > 1024:
+        body = body[:1021] + "..."
     payload = {
         "messaging_product": "whatsapp",
         "to": to,

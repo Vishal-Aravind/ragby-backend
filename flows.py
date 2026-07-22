@@ -364,11 +364,25 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
 
 
 def send_back_to_menu_button(to: str, text: str, phone_number_id: str, token: str):
-    send_whatsapp_buttons(
-        to, text,
-        [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
-        phone_number_id, token
-    )
+    # WhatsApp's interactive button body has a hard 1024-char limit — an AI
+    # answer can be longer than that (e.g. a detailed policy list), and
+    # WhatsApp rejects the ENTIRE message if it's over, so the customer
+    # would get nothing at all. Send the full answer as a plain message
+    # (no such limit in practice) and follow with a short separate button
+    # message, instead of silently losing the whole reply.
+    if len(text) <= 1024:
+        send_whatsapp_buttons(
+            to, text,
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+            phone_number_id, token
+        )
+    else:
+        send_whatsapp_message(to, text, phone_number_id, token)
+        send_whatsapp_buttons(
+            to, "Would you like to go back to the menu?",
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+            phone_number_id, token
+        )
 
 
 # -------------------------------------------------
