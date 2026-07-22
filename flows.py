@@ -478,6 +478,10 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         handle_text(session, "confirm", project_id, chat_id, phone_number, phone_number_id, token)
         return
 
+    if trigger == "change_order":
+        handle_text(session, "change order", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
     if trigger == RESERVED_BACK:
         flow = get_active_flow(project_id)
         if flow:
@@ -695,6 +699,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     if session and session.get("mode") == "awaiting_special_request":
         order_id = (session.get("metadata") or {}).get("order_id")
+        catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
         special_request = None if text.lower().strip() in ("skip", "skip_special_req") else text
 
         if order_id and special_request:
@@ -734,18 +739,22 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         send_whatsapp_buttons(
             phone_number,
             summary,
-            [{"id": "confirm_and_pay", "title": "Confirm & Pay"}],
+            [
+                {"id": "confirm_and_pay", "title": "Confirm & Pay"},
+                {"id": "change_order", "title": "✏️ Change Order"},
+            ],
             phone_number_id, token,
         )
         upsert_session(project_id, phone_number, {
             "mode": "awaiting_payment_confirm",
-            "metadata": {"order_id": order_id},
+            "metadata": {"order_id": order_id, "catalog_id": catalog_id},
         })
         return
 
     if session and session.get("mode") == "awaiting_payment_confirm":
         from shop import generate_razorpay_link
         order_id = (session.get("metadata") or {}).get("order_id")
+        catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
 
         if "confirm" in text.lower() or "pay" in text.lower():
             order_res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
@@ -775,11 +784,26 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                     phone_number_id, token,
                 )
                 upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
+        elif "change" in text.lower() or "edit" in text.lower() or "add" in text.lower():
+            # Same pre-load pattern "Add More" already uses one stage
+            # earlier — an explicit, unambiguous link rather than trying to
+            # guess what to modify from free text.
+            shop_url = f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}&order_id={order_id}"
+            send_whatsapp_cta_url(
+                phone_number,
+                "Sure! Tap below to change your order 🛍️",
+                "Edit Order",
+                shop_url,
+                phone_number_id, token,
+            )
         else:
             send_whatsapp_buttons(
                 phone_number,
-                "Please tap *Confirm & Pay* to proceed, or type *menu* to start over.",
-                [{"id": "confirm_and_pay", "title": "Confirm & Pay"}],
+                "Please tap *Confirm & Pay* to proceed, *Change Order* to edit it, or type *menu* to start over.",
+                [
+                    {"id": "confirm_and_pay", "title": "Confirm & Pay"},
+                    {"id": "change_order", "title": "✏️ Change Order"},
+                ],
                 phone_number_id, token,
             )
         return
