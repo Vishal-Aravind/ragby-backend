@@ -482,6 +482,10 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         handle_text(session, "change order", project_id, chat_id, phone_number, phone_number_id, token)
         return
 
+    if trigger == "cancel_order":
+        handle_text(session, "cancel", project_id, chat_id, phone_number, phone_number_id, token)
+        return
+
     if trigger == RESERVED_BACK:
         flow = get_active_flow(project_id)
         if flow:
@@ -742,6 +746,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             [
                 {"id": "confirm_and_pay", "title": "Confirm & Pay"},
                 {"id": "change_order", "title": "✏️ Change Order"},
+                {"id": "cancel_order", "title": "❌ Cancel"},
             ],
             phone_number_id, token,
         )
@@ -796,13 +801,26 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 shop_url,
                 phone_number_id, token,
             )
+        elif "cancel" in text.lower():
+            if order_id:
+                supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
+            send_whatsapp_message(
+                phone_number,
+                "No problem, your order has been cancelled. Feel free to ask me anything else! 😊",
+                phone_number_id, token,
+            )
+            # Fully clear the session (not just its mode) so the next
+            # message goes cleanly to open chat — same fix as the earlier
+            # appointment-confirmed stale-session bug, not a partial reset.
+            delete_session(project_id, phone_number)
         else:
             send_whatsapp_buttons(
                 phone_number,
-                "Please tap *Confirm & Pay* to proceed, *Change Order* to edit it, or type *menu* to start over.",
+                "Please tap *Confirm & Pay* to proceed, *Change Order* to edit it, *Cancel* to cancel, or type *menu* to start over.",
                 [
                     {"id": "confirm_and_pay", "title": "Confirm & Pay"},
                     {"id": "change_order", "title": "✏️ Change Order"},
+                    {"id": "cancel_order", "title": "❌ Cancel"},
                 ],
                 phone_number_id, token,
             )
