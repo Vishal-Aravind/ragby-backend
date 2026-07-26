@@ -39,9 +39,9 @@ PRICE_TO_PLAN = {
 }
 
 PLAN_LIMITS = {
-    "free":     {"conversations": 300,   "projects": 1, "seats": 1},
-    "pro":      {"conversations": 5000,  "projects": 3, "seats": 5},
-    "business": {"conversations": 25000, "projects": None, "seats": None},
+    "free":     {"conversations": 300,   "seats": 1},
+    "pro":      {"conversations": 5000,  "seats": 5},
+    "business": {"conversations": 25000, "seats": None},
 }
 
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
