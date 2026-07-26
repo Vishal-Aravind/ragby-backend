@@ -1,7 +1,9 @@
+import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 
 from clients import supabase, openai_client, embeddings, qdrant
@@ -11,6 +13,24 @@ from usage import check_rate_limit, increment_usage
 from qdrant_client import models
 
 router = APIRouter()
+
+# Per-minute burst limiter for the public chat widget — separate from
+# usage.py's MONTHLY cap, which does nothing to stop a fast script from
+# burning real OpenAI cost in a couple of minutes, long before the monthly
+# ceiling would ever trigger. In-memory/single-process by design (matches
+# the rest of this app — no Redis anywhere), keyed by (project_id, visitor
+# IP) so one abusive visitor can't affect other merchants' bots.
+_PUBLIC_CHAT_LIMIT_PER_MIN = 15
+_public_chat_hits = defaultdict(list)
+
+
+def _public_chat_rate_limited(project_id: str, ip: str) -> bool:
+    key = (project_id, ip)
+    now = time.time()
+    hits = [t for t in _public_chat_hits.get(key, []) if now - t < 60]
+    hits.append(now)
+    _public_chat_hits[key] = hits
+    return len(hits) > _PUBLIC_CHAT_LIMIT_PER_MIN
 
 
 # -------------------------------------------------
@@ -1034,7 +1054,14 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
 
 
 @router.post("/public/chat")
-def public_chat(req: PublicChatRequest):
+def public_chat(req: PublicChatRequest, request: Request):
+    visitor_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if _public_chat_rate_limited(req.projectId, visitor_ip):
+        return {
+            "answer": "You're sending messages a bit too fast — please wait a moment and try again.",
+            "sessionId": req.sessionId or str(uuid.uuid4()),
+        }
+
     session_id = req.sessionId or str(uuid.uuid4())
 
     existing = supabase.table("chats").select("id").eq("id", session_id).execute()

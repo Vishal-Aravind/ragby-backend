@@ -93,6 +93,14 @@ def send_template(
     """
     project = get_project_from_api_key(x_api_key)
 
+    # A leaked/compromised API key previously had NO cost ceiling at all
+    # here — not even the monthly cap every other send path in this app
+    # already enforces (see api_keys.py's identical check).
+    from usage import check_rate_limit, increment_usage
+    rate_check = check_rate_limit(project["project_id"])
+    if not rate_check["allowed"]:
+        raise HTTPException(status_code=429, detail="Monthly message limit reached")
+
     # Normalize phone number
     phone = body.to.replace("+", "").replace(" ", "").replace("-", "")
     if not phone:
@@ -142,6 +150,8 @@ def send_template(
             }).execute()
         except Exception as e:
             print(f"Notification log error (non-fatal): {e}")
+
+        increment_usage(project["project_id"])
 
         return SendTemplateResponse(
             status="sent",
@@ -233,6 +243,11 @@ def send_template_bulk(
     """
     project = get_project_from_api_key(x_api_key)
 
+    from usage import check_rate_limit, increment_usage
+    rate_check = check_rate_limit(project["project_id"])
+    if not rate_check["allowed"]:
+        raise HTTPException(status_code=429, detail="Monthly message limit reached")
+
     template = body.get("template")
     recipients = body.get("recipients", [])
 
@@ -274,6 +289,7 @@ def send_template_bulk(
         resp = res.json()
         if res.ok:
             results.append({"to": phone, "status": "sent", "message_id": resp.get("messages", [{}])[0].get("id")})
+            increment_usage(project["project_id"])
         else:
             results.append({"to": phone, "status": "failed", "error": resp.get("error", {}).get("message", "Unknown error")})
 

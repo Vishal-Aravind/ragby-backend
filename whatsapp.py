@@ -1,3 +1,5 @@
+import hmac
+import hashlib
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import PlainTextResponse
@@ -7,6 +9,21 @@ from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOK
 from auth import verify_token
 
 router = APIRouter()
+
+
+def verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
+    """Meta signs every real webhook POST with X-Hub-Signature-256
+    (sha256=<hex>, HMAC-SHA256 of the raw body using the app secret).
+    Without this check, anyone who learns a project's phone_number_id could
+    POST a fully spoofed message that still triggers a real OpenAI-costing
+    chat reply — unlike Slack's webhook (see slack.py's
+    verify_slack_signature) and Stripe's, this one had no verification at
+    all. Fails closed: a missing/misconfigured secret rejects the request
+    rather than silently accepting everything."""
+    if not signature_header or not META_APP_SECRET:
+        return False
+    expected = "sha256=" + hmac.new(META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 
 # -------------------------------------------------
@@ -124,6 +141,11 @@ async def whatsapp_verify(request: Request):
 # -------------------------------------------------
 @router.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not verify_meta_signature(raw_body, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     body = await request.json()
 
     try:
