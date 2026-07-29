@@ -3,12 +3,14 @@ Event Registration system — for webinars, expos, workshops, demos, walk-in pro
 Merchant creates an event, broadcasts a rich card via WhatsApp,
 customer registers via a public page, gets WhatsApp confirmation.
 """
-from fastapi import APIRouter, Depends, HTTPException
+import sentry_sdk
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 from clients import supabase
 from auth import verify_token
 from config import WHATSAPP_TOKEN, FRONTEND_URL
+from ratelimit import is_rate_limited
 from datetime import datetime, timedelta
 
 router = APIRouter()
@@ -323,6 +325,7 @@ def register_for_event_core(event_id: str, project_id: str, data: dict) -> dict:
             "data": data,
         }).execute()
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"form_submissions insert error: {e}")
 
     try:
@@ -355,6 +358,7 @@ def register_for_event_core(event_id: str, project_id: str, data: dict) -> dict:
 
             send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Event registration WhatsApp confirmation error: {e}")
 
     return {
@@ -392,6 +396,7 @@ def cancel_registration_core(registration_id: str, notify_customer: bool = True)
                     token=wa_data.get("access_token") or WHATSAPP_TOKEN,
                 )
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             print(f"Registration cancel notification error: {e}")
 
     supabase.table("event_registrations").update({"status": "cancelled"}).eq("id", registration_id).execute()
@@ -446,7 +451,10 @@ def public_event_details(event_id: str):
 
 
 @router.post("/public/events/register")
-def register_for_event(body: RegistrationCreate):
+def register_for_event(body: RegistrationCreate, request: Request):
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"register:{body.project_id}:{ip}", limit=5):
+        raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
     try:
         return register_for_event_core(body.event_id, body.project_id, body.data or {})
     except ValueError as e:

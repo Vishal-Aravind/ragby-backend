@@ -1,6 +1,5 @@
-import time
 import uuid
-from collections import defaultdict
+import sentry_sdk
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Request
@@ -10,6 +9,7 @@ from clients import supabase, openai_client, embeddings, qdrant
 from config import QDRANT_COLLECTION, FRONTEND_URL
 from auth import verify_token
 from usage import check_rate_limit, increment_usage
+from ratelimit import is_rate_limited
 from qdrant_client import models
 
 router = APIRouter()
@@ -17,20 +17,13 @@ router = APIRouter()
 # Per-minute burst limiter for the public chat widget — separate from
 # usage.py's MONTHLY cap, which does nothing to stop a fast script from
 # burning real OpenAI cost in a couple of minutes, long before the monthly
-# ceiling would ever trigger. In-memory/single-process by design (matches
-# the rest of this app — no Redis anywhere), keyed by (project_id, visitor
-# IP) so one abusive visitor can't affect other merchants' bots.
+# ceiling would ever trigger. Keyed by (project_id, visitor IP) so one
+# abusive visitor can't affect other merchants' bots.
 _PUBLIC_CHAT_LIMIT_PER_MIN = 15
-_public_chat_hits = defaultdict(list)
 
 
 def _public_chat_rate_limited(project_id: str, ip: str) -> bool:
-    key = (project_id, ip)
-    now = time.time()
-    hits = [t for t in _public_chat_hits.get(key, []) if now - t < 60]
-    hits.append(now)
-    _public_chat_hits[key] = hits
-    return len(hits) > _PUBLIC_CHAT_LIMIT_PER_MIN
+    return is_rate_limited(f"chat:{project_id}:{ip}", _PUBLIC_CHAT_LIMIT_PER_MIN)
 
 
 # -------------------------------------------------
@@ -45,6 +38,10 @@ class PublicChatRequest(BaseModel):
     projectId: str
     message: str
     sessionId: Optional[str] = None
+
+class VerifyPasswordRequest(BaseModel):
+    projectId: str
+    password: str
 
 
 # -------------------------------------------------
@@ -524,6 +521,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"execute_appointment_tool error: {e}")
         return {"error": "Something went wrong trying to do that — please try again."}
 
@@ -565,6 +563,7 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"execute_shop_tool error: {e}")
         return {"error": "Something went wrong trying to do that — please try again."}
 
@@ -661,6 +660,7 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"execute_event_tool error: {e}")
         return {"error": "Something went wrong trying to do that — please try again."}
 
@@ -1034,6 +1034,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         return {"answer": answer, "sources": []}
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"ERROR IN RUN_CHAT: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1051,6 +1052,27 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     result = run_chat(req.projectId, req.chatId, req.message, history)
     increment_usage(req.projectId)
     return result
+
+
+@router.post("/public/chat/verify-password")
+def verify_chat_password(req: VerifyPasswordRequest, request: Request):
+    # This used to be a plain string compare with no attempt limiting at
+    # all — straightforwardly brute-forceable. A tighter, longer window
+    # than the chat burst limiter, since this guards a password rather than
+    # just costing money per attempt.
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"pw:{req.projectId}:{ip}", limit=5, window_seconds=300):
+        raise HTTPException(status_code=429, detail="Too many attempts — please wait a few minutes and try again.")
+
+    res = supabase.table("projects").select("chat_password").eq("id", req.projectId).maybe_single().execute()
+    project = res.data if res else None
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.get("chat_password") != req.password:
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+    return {"success": True}
 
 
 @router.post("/public/chat")

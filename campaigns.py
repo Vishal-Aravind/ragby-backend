@@ -1,5 +1,6 @@
 import asyncio
 import calendar
+import sentry_sdk
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from clients import supabase
@@ -279,6 +280,7 @@ async def send_campaign_messages(
                 print(f"Campaign send error to {phone}: {res.text}")
 
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             failed += 1
             print(f"Campaign send exception to {phone}: {e}")
 
@@ -352,12 +354,15 @@ def dispatch_scheduled_campaigns():
                             "total_count": len(fresh_contacts),
                         }).eq("id", camp["id"]).execute()
                     except Exception as e:
+                        sentry_sdk.capture_exception(e)
                         print(f"Failed to reschedule recurring campaign {camp['id']}: {e}")
 
             except Exception as e:
+                sentry_sdk.capture_exception(e)
                 print(f"dispatch_scheduled_campaigns error for {camp.get('id')}: {e}")
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"dispatch_scheduled_campaigns fatal error: {e}")
 
 

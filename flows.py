@@ -6,6 +6,7 @@ Interactive Message Flows for WhatsApp
 - "handoff" button ID → human handoff
 - Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
+import sentry_sdk
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends
@@ -53,6 +54,7 @@ def get_session(project_id: str, phone_number: str) -> Optional[dict]:
         return session
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"get_session error: {e}")
         return None
 
@@ -86,6 +88,7 @@ def get_active_flow(project_id: str) -> Optional[dict]:
             .execute()
         return res.data[0] if res.data else None
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"get_active_flow error: {e}")
         return None
 

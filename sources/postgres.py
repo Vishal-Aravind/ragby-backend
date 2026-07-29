@@ -1,6 +1,7 @@
 # sources/postgres.py
 # Handles both PostgreSQL and MySQL via SQLAlchemy
 
+import sentry_sdk
 import sqlalchemy
 from functools import lru_cache
 
@@ -133,6 +134,7 @@ Return ONLY the SQL query, nothing else."""
                 lines.append(", ".join(str(v) for v in row))
             return "\n".join(lines)
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         return f"Query failed: {str(e)}"
     finally:
         engine.dispose()

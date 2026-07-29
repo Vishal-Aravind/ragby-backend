@@ -3,6 +3,7 @@ Send Template API — allows external systems to trigger WhatsApp template messa
 Merchants can call this from their own booking software, CRM, inventory systems etc.
 Authentication is via the project's API key (stored in api_keys table).
 """
+import sentry_sdk
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from typing import List, Optional
@@ -149,6 +150,7 @@ def send_template(
                 "status": "sent",
             }).execute()
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             print(f"Notification log error (non-fatal): {e}")
 
         increment_usage(project["project_id"])

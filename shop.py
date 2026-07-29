@@ -1,8 +1,10 @@
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
 from auth import verify_token
+from ratelimit import is_rate_limited
 import os
 import hmac
 import hashlib
@@ -328,6 +330,7 @@ def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data
         wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
         wa_data = (wa_res.data if wa_res else None)
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"whatsapp_integrations fetch error: {e}")
         wa_data = None
 
@@ -456,15 +459,20 @@ def create_order_from_chat(project_id: str, phone: str, requested_items: list, d
 
 
 @router.post("/public/shop/submit-cart")
-async def submit_cart(body: CartSubmit):
+async def submit_cart(body: CartSubmit, request: Request):
     project_id = body.project_id
     phone = body.phone.replace("+", "").replace(" ", "")
+
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"cart:{project_id}:{ip}", limit=5):
+        raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
 
     # Get shop config
     try:
         config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
         config = (config_res.data if config_res else None) or {}
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"shop_config fetch error: {e}")
         config = {}
 
@@ -651,6 +659,7 @@ def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: st
                 "metadata": {},
             })
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"_advance_flow_after_payment error: {e}")
 
 
@@ -687,5 +696,6 @@ def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
         return link["short_url"]
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"generate_razorpay_link error: {e}")
         return None

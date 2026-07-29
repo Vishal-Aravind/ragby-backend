@@ -1,9 +1,11 @@
 import os
+import sentry_sdk
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from clients import supabase
 from auth import verify_token
+from config import TELEGRAM_WEBHOOK_SECRET
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
 
@@ -20,7 +22,14 @@ def send_telegram_message(bot_token: str, chat_id: int, text: str):
 
 def set_telegram_webhook(bot_token: str, webhook_url: str):
     url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
-    res = requests.post(url, json={"url": webhook_url})
+    payload = {"url": webhook_url}
+    # Telegram echoes this back as a header on every real webhook call, so
+    # we can verify a request genuinely came from Telegram — previously
+    # nothing checked this at all, unlike WhatsApp's webhook (now fixed) and
+    # Slack's (already had it).
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    res = requests.post(url, json=payload)
     return res.json()
 
 def get_bot_info(bot_token: str):
@@ -87,6 +96,15 @@ def telegram_status(project_id: str, user=Depends(verify_token)):
 
 @router.post("/webhook/telegram/{project_id}")
 async def telegram_webhook(project_id: str, req: Request):
+    # Fails closed if the secret isn't configured — same posture as the
+    # WhatsApp webhook fix. Note: any Telegram bot connected BEFORE this
+    # secret was set up needs to be disconnected and reconnected (via the
+    # dashboard) so Telegram actually registers the secret_token — until
+    # then its existing webhook registration has no secret to send, and
+    # this check would reject it.
+    if not TELEGRAM_WEBHOOK_SECRET or req.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+
     body = await req.json()
     print(f"TELEGRAM BODY: {body}")
 
@@ -160,5 +178,6 @@ async def telegram_webhook(project_id: str, req: Request):
         return {"status": "ok"}
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"TELEGRAM WEBHOOK ERROR: {e}")
         return {"status": "error"}

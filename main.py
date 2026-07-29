@@ -1,9 +1,25 @@
+import sentry_sdk
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 
-from config import FRONTEND_URL
+from config import FRONTEND_URL, SENTRY_DSN
+
+# init() quietly does nothing until SENTRY_DSN is actually set — safe to
+# deploy either way. Once set, auto-captures unhandled exceptions (the raw
+# 500s that, until now, only ever showed up as a print() in a console
+# nobody was watching in real time). Must run before the FastAPI app is
+# created. capture_exception() calls elsewhere in this codebase (for
+# exceptions that are already caught and handled, not just left to crash)
+# are themselves safe no-ops if init() was never called — that's why the
+# import above stays unconditional even though init() is not.
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
 
 # Import all routers
 from usage import router as usage_router
@@ -24,6 +40,7 @@ from send_template_api import router as send_template_router
 from appointments import router as appointments_router
 from events import router as events_router
 from content_gaps import router as content_gaps_router
+from auth import router as auth_router
 
 
 # -------------------------------------------------
@@ -35,6 +52,7 @@ def run_appointment_reminders():
         from appointments import send_reminders_job
         send_reminders_job()
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Scheduler: reminder job error: {e}")
 
 
@@ -44,6 +62,7 @@ def run_scheduled_campaigns():
         from campaigns import dispatch_scheduled_campaigns
         dispatch_scheduled_campaigns()
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Scheduler: campaign dispatch error: {e}")
 
 
@@ -58,6 +77,7 @@ async def lifespan(app: FastAPI):
         scheduler.start()
         print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s")
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Scheduler failed to start: {e}")
 
     yield  # app runs here
@@ -105,6 +125,7 @@ app.include_router(send_template_router)
 app.include_router(appointments_router)
 app.include_router(events_router)
 app.include_router(content_gaps_router)
+app.include_router(auth_router)
 
 
 # -------------------------------------------------

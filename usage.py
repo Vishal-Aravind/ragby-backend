@@ -1,3 +1,4 @@
+import sentry_sdk
 from datetime import datetime
 from fastapi import APIRouter, Depends
 
@@ -95,6 +96,7 @@ def increment_usage(project_id: str):
             }).execute()
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"increment_usage error: {e}")
 
 

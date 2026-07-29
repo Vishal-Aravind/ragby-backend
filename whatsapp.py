@@ -1,5 +1,6 @@
 import hmac
 import hashlib
+import sentry_sdk
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import PlainTextResponse
@@ -236,6 +237,7 @@ async def whatsapp_webhook(request: Request):
         return {"status": "ignored"}
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"WHATSAPP WEBHOOK ERROR: {e}")
         return {"status": "error"}
 

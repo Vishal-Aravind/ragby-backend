@@ -1,3 +1,4 @@
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from qdrant_client import models
 
@@ -73,6 +74,7 @@ def add_source(data: dict, user=Depends(verify_token)):
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"add_source sync error ({data['type']}): {e}")
         supabase.table("data_sources").delete().eq("id", source["id"]).execute()
         raise HTTPException(
@@ -142,6 +144,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         # The old points for this source were already deleted above before
         # this ran — a failed resync used to silently report "synced"
         # anyway, leaving the source connected but genuinely empty with no
@@ -165,6 +168,7 @@ def introspect(data: dict, user=Depends(verify_token)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=400, detail=f"Could not connect: {str(e)}")
 
 

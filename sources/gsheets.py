@@ -1,6 +1,7 @@
 # sources/gsheets.py
 
 import uuid
+import sentry_sdk
 import requests
 import pandas as pd
 from qdrant_client import models
@@ -21,6 +22,7 @@ def fetch_tab(sheet_id: str, tab_name: str):
         df = pd.read_csv(url)
         return df
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Could not fetch tab '{tab_name}': {e}")
         return None
 
@@ -33,6 +35,7 @@ def get_all_tab_names(sheet_id: str):
         entries = data.get("feed", {}).get("entry", [])
         return [e["title"]["$t"] for e in entries]
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Could not fetch tab list: {e}")
         return None
 
@@ -68,6 +71,7 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
                 df = pd.read_csv(url)
                 tab_label = "default"
             except Exception as e:
+                sentry_sdk.capture_exception(e)
                 print(f"Could not fetch default tab: {e}")
                 continue
         else:

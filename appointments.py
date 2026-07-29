@@ -2,12 +2,14 @@
 Appointments system — Calendly-style booking via WhatsApp bot.
 Supports Google Calendar integration for availability.
 """
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List
 from clients import supabase
 from auth import verify_token
 from config import WHATSAPP_TOKEN, FRONTEND_URL
+from ratelimit import is_rate_limited
 import os
 import requests
 from datetime import datetime, date, timedelta, time
@@ -464,6 +466,7 @@ def create_appointment(
                     if old_token:
                         delete_google_event(old_token, old_settings.get("google_calendar_id", "primary"), old_appt.data["google_event_id"])
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             print(f"Reschedule old appointment error: {e}")
 
     appt_res = supabase.table("appointments").insert({
@@ -520,6 +523,7 @@ def create_appointment(
             }, on_conflict="project_id,phone_number").execute()
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"WhatsApp confirmation error: {e}")
 
     return {
@@ -543,8 +547,11 @@ def public_slots(project_id: str, date: str):
 
 
 @router.post("/public/appointments/book")
-def book_appointment(body: BookingCreate):
+def book_appointment(body: BookingCreate, request: Request):
     """Create a new appointment."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"book:{body.project_id}:{ip}", limit=5):
+        raise HTTPException(status_code=429, detail="Too many booking attempts — please wait a moment and try again.")
     try:
         return create_appointment(
             project_id=body.project_id,
@@ -631,6 +638,7 @@ def cancel_appointment(appointment_id: str, notify_customer: bool = True) -> dic
                     token=wa_data.get("access_token") or WHATSAPP_TOKEN,
                 )
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             print(f"Cancel notification error: {e}")
 
     supabase.table("appointments").update({"status": "cancelled"}).eq("id", appointment_id).execute()
@@ -722,6 +730,7 @@ def send_reminders(user=Depends(verify_token)):
                     sent += 1
 
         except Exception as e:
+            sentry_sdk.capture_exception(e)
             print(f"Reminder error for {appt['id']}: {e}")
             failed += 1
 
@@ -769,6 +778,7 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
             print(f"Reminder template failed for {to}: {res.text}")
             return False
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Reminder template error: {e}")
         return False
 
@@ -852,10 +862,12 @@ def send_reminders_job():
                         sent += 1
 
             except Exception as e:
+                sentry_sdk.capture_exception(e)
                 print(f"Reminder job error for appointment {appt.get('id')}: {e}")
                 failed += 1
 
         print(f"Reminder job done — sent: {sent}, failed: {failed}")
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Reminder job fatal error: {e}")

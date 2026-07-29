@@ -1,3 +1,4 @@
+import sentry_sdk
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -136,4 +137,5 @@ def upsert_contact(project_id: str, phone: str, name: str = None, channel: str =
                 "last_seen_at": "now()",
             }).execute()
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"upsert_contact error: {e}")
