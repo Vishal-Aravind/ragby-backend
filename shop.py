@@ -5,6 +5,7 @@ from typing import List, Optional
 from clients import supabase
 from auth import verify_token
 from ratelimit import is_rate_limited
+from shopify_client import graphql as shopify_graphql
 import os
 import hmac
 import hashlib
@@ -27,6 +28,7 @@ class ShopConfigUpdate(BaseModel):
     store_phone: Optional[str] = None
     gst_percent: Optional[float] = None
     currency: Optional[str] = None
+    currency_code: Optional[str] = None
     accent_color: Optional[str] = None
     delivery_types: Optional[List[str]] = None
     terms_note: Optional[str] = None
@@ -76,6 +78,10 @@ class CartItem(BaseModel):
     price: float
     quantity: int
     image_url: Optional[str] = None
+    # Captured at order time so a later Shopify order write-back knows
+    # exactly which Shopify variant this line item was — product_id is our
+    # own internal row id, not something Shopify's API understands.
+    shopify_variant_id: Optional[str] = None
 
 class CartSubmit(BaseModel):
     phone: str
@@ -165,6 +171,7 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
             "store_phone": "",
             "gst_percent": 0,
             "currency": "₹",
+            "currency_code": "INR",
             "accent_color": "#16a34a",
             "delivery_types": ["Takeaway"],
             "terms_note": "This order is not eligible for any kind of Discounts. T&C apply.",
@@ -413,6 +420,7 @@ def create_order_from_chat(project_id: str, phone: str, requested_items: list, d
             "price": product["price"],
             "quantity": qty,
             "image_url": product.get("image_url"),
+            "shopify_variant_id": product.get("shopify_variant_id"),
         })
         catalog_id = catalog_id or product.get("catalog_id")
 
@@ -589,6 +597,12 @@ async def razorpay_webhook(request: Request):
         }).eq("id", order["id"]).execute()
 
         try:
+            push_order_to_shopify(order["id"])
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Shopify order write-back error for order {order['id']}: {e}")
+
+        try:
             wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             wa_data = (wa_res.data if wa_res else None)
         except:
@@ -680,7 +694,12 @@ def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
         client = razorpay.Client(auth=(key_id, key_secret))
         link = client.payment_link.create({
             "amount": int(order["total"] * 100),
-            "currency": "INR",
+            # FIX: was hardcoded "INR" regardless of the store's real
+            # currency — harmless for every existing (INR-only) store, but
+            # would have silently charged a Shopify-sourced multi-currency
+            # catalog in the wrong currency. currency_code is a real
+            # ISO-4217 code; shop_config.currency is just a display symbol.
+            "currency": config.get("currency_code") or "INR",
             "description": f"Order #{order['id'][:8].upper()}",
             "customer": {"contact": f"+{order['phone_number']}"},
             "notify": {"sms": False, "email": False},
@@ -699,3 +718,101 @@ def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
         sentry_sdk.capture_exception(e)
         print(f"generate_razorpay_link error: {e}")
         return None
+
+
+# ─────────────────────────────────────────────
+# SHOPIFY ORDER WRITE-BACK — called from razorpay_webhook above
+# ─────────────────────────────────────────────
+
+def push_order_to_shopify(order_id: str):
+    """Pushes a completed WhatsApp/Razorpay order into Shopify as an order
+    record, purely for the merchant's unified sales reporting. This is
+    Shopify's own documented "importing orders from an external system" use
+    case for orderCreate — the actual payment already happened via Razorpay,
+    not a live Shopify Checkout session, which is what keeps this compliant
+    (see the Shopify integration plan for why a widget-based Razorpay
+    checkout would NOT be compliant the same way).
+
+    No-op if the project has no connected Shopify store, or if this order
+    was already pushed — shopify_order_id doubles as the idempotency check,
+    so a retried Razorpay webhook can never create a duplicate Shopify order."""
+    order_res = supabase.table("orders").select("*").eq("id", order_id).maybe_single().execute()
+    order = order_res.data if order_res else None
+    if not order or order.get("shopify_order_id"):
+        return
+
+    integration_res = supabase.table("shopify_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
+    integration = integration_res.data if integration_res else None
+    if not integration:
+        return
+
+    config_res = supabase.table("shop_config").select("currency_code").eq("project_id", order["project_id"]).maybe_single().execute()
+    currency_code = ((config_res.data if config_res else None) or {}).get("currency_code") or "INR"
+
+    line_items = []
+    for item in (order.get("items") or []):
+        variant_id = item.get("shopify_variant_id")
+        if variant_id:
+            line_items.append({"variantId": variant_id, "quantity": item["quantity"]})
+        else:
+            # Manually-added product (or an item placed before this column
+            # existed) — record it as a custom, non-catalog line item
+            # rather than dropping it, so the Shopify order total still
+            # matches what the customer actually paid.
+            line_items.append({
+                "title": item.get("name", "Item"),
+                "quantity": item["quantity"],
+                "priceSet": {"shopMoney": {"amount": f"{item['price']:.2f}", "currencyCode": currency_code}},
+            })
+
+    # Line items alone only sum to the subtotal — without this, the order's
+    # line-item total wouldn't reconcile with the transaction amount below
+    # (which is the customer's actual total, GST included), leaving a
+    # visibly mismatched-looking order in the merchant's Shopify admin.
+    tax_lines = []
+    if order.get("gst_amount"):
+        tax_lines.append({
+            "title": "GST",
+            "priceSet": {"shopMoney": {"amount": f"{order['gst_amount']:.2f}", "currencyCode": currency_code}},
+        })
+
+    # NOTE: this mutation shape follows Shopify's documented OrderCreateOrderInput
+    # conventions as closely as I can verify without a live store to test
+    # against — worth a quick check against Shopify's GraphQL schema explorer
+    # on your dev store before this runs against a real merchant's data.
+    mutation = """
+        mutation orderCreate($order: OrderCreateOrderInput!) {
+          orderCreate(order: $order) {
+            order { id }
+            userErrors { field message }
+          }
+        }
+    """
+    variables = {
+        "order": {
+            "currency": currency_code,
+            "lineItems": line_items,
+            "taxLines": tax_lines,
+            "financialStatus": "PAID",
+            "transactions": [{
+                "kind": "SALE",
+                "status": "SUCCESS",
+                "gateway": "Razorpay",
+                "amountSet": {"shopMoney": {"amount": f"{order['total']:.2f}", "currencyCode": currency_code}},
+            }],
+        }
+    }
+
+    try:
+        data = shopify_graphql(integration["shop_domain"], integration["access_token"], mutation, variables)
+        result = data["orderCreate"]
+        errors = result.get("userErrors") or []
+        if errors:
+            sentry_sdk.capture_message(f"Shopify orderCreate userErrors for order {order_id}: {errors}")
+            return
+        shopify_order_id = (result.get("order") or {}).get("id")
+        if shopify_order_id:
+            supabase.table("orders").update({"shopify_order_id": shopify_order_id}).eq("id", order_id).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"push_order_to_shopify error for order {order_id}: {e}")

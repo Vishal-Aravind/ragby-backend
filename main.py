@@ -41,6 +41,7 @@ from appointments import router as appointments_router
 from events import router as events_router
 from content_gaps import router as content_gaps_router
 from auth import router as auth_router
+from shopify_oauth import router as shopify_router
 
 
 # -------------------------------------------------
@@ -66,6 +67,32 @@ def run_scheduled_campaigns():
         print(f"Scheduler: campaign dispatch error: {e}")
 
 
+def run_shopify_reconciliation():
+    """Runs every 6 hours — backstop for Shopify's product webhooks, which
+    aren't 100% guaranteed to deliver (per Shopify's own docs). Webhooks are
+    the fast primary path (see shopify_oauth.py); this just catches anything
+    missed. One merchant's failure must never abort the loop for the rest."""
+    try:
+        from clients import supabase, qdrant, embeddings
+        from config import QDRANT_COLLECTION
+        from sources.shopify import sync_products
+
+        integrations = supabase.table("shopify_integrations").select("project_id").execute()
+        for integration in (integrations.data or []):
+            project_id = integration["project_id"]
+            try:
+                source_res = supabase.table("data_sources").select("id").eq("project_id", project_id).eq("type", "shopify").maybe_single().execute()
+                source_id = (source_res.data or {}).get("id") if source_res else None
+                if source_id:
+                    sync_products(project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+                print(f"Scheduler: Shopify reconciliation error for project {project_id}: {e}")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Scheduler: Shopify reconciliation job error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start scheduler on app startup
@@ -74,8 +101,9 @@ async def lifespan(app: FastAPI):
         scheduler = BackgroundScheduler()
         scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
         scheduler.add_job(run_scheduled_campaigns, 'interval', seconds=30, id='scheduled_campaigns')
+        scheduler.add_job(run_shopify_reconciliation, 'interval', hours=6, id='shopify_reconciliation')
         scheduler.start()
-        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s")
+        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler failed to start: {e}")
@@ -126,6 +154,7 @@ app.include_router(appointments_router)
 app.include_router(events_router)
 app.include_router(content_gaps_router)
 app.include_router(auth_router)
+app.include_router(shopify_router)
 
 
 # -------------------------------------------------

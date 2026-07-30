@@ -28,6 +28,18 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 META_APP_ID = os.getenv("META_APP_ID")
 META_APP_SECRET = os.getenv("META_APP_SECRET")
 
+SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY", "")
+SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET", "")
+# read_orders/write_orders added for Piece 2's order write-back (push_order_to_shopify
+# in shop.py) — without these, the OAuth token Piece 1 issues has no permission to
+# call orderCreate, and write-back would fail with a Shopify permissions error on
+# every single order. Scopes are locked in at connect time, so changing this after a
+# merchant already connected requires disconnecting and reconnecting to pick up the
+# new permissions — it isn't retroactive.
+SHOPIFY_APP_SCOPES = os.getenv("SHOPIFY_APP_SCOPES", "read_products,read_inventory,read_orders,write_orders")
+SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", f"{BACKEND_PUBLIC_URL}/shopify/oauth/callback")
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
+
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRO_MONTHLY = os.getenv("STRIPE_PRO_MONTHLY")

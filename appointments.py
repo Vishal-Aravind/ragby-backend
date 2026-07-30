@@ -4,6 +4,7 @@ Supports Google Calendar integration for availability.
 """
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from clients import supabase
@@ -245,14 +246,22 @@ def google_callback(code: str, state: str):
         "grant_type": "authorization_code",
     })
 
+    # FIX: FastAPI's default response_class is JSONResponse — a bare string
+    # return gets json.dumps()'d (wrapped in quotes, Content-Type
+    # application/json), so the <script> below never actually executed in
+    # the popup and window.opener.postMessage never fired. The token was
+    # still saved correctly (that part never depended on this), but the
+    # frontend's "Connecting..." spinner would hang until a manual refresh.
+    # Wrapping every return in HTMLResponse() makes the popup really close
+    # and notify its opener as intended.
     if not res.ok:
-        return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'{res.text}'}}, '*'); window.close();</script></body></html>"
+        return HTMLResponse(f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'{res.text}'}}, '*'); window.close();</script></body></html>")
 
     token_data = res.json()
     refresh_token = token_data.get("refresh_token")
 
     if not refresh_token:
-        return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'No refresh token returned. Try disconnecting and reconnecting.'}}, '*'); window.close();</script></body></html>"
+        return HTMLResponse("<html><body><script>window.opener.postMessage({type:'GOOGLE_AUTH',event:'ERROR',error:'No refresh token returned. Try disconnecting and reconnecting.'}, '*'); window.close();</script></body></html>")
 
     # Save refresh token
     existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
@@ -266,7 +275,7 @@ def google_callback(code: str, state: str):
             "google_refresh_token": refresh_token,
         }).execute()
 
-    return f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'FINISH'}}, '*'); window.close();</script></body></html>"
+    return HTMLResponse("<html><body><script>window.opener.postMessage({type:'GOOGLE_AUTH',event:'FINISH'}, '*'); window.close();</script></body></html>")
 
 
 @router.delete("/appointments/google/disconnect/{project_id}")

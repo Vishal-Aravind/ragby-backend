@@ -9,6 +9,7 @@ from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
 from sources.website import sync_website
+from sources.shopify import sync_products as sync_shopify_products
 
 router = APIRouter()
 
@@ -73,6 +74,15 @@ def add_source(data: dict, user=Depends(verify_token)):
             )
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
+
+        elif data["type"] == "shopify":
+            # In practice this data_sources row is usually created by the
+            # OAuth callback (shopify_oauth.py) itself, not this generic
+            # form — wiring it here too keeps the resync/list UI uniform
+            # across every source type.
+            sync_shopify_products(
+                data["projectId"], source["id"], qdrant, embeddings, QDRANT_COLLECTION
+            )
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"add_source sync error ({data['type']}): {e}")
@@ -143,6 +153,11 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             )
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
+
+        elif s["type"] == "shopify":
+            sync_shopify_products(
+                s["project_id"], source_id, qdrant, embeddings, QDRANT_COLLECTION
+            )
     except Exception as e:
         sentry_sdk.capture_exception(e)
         # The old points for this source were already deleted above before
