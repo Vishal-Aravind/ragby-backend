@@ -14,13 +14,18 @@ def get_current_month() -> str:
 
 
 def check_rate_limit(project_id: str) -> dict:
+    # FIX: was .single(), which raises PGRST116 ("0 rows") instead of
+    # returning empty data — any chat request against a stale/deleted
+    # project_id (e.g. an old widget embed still live on a merchant's site
+    # after they delete the project) threw an unhandled 500 here, leaving
+    # the widget's "..." typing indicator stuck forever with no error shown.
     proj = supabase.table("projects") \
         .select("user_id") \
         .eq("id", project_id) \
-        .single() \
+        .maybe_single() \
         .execute()
 
-    if not proj.data:
+    if not proj or not proj.data:
         return {"allowed": False, "reason": "Project not found"}
 
     user_id = proj.data["user_id"]
@@ -28,7 +33,7 @@ def check_rate_limit(project_id: str) -> dict:
     profile = supabase.table("profiles") \
         .select("plan") \
         .eq("id", user_id) \
-        .single() \
+        .maybe_single() \
         .execute()
 
     plan = "free"

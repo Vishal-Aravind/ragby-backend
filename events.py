@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN, FRONTEND_URL
 from ratelimit import is_rate_limited
 from datetime import datetime, timedelta
@@ -60,6 +60,7 @@ class RegistrationCreate(BaseModel):
 # -------------------------------------------------
 @router.get("/events")
 def list_events(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("events") \
         .select("*") \
         .eq("project_id", project_id) \
@@ -81,6 +82,7 @@ def list_events(project_id: str, user=Depends(verify_token)):
 
 @router.post("/events")
 def create_event(project_id: str, body: EventCreate, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("events").insert({
         "project_id": project_id,
         **body.dict(exclude_none=True),
@@ -88,8 +90,23 @@ def create_event(project_id: str, body: EventCreate, user=Depends(verify_token))
     return res.data[0]
 
 
+def _require_role_for_event(user_id: str, event_id: str):
+    res = supabase.table("events").select("project_id").eq("id", event_id).maybe_single().execute()
+    event = res.data if res else None
+    if not event:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, event["project_id"])
+
+def _require_role_for_registration(user_id: str, registration_id: str):
+    res = supabase.table("event_registrations").select("project_id").eq("id", registration_id).maybe_single().execute()
+    registration = res.data if res else None
+    if not registration:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, registration["project_id"])
+
 @router.put("/events/{event_id}")
 def update_event(event_id: str, body: EventUpdate, user=Depends(verify_token)):
+    _require_role_for_event(user.id, event_id)
     update = {k: v for k, v in body.dict().items() if v is not None}
     supabase.table("events").update(update).eq("id", event_id).execute()
     res = supabase.table("events").select("*").eq("id", event_id).single().execute()
@@ -98,12 +115,14 @@ def update_event(event_id: str, body: EventUpdate, user=Depends(verify_token)):
 
 @router.delete("/events/{event_id}")
 def delete_event(event_id: str, user=Depends(verify_token)):
+    _require_role_for_event(user.id, event_id)
     supabase.table("events").delete().eq("id", event_id).execute()
     return {"status": "deleted"}
 
 
 @router.get("/events/{event_id}/registrations")
 def list_registrations(event_id: str, user=Depends(verify_token)):
+    _require_role_for_event(user.id, event_id)
     res = supabase.table("event_registrations") \
         .select("*") \
         .eq("event_id", event_id) \
@@ -114,6 +133,7 @@ def list_registrations(event_id: str, user=Depends(verify_token)):
 
 @router.put("/events/registrations/{registration_id}")
 def update_registration(registration_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_registration(user.id, registration_id)
     status = data.get("status")
     if status == "cancelled":
         try:

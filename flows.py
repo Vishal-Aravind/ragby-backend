@@ -9,9 +9,9 @@ Interactive Message Flows for WhatsApp
 import sentry_sdk
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN, FRONTEND_URL
 from whatsapp import (
     send_whatsapp_message,
@@ -960,8 +960,32 @@ def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
 # -------------------------------------------------
 # FLOW CRUD API
 # -------------------------------------------------
+def _require_role_for_flow(user_id: str, flow_id: str):
+    res = supabase.table("flows").select("project_id").eq("id", flow_id).maybe_single().execute()
+    flow = res.data if res else None
+    if not flow:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, flow["project_id"])
+    return flow["project_id"]
+
+def _require_role_for_node(user_id: str, node_id: str):
+    res = supabase.table("flow_nodes").select("flow_id").eq("id", node_id).maybe_single().execute()
+    node = res.data if res else None
+    if not node:
+        raise HTTPException(status_code=404, detail="Not found")
+    _require_role_for_flow(user_id, node["flow_id"])
+
+def _require_role_for_edge(user_id: str, edge_id: str):
+    res = supabase.table("flow_edges").select("flow_id").eq("id", edge_id).maybe_single().execute()
+    edge = res.data if res else None
+    if not edge:
+        raise HTTPException(status_code=404, detail="Not found")
+    _require_role_for_flow(user_id, edge["flow_id"])
+
+
 @router.get("/flows")
 def list_flows(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("flows") \
         .select("id, name, is_active, trigger_keywords, free_questions, created_at") \
         .eq("project_id", project_id) \
@@ -972,6 +996,7 @@ def list_flows(project_id: str, user=Depends(verify_token)):
 
 @router.post("/flows")
 def create_flow(data: dict, user=Depends(verify_token)):
+    require_project_role(user.id, data["project_id"])
     res = supabase.table("flows").insert({
         "project_id": data["project_id"],
         "name": data["name"],
@@ -984,6 +1009,7 @@ def create_flow(data: dict, user=Depends(verify_token)):
 
 @router.put("/flows/{flow_id}")
 def update_flow(flow_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     update = {}
     if "name" in data: update["name"] = data["name"]
     if "is_active" in data: update["is_active"] = data["is_active"]
@@ -1005,12 +1031,14 @@ def update_flow(flow_id: str, data: dict, user=Depends(verify_token)):
 
 @router.delete("/flows/{flow_id}")
 def delete_flow(flow_id: str, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     supabase.table("flows").delete().eq("id", flow_id).execute()
     return {"status": "deleted"}
 
 
 @router.get("/flows/{flow_id}/nodes")
 def get_flow_nodes(flow_id: str, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     nodes = supabase.table("flow_nodes").select("*").eq("flow_id", flow_id).order("created_at").execute()
     edges = supabase.table("flow_edges").select("*").eq("flow_id", flow_id).execute()
     return {"nodes": nodes.data, "edges": edges.data}
@@ -1018,6 +1046,7 @@ def get_flow_nodes(flow_id: str, user=Depends(verify_token)):
 
 @router.post("/flows/{flow_id}/nodes")
 def create_node(flow_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     res = supabase.table("flow_nodes").insert({
         "flow_id": flow_id,
         "type": data["type"],
@@ -1029,6 +1058,7 @@ def create_node(flow_id: str, data: dict, user=Depends(verify_token)):
 
 @router.put("/flows/nodes/{node_id}")
 def update_node(node_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_node(user.id, node_id)
     update = {}
     if "type" in data: update["type"] = data["type"]
     if "content" in data: update["content"] = data["content"]
@@ -1039,12 +1069,14 @@ def update_node(node_id: str, data: dict, user=Depends(verify_token)):
 
 @router.delete("/flows/nodes/{node_id}")
 def delete_node(node_id: str, user=Depends(verify_token)):
+    _require_role_for_node(user.id, node_id)
     supabase.table("flow_nodes").delete().eq("id", node_id).execute()
     return {"status": "deleted"}
 
 
 @router.post("/flows/{flow_id}/edges")
 def create_edge(flow_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     res = supabase.table("flow_edges").insert({
         "flow_id": flow_id,
         "from_node_id": data["from_node_id"],
@@ -1056,12 +1088,14 @@ def create_edge(flow_id: str, data: dict, user=Depends(verify_token)):
 
 @router.delete("/flows/edges/{edge_id}")
 def delete_edge(edge_id: str, user=Depends(verify_token)):
+    _require_role_for_edge(user.id, edge_id)
     supabase.table("flow_edges").delete().eq("id", edge_id).execute()
     return {"status": "deleted"}
 
 
 @router.post("/flows/{flow_id}/sync")
 def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
+    _require_role_for_flow(user.id, flow_id)
     import uuid as uuid_lib
 
     nodes = data.get("nodes", [])

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 
 router = APIRouter()
 
@@ -71,6 +71,7 @@ class LeadConfigRequest(BaseModel):
 
 @router.put("/lead-config")
 def save_lead_config(req: LeadConfigRequest, user=Depends(verify_token)):
+    require_project_role(user.id, req.projectId)
     supabase.table("lead_capture_config").upsert({
         "project_id": req.projectId,
         "enabled": req.enabled,
@@ -83,6 +84,7 @@ def save_lead_config(req: LeadConfigRequest, user=Depends(verify_token)):
 
 @router.get("/leads")
 def get_leads(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("leads") \
         .select("*") \
         .eq("project_id", project_id) \
@@ -97,6 +99,11 @@ class LeadTagsUpdate(BaseModel):
 
 @router.put("/leads/{lead_id}")
 def update_lead_tags(lead_id: str, req: LeadTagsUpdate, user=Depends(verify_token)):
+    existing = supabase.table("leads").select("project_id").eq("id", lead_id).maybe_single().execute()
+    lead = existing.data if existing else None
+    if not lead:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user.id, lead["project_id"])
     # Normalize: trim, lowercase, drop empties, dedupe — "VIP" and "vip" must
     # collapse into one tag, or campaign tag filtering silently misses people.
     clean_tags = sorted(set(t.strip().lower() for t in req.tags if t.strip()))

@@ -1,7 +1,7 @@
 import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from whatsapp import send_whatsapp_message
 
 router = APIRouter()
@@ -33,6 +33,7 @@ def get_project_by_key(api_key: str):
 # -------------------------------------------------
 @router.get("/api-keys/{project_id}")
 def get_api_key(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("api_keys") \
         .select("id, key, name, created_at, last_used_at") \
         .eq("project_id", project_id) \
@@ -53,6 +54,7 @@ def get_api_key(project_id: str, user=Depends(verify_token)):
 
 @router.post("/api-keys/{project_id}/regenerate")
 def regenerate_api_key(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     key = generate_key()
     existing = supabase.table("api_keys") \
         .select("id") \

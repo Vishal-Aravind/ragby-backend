@@ -18,6 +18,40 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(bearer_sch
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
+def get_project_role(user_id: str, project_id: str):
+    """Returns "owner" | "admin" | "agent" | None for a given user + project.
+    Mirrors src/lib/supabase-api.js's getProjectRole — the `supabase` client
+    here already uses the service-role key, so this bypasses RLS on purpose
+    (it only reads ownership/membership rows, never project content)."""
+    if not project_id:
+        return None
+    project = supabase.table("projects").select("user_id").eq("id", project_id).maybe_single().execute()
+    project_data = project.data if project else None
+    if not project_data:
+        return None
+    if project_data["user_id"] == user_id:
+        return "owner"
+    member = (
+        supabase.table("project_members")
+        .select("role")
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .eq("status", "active")
+        .maybe_single()
+        .execute()
+    )
+    member_data = member.data if member else None
+    return member_data["role"] if member_data else None
+
+
+def require_project_role(user_id: str, project_id: str):
+    """Raises 403 if the user has no role on the project; otherwise returns the role."""
+    role = get_project_role(user_id, project_id)
+    if not role:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return role
+
+
 # -------------------------------------------------
 # LOGIN/SIGNUP BRUTE-FORCE PROTECTION
 # -------------------------------------------------

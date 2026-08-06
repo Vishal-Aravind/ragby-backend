@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from ratelimit import is_rate_limited
 from shopify_client import graphql as shopify_graphql
 import os
@@ -163,6 +163,7 @@ def get_active_catalog_summary(project_id: str) -> list:
 
 @router.get("/shop-config/{project_id}")
 async def get_shop_config(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         return {
@@ -185,6 +186,7 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
 
 @router.put("/shop-config/{project_id}")
 async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
     update = {k: v for k, v in body.dict().items() if v is not None}
     if existing and existing.data:
@@ -201,11 +203,13 @@ async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depen
 
 @router.get("/catalogs")
 async def list_catalogs(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("catalogs").select("*").eq("project_id", project_id).order("created_at", desc=False).execute()
     return res.data or []
 
 @router.post("/catalogs")
 async def create_catalog(body: CatalogCreate, user=Depends(verify_token)):
+    require_project_role(user.id, body.project_id)
     supabase.table("catalogs").insert({
         "project_id": body.project_id,
         "name": body.name,
@@ -215,8 +219,16 @@ async def create_catalog(body: CatalogCreate, user=Depends(verify_token)):
     res = supabase.table("catalogs").select("*").eq("project_id", body.project_id).order("created_at", desc=True).limit(1).execute()
     return res.data[0]
 
+def _require_role_for_catalog(user_id: str, catalog_id: str):
+    res = supabase.table("catalogs").select("project_id").eq("id", catalog_id).maybe_single().execute()
+    catalog = res.data if res else None
+    if not catalog:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, catalog["project_id"])
+
 @router.put("/catalogs/{catalog_id}")
 async def update_catalog(catalog_id: str, body: CatalogUpdate, user=Depends(verify_token)):
+    _require_role_for_catalog(user.id, catalog_id)
     update = {k: v for k, v in body.dict().items() if v is not None}
     supabase.table("catalogs").update(update).eq("id", catalog_id).execute()
     res = supabase.table("catalogs").select("*").eq("id", catalog_id).single().execute()
@@ -224,6 +236,7 @@ async def update_catalog(catalog_id: str, body: CatalogUpdate, user=Depends(veri
 
 @router.delete("/catalogs/{catalog_id}")
 async def delete_catalog(catalog_id: str, user=Depends(verify_token)):
+    _require_role_for_catalog(user.id, catalog_id)
     supabase.table("catalogs").delete().eq("id", catalog_id).execute()
     return {"status": "deleted"}
 
@@ -234,6 +247,7 @@ async def delete_catalog(catalog_id: str, user=Depends(verify_token)):
 
 @router.get("/products")
 async def list_products(project_id: str, catalog_id: Optional[str] = None, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     query = supabase.table("products").select("*").eq("project_id", project_id)
     if catalog_id:
         query = query.eq("catalog_id", catalog_id)
@@ -242,6 +256,7 @@ async def list_products(project_id: str, catalog_id: Optional[str] = None, user=
 
 @router.post("/products")
 async def create_product(body: ProductCreate, user=Depends(verify_token)):
+    require_project_role(user.id, body.project_id)
     supabase.table("products").insert({
         "project_id": body.project_id,
         "catalog_id": body.catalog_id,
@@ -257,8 +272,16 @@ async def create_product(body: ProductCreate, user=Depends(verify_token)):
     res = supabase.table("products").select("*").eq("project_id", body.project_id).eq("catalog_id", body.catalog_id).order("created_at", desc=True).limit(1).execute()
     return res.data[0]
 
+def _require_role_for_product(user_id: str, product_id: str):
+    res = supabase.table("products").select("project_id").eq("id", product_id).maybe_single().execute()
+    product = res.data if res else None
+    if not product:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, product["project_id"])
+
 @router.put("/products/{product_id}")
 async def update_product(product_id: str, body: ProductUpdate, user=Depends(verify_token)):
+    _require_role_for_product(user.id, product_id)
     update = {k: v for k, v in body.dict().items() if v is not None}
     supabase.table("products").update(update).eq("id", product_id).execute()
     res = supabase.table("products").select("*").eq("id", product_id).single().execute()
@@ -266,6 +289,7 @@ async def update_product(product_id: str, body: ProductUpdate, user=Depends(veri
 
 @router.delete("/products/{product_id}")
 async def delete_product(product_id: str, user=Depends(verify_token)):
+    _require_role_for_product(user.id, product_id)
     supabase.table("products").delete().eq("id", product_id).execute()
     return {"status": "deleted"}
 
@@ -542,11 +566,17 @@ async def submit_cart(body: CartSubmit, request: Request):
 
 @router.get("/orders")
 async def list_orders(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("orders").select("*").eq("project_id", project_id).order("created_at", desc=True).execute()
     return res.data or []
 
 @router.put("/orders/{order_id}")
 async def update_order(order_id: str, body: OrderStatusUpdate, user=Depends(verify_token)):
+    existing = supabase.table("orders").select("project_id").eq("id", order_id).maybe_single().execute()
+    order = existing.data if existing else None
+    if not order:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user.id, order["project_id"])
     update = {k: v for k, v in body.dict().items() if v is not None}
     supabase.table("orders").update(update).eq("id", order_id).execute()
     res = supabase.table("orders").select("*").eq("id", order_id).single().execute()

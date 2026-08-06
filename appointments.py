@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN, FRONTEND_URL
 from ratelimit import is_rate_limited
 import os
@@ -217,6 +217,7 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
 @router.get("/appointments/google/auth/{project_id}")
 def google_auth(project_id: str, user=Depends(verify_token)):
     """Start Google OAuth flow for calendar access."""
+    require_project_role(user.id, project_id)
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to env vars.")
 
@@ -280,6 +281,7 @@ def google_callback(code: str, state: str):
 
 @router.delete("/appointments/google/disconnect/{project_id}")
 def google_disconnect(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     supabase.table("appointment_settings").update({
         "google_refresh_token": None,
         "google_calendar_id": "primary",
@@ -292,6 +294,7 @@ def google_disconnect(project_id: str, user=Depends(verify_token)):
 # -------------------------------------------------
 @router.get("/appointment-settings/{project_id}")
 def get_settings(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         return {
@@ -325,6 +328,7 @@ def get_settings(project_id: str, user=Depends(verify_token)):
 
 @router.put("/appointment-settings/{project_id}")
 def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     update = {k: v for k, v in body.dict().items() if v is not None}
     existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
     if existing and existing.data:
@@ -581,6 +585,7 @@ def book_appointment(body: BookingCreate, request: Request):
 # -------------------------------------------------
 @router.get("/appointments")
 def list_appointments(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("appointments") \
         .select("*") \
         .eq("project_id", project_id) \
@@ -657,6 +662,11 @@ def cancel_appointment(appointment_id: str, notify_customer: bool = True) -> dic
 
 @router.put("/appointments/{appointment_id}")
 def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=Depends(verify_token)):
+    appt_check = supabase.table("appointments").select("project_id").eq("id", appointment_id).maybe_single().execute()
+    appt_data = appt_check.data if appt_check else None
+    if not appt_data:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user.id, appt_data["project_id"])
     if body.status == "cancelled":
         try:
             return cancel_appointment(appointment_id, notify_customer=True)

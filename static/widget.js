@@ -7,11 +7,33 @@
 
   const apiBase = new URL(script.src).origin;
 
-  // Session-based userId
+  // Session-based userId — used only for lead-capture dedup (see
+  // /public/leads below), NOT the actual conversation session.
   let userId = localStorage.getItem("rag_user_id");
   if (!userId) {
     userId = crypto.randomUUID();
     localStorage.setItem("rag_user_id", userId);
+  }
+
+  // FIX: this widget used to send `userId` as if it were the chat session,
+  // but the backend's /public/chat only ever recognizes a field called
+  // `sessionId` — the mismatch meant every single message silently started
+  // a brand-new, memoryless chat. Persisted here the same way
+  // PublicChatClient.js's shareable-link chat already does (3-hour TTL),
+  // and sent back on every call from here on.
+  const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
+  let sessionId = null;
+  try {
+    const stored = JSON.parse(localStorage.getItem(`chat_session_${projectId}`) || "null");
+    if (stored && stored.expiresAt > Date.now()) sessionId = stored.value;
+  } catch (e) {}
+
+  function saveSessionId(id) {
+    sessionId = id;
+    localStorage.setItem(`chat_session_${projectId}`, JSON.stringify({
+      value: id,
+      expiresAt: Date.now() + SESSION_TTL_MS,
+    }));
   }
 
   // Lead state
@@ -25,11 +47,17 @@
 
   const history = [];
 
+  const URL_RE = /(https?:\/\/[^\s<]+)/g;
+
   function render(text) {
-    return (text || "")
+    const escaped = (text || "")
       .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/\n/g, "<br/>");
+      .replace(/>/g, "&gt;");
+    // Auto-linkify so a checkout/shop link the bot relays is actually
+    // tappable — this widget only ever renders plain escaped text, unlike
+    // WhatsApp, which auto-links URLs on its own.
+    const linked = escaped.replace(URL_RE, url => `<a href="${url}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:underline">${url}</a>`);
+    return linked.replace(/\n/g, "<br/>");
   }
 
   // ---------------- FETCH LEAD CONFIG ----------------
@@ -41,6 +69,23 @@
     } catch (e) {
       leadConfig = null;
     }
+  }
+
+  // ---------------- RESTORE HISTORY ----------------
+  // Redraws earlier messages from this session so the widget's screen
+  // matches what the bot actually remembers (see sessionId persistence
+  // above) — without this, reopening the bubble or reloading the page
+  // showed an empty box even though the backend recalled everything.
+  async function restoreHistory() {
+    if (!sessionId) return;
+    try {
+      const res = await fetch(`${apiBase}/public/chat/history/${sessionId}`);
+      const data = await res.json();
+      for (const m of (data.messages || [])) {
+        addMsg(m.role === "user" ? "user" : "assistant", render(m.content || ""));
+      }
+      if (data.messages && data.messages.length) userMessageCount = data.messages.filter(m => m.role === "user").length;
+    } catch (e) {}
   }
 
   // ---------------- UI ----------------
@@ -79,8 +124,18 @@
   `;
   document.body.appendChild(box);
 
+  let hasOpened = false;
   btn.onclick = () => {
     box.style.display = box.style.display === "none" ? "flex" : "none";
+    // Shown once, the first time the widget is opened — gives the visitor
+    // a hint of what to ask instead of a blank box. Skipped if earlier
+    // messages were just restored (see restoreHistory below), and not
+    // shown again on later opens/closes so it doesn't repeat above real
+    // conversation.
+    if (!hasOpened && box.style.display === "flex" && !msgs.children.length) {
+      addMsg("assistant", "👋 Hi! Ask me anything — I'm here to help.");
+    }
+    hasOpened = true;
   };
 
   const msgs = box.querySelector("#msgs");
@@ -113,9 +168,9 @@
     return el;
   }
 
-  function blockInput() {
+  function blockInput(placeholder) {
     input.disabled = true;
-    input.placeholder = "Please fill the form to continue...";
+    input.placeholder = placeholder || "Please fill the form to continue...";
     sendBtn.disabled = true;
     sendBtn.style.opacity = "0.5";
   }
@@ -262,20 +317,37 @@
   // ---------------- ASK BOT ----------------
   async function askBot(question) {
     const typing = showTyping();
+    // Disabled while waiting on a reply — previously a visitor could fire
+    // off several messages before the first response landed, and since
+    // requests can resolve out of order, replies could show up in a
+    // different order than the questions were asked.
+    blockInput("Waiting for reply...");
 
-    const res = await fetch(`${apiBase}/public/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        projectId,
-        message: question,
-        userId,
-      }),
-    });
+    // FIX: previously had no error handling at all — a network failure or
+    // non-2xx response left the "..." typing indicator stuck forever with
+    // no message and no way to retry, since res.json() would throw and the
+    // rejection was never caught.
+    try {
+      const res = await fetch(`${apiBase}/public/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId,
+          message: question,
+          sessionId,
+        }),
+      });
 
-    const data = await res.json();
-    typing.remove();
-    addMsg("assistant", render(data.answer || ""));
+      const data = await res.json();
+      typing.remove();
+      if (data.sessionId) saveSessionId(data.sessionId);
+      addMsg("assistant", render(data.answer || "Sorry, something went wrong. Please try again."));
+    } catch (e) {
+      typing.remove();
+      addMsg("assistant", "Sorry, something went wrong. Please try again.");
+    } finally {
+      if (!awaitingLead) unblockInput();
+    }
   }
 
   // ---------------- FORM SUBMIT ----------------
@@ -303,4 +375,5 @@
 
   // ---------------- INIT ----------------
   fetchLeadConfig();
+  restoreHistory();
 })();

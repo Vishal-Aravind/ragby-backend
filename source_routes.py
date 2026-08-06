@@ -4,7 +4,7 @@ from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
-from auth import verify_token
+from auth import verify_token, require_project_role
 from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
@@ -16,6 +16,7 @@ router = APIRouter()
 
 @router.get("/sources")
 def list_sources(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("data_sources") \
         .select("*") \
         .eq("project_id", project_id) \
@@ -25,6 +26,7 @@ def list_sources(project_id: str, user=Depends(verify_token)):
 
 @router.post("/sources/add")
 def add_source(data: dict, user=Depends(verify_token)):
+    require_project_role(user.id, data["projectId"])
     res = supabase.table("data_sources").insert({
         "project_id": data["projectId"],
         "type": data["type"],
@@ -95,8 +97,16 @@ def add_source(data: dict, user=Depends(verify_token)):
     return {"id": source["id"], "skipped_tabs": skipped_tabs}
 
 
+def _require_role_for_source(user_id: str, source_id: str):
+    res = supabase.table("data_sources").select("project_id").eq("id", source_id).maybe_single().execute()
+    source = res.data if res else None
+    if not source:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, source["project_id"])
+
 @router.delete("/sources/{source_id}")
 def delete_source(source_id: str, user=Depends(verify_token)):
+    _require_role_for_source(user.id, source_id)
     qdrant.delete(
         collection_name=QDRANT_COLLECTION,
         points_selector=models.Filter(
@@ -112,6 +122,7 @@ def delete_source(source_id: str, user=Depends(verify_token)):
 
 @router.post("/sources/sync/{source_id}")
 def resync_source(source_id: str, user=Depends(verify_token)):
+    _require_role_for_source(user.id, source_id)
     res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
     s = res.data
 
@@ -195,6 +206,7 @@ async def upload_excel(
     source_id: str = Form(""),
     user=Depends(verify_token)
 ):
+    require_project_role(user.id, projectId)
     file_bytes = await file.read()
 
     if source_id:

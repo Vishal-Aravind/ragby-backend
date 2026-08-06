@@ -38,6 +38,12 @@ class PublicChatRequest(BaseModel):
     projectId: str
     message: str
     sessionId: Optional[str] = None
+    # Only ever "shopify" (the storefront widget extension) today — anything
+    # else falls back to the generic "public" channel. Whitelisted rather
+    # than trusted as free text at the one place it's consumed below, since
+    # this string directly controls which paid tools (e.g. SHOPIFY_CART_TOOLS)
+    # get offered to the model for this conversation.
+    channel: Optional[str] = None
 
 class VerifyPasswordRequest(BaseModel):
     projectId: str
@@ -252,6 +258,47 @@ SHOP_ORDER_TOOLS = [
                         },
                     },
                     "delivery_type": {"type": "string", "description": "One of the store's delivery options, only if the customer specified one"},
+                },
+                "required": ["items"],
+            },
+        },
+    },
+]
+
+# Only ever added to active_tools when channel == "shopify" (see run_chat) —
+# the Shopify storefront widget's checkout hands off to Shopify's own
+# hosted checkout via a real Storefront API cart, NOT Razorpay — Shopify's
+# API License prohibits an app-hosted alternative to Shopify Checkout on a
+# merchant's own storefront. This is why it's a separate tool set from
+# SHOP_ORDER_TOOLS rather than that tool simply being allowed on more
+# channels — the two have genuinely different completion mechanisms.
+SHOPIFY_CART_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_shopify_checkout_link",
+            "description": (
+                "Create a real Shopify checkout link for items the customer has explicitly confirmed. Always "
+                "call browse_shop_catalog first if you haven't already, so item names are accurate. Read back "
+                "the exact items and quantities and get the customer's explicit yes BEFORE calling this — never "
+                "call it on a first mention of wanting to buy. You cannot take payment yourself in this chat — "
+                "after this runs, ALWAYS include the exact checkout_url it returns verbatim in your reply, and "
+                "tell the customer to tap it to enter their address and pay securely on the store's own checkout."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_name": {"type": "string", "description": "Exact product name as shown by browse_shop_catalog"},
+                                "quantity": {"type": "integer"},
+                            },
+                            "required": ["product_name", "quantity"],
+                        },
+                    },
                 },
                 "required": ["items"],
             },
@@ -665,17 +712,39 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
         return {"error": "Something went wrong trying to do that — please try again."}
 
 
-def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
+def execute_shopify_cart_tool(name: str, args: dict, project_id: str, channel: str, chat_id: str) -> dict:
+    try:
+        if name == "get_shopify_checkout_link":
+            # Belt-and-suspenders: only ever reachable when channel ==
+            # "shopify" (see run_chat's tool-list construction), but never
+            # trust that alone — re-check here too, mirroring place_order's
+            # own WhatsApp-only re-check.
+            if channel != "shopify":
+                return {"error": "Checkout links are only available on the Shopify storefront widget."}
+            from shopify_storefront import create_checkout_from_chat
+            return create_checkout_from_chat(project_id, chat_id, args["items"])
+        return {"error": f"Unknown tool {name}"}
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"execute_shopify_cart_tool error: {e}")
+        return {"error": "Something went wrong trying to build that checkout — please try again."}
+
+
+def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str, chat_id: str = None) -> dict:
     if name in ("check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
         return execute_appointment_tool(name, args, project_id, channel, external_id)
     if name in ("check_order_status", "browse_shop_catalog", "place_order"):
         return execute_shop_tool(name, args, project_id, channel, external_id)
     if name in ("browse_upcoming_events", "get_event_registration_link", "check_my_event_registrations", "cancel_event_registration"):
         return execute_event_tool(name, args, project_id, channel, external_id)
+    if name == "get_shopify_checkout_link":
+        return execute_shopify_cart_tool(name, args, project_id, channel, chat_id)
     return {"error": f"Unknown tool {name}"}
 
 
-def run_completion(messages: list, tools: list, project_id: str, channel: str, external_id: str, temperature: float, max_tokens: int) -> str:
+def run_completion(messages: list, tools: list, project_id: str, channel: str, external_id: str, temperature: float, max_tokens: int, chat_id: str = None) -> str:
     """Runs one OpenAI completion, transparently looping through any tool
     calls the model makes (max 3 rounds — a real conversation never needs
     more than that, and it caps the blast radius of a runaway loop)."""
@@ -700,7 +769,7 @@ def run_completion(messages: list, tools: list, project_id: str, channel: str, e
         for tc in msg.tool_calls:
             import json as _json
             args = _json.loads(tc.function.arguments or "{}")
-            result = execute_tool(tc.function.name, args, project_id, channel, external_id)
+            result = execute_tool(tc.function.name, args, project_id, channel, external_id, chat_id)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -856,14 +925,40 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         shop_settings = get_shop_settings_if_assistable(project_id)
         if shop_settings:
             active_tools += SHOP_READONLY_TOOLS
-            system_prompt += (
-                "\n\nShop:\n"
-                "- You can look up the customer's own past orders and browse the product catalog using the "
-                "tools provided.\n"
+            is_shopify_widget = channel == "shopify"
+
+            # On every other channel, "send them the shop_link" makes sense —
+            # it points to Ragby's own richer browsing page. On the Shopify
+            # widget specifically, that link is a SEPARATE, unbranded Ragby
+            # page — the customer is already on the merchant's real store, so
+            # deflecting them to it would be actively worse UX, not better.
+            browse_guidance = (
+                "- If the customer asks broadly what you sell, to see the menu, or to browse, call "
+                "browse_shop_catalog and recommend a few real items directly in this chat — the customer is "
+                "already on the store's own website, so don't send them a separate shop link, just talk them "
+                "through real options here.\n"
+            ) if is_shopify_widget else (
                 "- If the customer asks broadly what you sell, to see the menu, or to browse (no specific "
                 "product or preference stated), call browse_shop_catalog and just send them the shop_link — "
                 "don't enumerate every item in chat text, the real shop page is a much better browsing "
                 "experience (photos, categories, cart).\n"
+            )
+            fallback_guidance = (
+                "suggest the closest real items instead — never invent a plausible-sounding item, side dish, "
+                "or variant (like a rice or bread that isn't actually listed) just because it would logically "
+                "fit the request. Making up something that sounds right is worse than admitting you don't have it.\n"
+            ) if is_shopify_widget else (
+                "suggest the closest real items instead, or point them to shop_link — never invent a plausible-"
+                "sounding item, side dish, or variant (like a rice or bread that isn't actually listed) just "
+                "because it would logically fit the request. Making up something that sounds right is worse "
+                "than admitting you don't have it.\n"
+            )
+
+            system_prompt += (
+                "\n\nShop:\n"
+                "- You can look up the customer's own past orders and browse the product catalog using the "
+                "tools provided.\n"
+                + browse_guidance +
                 "- If the customer asks about a specific product, or wants a recommendation with any stated "
                 "preference (budget, dietary need, occasion, 'what's cheapest', 'what's good for X'), call "
                 "browse_shop_catalog and answer directly using its product data — recommend by name and price, "
@@ -871,10 +966,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "- CRITICAL: only ever mention products that are LITERALLY in that result's product list, by "
                 "their exact name. If nothing in the list is a good match for what the customer asked (e.g. "
                 "they want 'something plain' but nothing there is described as plain), say so honestly and "
-                "suggest the closest real items instead, or point them to shop_link — never invent a plausible-"
-                "sounding item, side dish, or variant (like a rice or bread that isn't actually listed) just "
-                "because it would logically fit the request. Making up something that sounds right is worse "
-                "than admitting you don't have it.\n"
+                + fallback_guidance +
                 "- Keep any single recommendation reply to at most 3-5 items even if more match — offer to "
                 "share more if they want.\n"
                 "- If a recommendation request is genuinely vague (just 'what's good?' with no stated "
@@ -887,6 +979,21 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     "\n- You can also place a new order once the customer has explicitly confirmed the exact "
                     "items, quantities, and total price — always check the catalog and read the order back "
                     "to them first, never guess or assume what they want."
+                )
+            elif shop_settings.get("bot_can_order") and channel == "shopify":
+                active_tools += SHOPIFY_CART_TOOLS
+                system_prompt += (
+                    "\n- You can also generate a real Shopify checkout link once the customer has explicitly "
+                    "confirmed the exact items and quantities — never guess or assume what they want. You "
+                    "cannot take payment yourself in this chat; after calling get_shopify_checkout_link, ALWAYS "
+                    "include the exact checkout_url it returns verbatim in your reply, since that link is how "
+                    "the customer actually pays."
+                )
+            elif is_shopify_widget:
+                system_prompt += (
+                    "\n- Checkout link generation isn't turned on for this store yet — you cannot generate one. "
+                    "If the customer wants to buy, let them know they can add items to their cart and check out "
+                    "directly on this site once it's enabled."
                 )
             else:
                 system_prompt += (
@@ -948,7 +1055,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 messages.append({"role": h["role"], "content": h["content"]})
             messages.append({"role": "user", "content": message})
 
-            answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.3, max_tokens=500)
+            answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.3, max_tokens=500, chat_id=chat_id)
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
@@ -1029,7 +1136,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             "content": f"Context:\n{context or '(none — this may be a booking/order/catalog request rather than a document question)'}\n\nQuestion:\n{message}"
         })
 
-        answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.2, max_tokens=300)
+        answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.2, max_tokens=300, chat_id=chat_id)
         save_message(chat_id, "assistant", answer)
         return {"answer": answer, "sources": []}
 
@@ -1075,6 +1182,25 @@ def verify_chat_password(req: VerifyPasswordRequest, request: Request):
     return {"success": True}
 
 
+@router.get("/public/chat/history/{session_id}")
+def public_chat_history(session_id: str):
+    """Used by widget.js to redraw a visitor's earlier messages when they
+    reopen the chat bubble or reload the page — the backend already recalls
+    the conversation via session_id (see get_history in run_chat below), but
+    without this the widget UI showed an empty box every time, looking like
+    a fresh conversation even though the bot actually remembered everything.
+    Unauthenticated by design, same trust model as the existing
+    /api/chat/public/history Next.js route — session_id is an unguessable
+    UUID held client-side, not a resource anyone can enumerate."""
+    try:
+        return {"messages": get_history(session_id, limit=30)}
+    except Exception:
+        # A malformed session_id (not a real UUID) would otherwise 500 here
+        # — fail soft into "no history" instead, since this only ever
+        # affects how much gets redrawn on screen, not anything functional.
+        return {"messages": []}
+
+
 @router.post("/public/chat")
 def public_chat(req: PublicChatRequest, request: Request):
     visitor_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
@@ -1092,15 +1218,21 @@ def public_chat(req: PublicChatRequest, request: Request):
             "id": session_id,
             "project_id": req.projectId,
             "title": "Public Chat",
-            "channel": "public",
+            "channel": "shopify" if req.channel == "shopify" else "public",
         }).execute()
 
     rate_check = check_rate_limit(req.projectId)
     if not rate_check["allowed"]:
-        return {
-            "answer": "Sorry, this assistant has reached its monthly limit. Please try again next month.",
-            "sessionId": session_id,
-        }
+        # FIX: previously always showed the "monthly limit reached" message
+        # even when the real reason was "Project not found" (e.g. a stale
+        # widget embed left on a merchant's site after they delete the
+        # project) — genuinely confusing for whoever's staring at the chat.
+        answer = (
+            "Sorry, this assistant has reached its monthly limit. Please try again next month."
+            if rate_check.get("reason") != "Project not found"
+            else "This assistant isn't available right now."
+        )
+        return {"answer": answer, "sessionId": session_id}
 
     history = get_history(session_id, limit=7) if req.sessionId else []
     result = run_chat(req.projectId, session_id, req.message, history)

@@ -4,7 +4,7 @@ import sentry_sdk
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN
 
 router = APIRouter()
@@ -16,6 +16,7 @@ router = APIRouter()
 @router.get("/campaigns/templates")
 def get_templates(project_id: str, user=Depends(verify_token)):
     """Fetch approved templates from Meta for this project's WABA."""
+    require_project_role(user.id, project_id)
     import requests
 
     wa = supabase.table("whatsapp_integrations") \
@@ -125,6 +126,7 @@ def _parse_and_validate_schedule(scheduled_at, recurrence, recipient_filter):
 @router.post("/campaigns")
 async def create_campaign(data: dict, background_tasks: BackgroundTasks, user=Depends(verify_token)):
     project_id     = data["project_id"]
+    require_project_role(user.id, project_id)
     name           = data["name"]
     template_name  = data["template_name"]
     template_lang  = data.get("template_language", "en_US")
@@ -198,6 +200,7 @@ def update_campaign(campaign_id: str, data: dict, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail="Only scheduled campaigns can be edited")
 
     project_id = existing.data["project_id"]
+    require_project_role(user.id, project_id)
     name           = data["name"]
     template_name  = data["template_name"]
     template_lang  = data.get("template_language", "en_US")
@@ -371,8 +374,11 @@ def dispatch_scheduled_campaigns():
 # -------------------------------------------------
 @router.post("/campaigns/{campaign_id}/cancel")
 def cancel_campaign(campaign_id: str, user=Depends(verify_token)):
-    camp = supabase.table("campaigns").select("status").eq("id", campaign_id).maybe_single().execute()
-    if not camp or not camp.data or camp.data["status"] != "scheduled":
+    camp = supabase.table("campaigns").select("status, project_id").eq("id", campaign_id).maybe_single().execute()
+    if not camp or not camp.data:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user.id, camp.data["project_id"])
+    if camp.data["status"] != "scheduled":
         raise HTTPException(status_code=400, detail="Only scheduled campaigns can be cancelled")
 
     supabase.table("campaigns").update({"status": "cancelled"}).eq("id", campaign_id).execute()
@@ -384,6 +390,7 @@ def cancel_campaign(campaign_id: str, user=Depends(verify_token)):
 # -------------------------------------------------
 @router.get("/campaigns")
 def list_campaigns(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("campaigns") \
         .select("*") \
         .eq("project_id", project_id) \

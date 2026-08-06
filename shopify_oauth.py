@@ -116,6 +116,11 @@ def register_webhooks(shop_domain: str, access_token: str):
     topics = [
         "PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE", "APP_UNINSTALLED",
         "CUSTOMERS_DATA_REQUEST", "CUSTOMERS_REDACT", "SHOP_REDACT",
+        # ORDERS_PAID — Piece 3: tells us when a shopper completes checkout
+        # on a cart the widget built, so we can reconcile it (see
+        # shopify_webhooks' "orders/paid" branch below) and let the widget
+        # confirm the purchase to the shopper on refocus.
+        "ORDERS_PAID",
     ]
     mutation = """
         mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
@@ -254,6 +259,16 @@ def shopify_oauth_callback(request: Request):
         print(f"Shopify currency sync error for {shop_domain}: {e}")
 
     try:
+        from shopify_storefront import mint_storefront_token
+        storefront_token = mint_storefront_token(shop_domain, access_token)
+        supabase.table("shopify_integrations").update({
+            "storefront_access_token": storefront_token,
+        }).eq("project_id", project_id).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Shopify Storefront token creation error for {shop_domain}: {e}")
+
+    try:
         _ensure_data_source_and_kick_off_sync(project_id, shop_domain)
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -328,6 +343,61 @@ async def shopify_webhooks(request: Request):
         elif topic == "app/uninstalled":
             supabase.table("shopify_integrations").delete().eq("project_id", project_id).execute()
 
+        elif topic == "orders/paid":
+            payload = json.loads(body_bytes)
+            note_attributes = payload.get("note_attributes") or []
+            chat_id = next((a.get("value") for a in note_attributes if a.get("name") == "ragby_chat_id"), None)
+            shopify_order_id = str(payload.get("id"))
+
+            if chat_id:
+                cart_session_res = supabase.table("shopify_cart_sessions") \
+                    .select("id").eq("chat_id", chat_id).eq("status", "open") \
+                    .order("created_at", desc=True).limit(1).execute()
+                cart_session = (cart_session_res.data or [None])[0]
+                if cart_session:
+                    from datetime import datetime, timezone
+                    supabase.table("shopify_cart_sessions").update({
+                        "status": "completed",
+                        "shopify_order_id": shopify_order_id,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", cart_session["id"]).execute()
+
+                # Best-effort reconciliation into `orders` for unified
+                # merchant reporting (same table Piece 2's WhatsApp orders
+                # use). Wrapped separately from the cart_session update
+                # above — the exact REST field shapes here are the
+                # least-verified part of this whole integration, and a
+                # failure here must never stop the widget's refocus check
+                # from seeing the completed cart_session, which is the part
+                # that actually matters to the shopper.
+                try:
+                    already = supabase.table("orders").select("id").eq("shopify_order_id", shopify_order_id).maybe_single().execute()
+                    if not already or not already.data:
+                        items_data = [{
+                            "name": li.get("name") or li.get("title"),
+                            "price": float(li.get("price") or 0),
+                            "quantity": li.get("quantity") or 1,
+                        } for li in (payload.get("line_items") or [])]
+                        phone = ((payload.get("customer") or {}).get("phone")) or payload.get("phone") or ""
+                        supabase.table("orders").insert({
+                            "project_id": project_id,
+                            "phone_number": phone.replace("+", "").replace(" ", ""),
+                            "items": items_data,
+                            "subtotal": float(payload.get("subtotal_price") or 0),
+                            "gst_amount": float(payload.get("total_tax") or 0),
+                            "total": float(payload.get("total_price") or 0),
+                            "status": "confirmed",
+                            "payment_status": "paid",
+                            "delivery_type": "Shopify Checkout",
+                            "shopify_order_id": shopify_order_id,
+                        }).execute()
+                except Exception as e:
+                    sentry_sdk.capture_exception(e)
+                    print(f"Shopify orders/paid → orders table reconciliation error: {e}")
+            # No ragby_chat_id attribute means this order didn't originate
+            # from our widget (a regular storefront sale, or the merchant's
+            # own POS/admin order) — nothing for us to reconcile.
+
         elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
             # Mandatory compliance topics — Piece 1 holds no customer PII,
             # nothing to act on.
@@ -338,3 +408,20 @@ async def shopify_webhooks(request: Request):
         print(f"Shopify webhook handler error (topic={topic}, shop={shop_domain}): {e}")
 
     return {"status": "ok"}
+
+
+@router.get("/public/shopify/cart-status/{chat_id}")
+def shopify_cart_status(chat_id: str):
+    """Polled by the storefront widget when the shopper's tab regains focus
+    after being sent to Shopify's checkout — no auth, matching the rest of
+    the /public/* surface. Looks up the most recent cart this conversation
+    built (there could be more than one if the shopper abandoned an earlier
+    one) rather than assuming exactly one ever exists per chat."""
+    res = supabase.table("shopify_cart_sessions") \
+        .select("status, checkout_url, shopify_order_id") \
+        .eq("chat_id", chat_id) \
+        .order("created_at", desc=True).limit(1).execute()
+    row = (res.data or [None])[0]
+    if not row:
+        return {"status": "none"}
+    return row
