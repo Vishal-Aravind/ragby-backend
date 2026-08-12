@@ -40,6 +40,19 @@ SHOPIFY_APP_SCOPES = os.getenv("SHOPIFY_APP_SCOPES", "read_products,read_invento
 SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", f"{BACKEND_PUBLIC_URL}/shopify/oauth/callback")
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 
+# Razorpay Technology Partner OAuth app credentials ("Connect with Razorpay"
+# flow, backend/razorpay_oauth.py) — distinct from shop.py's
+# RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET, which remain the deprecated-but-
+# still-supported manual per-merchant key fallback for shops that haven't
+# reconnected via OAuth yet.
+RAZORPAY_PARTNER_CLIENT_ID = os.getenv("RAZORPAY_PARTNER_CLIENT_ID", "")
+RAZORPAY_PARTNER_CLIENT_SECRET = os.getenv("RAZORPAY_PARTNER_CLIENT_SECRET", "")
+RAZORPAY_PARTNER_REDIRECT_URI = os.getenv("RAZORPAY_PARTNER_REDIRECT_URI", f"{BACKEND_PUBLIC_URL}/razorpay/oauth/callback")
+# One shared secret covering every connected sub-merchant account — Razorpay
+# Partner webhooks are configured once at the application level, not per
+# merchant (confirmed against Razorpay's Partner OAuth docs).
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 STRIPE_PRO_MONTHLY = os.getenv("STRIPE_PRO_MONTHLY")

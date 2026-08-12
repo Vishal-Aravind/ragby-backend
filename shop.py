@@ -6,6 +6,7 @@ from clients import supabase
 from auth import verify_token, require_project_role
 from ratelimit import is_rate_limited
 from shopify_client import graphql as shopify_graphql
+from config import RAZORPAY_WEBHOOK_SECRET
 import os
 import hmac
 import hashlib
@@ -15,6 +16,10 @@ import time
 router = APIRouter()
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ragby-frontend.vercel.app")
+# Legacy manual-key fallback — deprecated in favor of Razorpay Partner OAuth
+# (razorpay_oauth.py) but kept alive so shops that haven't reconnected yet,
+# and payment links created before cutover, keep working. See
+# generate_razorpay_link() and _candidate_webhook_secrets() below.
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 
@@ -587,6 +592,42 @@ async def update_order(order_id: str, body: OrderStatusUpdate, user=Depends(veri
 # RAZORPAY WEBHOOK
 # ─────────────────────────────────────────────
 
+def _candidate_webhook_secrets(project_id: str) -> list:
+    """Every secret worth trying to verify a webhook against, in preference
+    order: the shared Razorpay Partner-app secret (covers every OAuth-
+    connected merchant, one config for the whole app) first, then the
+    project's own legacy manual key_secret / global env fallback (covers
+    shops that haven't reconnected via OAuth yet). Trying both — instead of
+    picking one — is what lets OAuth-connected and legacy shops coexist
+    correctly during the transition."""
+    candidates = []
+    if RAZORPAY_WEBHOOK_SECRET:
+        candidates.append(RAZORPAY_WEBHOOK_SECRET)
+    try:
+        config_res = supabase.table("shop_config").select("razorpay_key_secret").eq("project_id", project_id).maybe_single().execute()
+        legacy_secret = ((config_res.data if config_res else None) or {}).get("razorpay_key_secret")
+    except Exception:
+        legacy_secret = None
+    legacy_secret = legacy_secret or RAZORPAY_KEY_SECRET
+    if legacy_secret:
+        candidates.append(legacy_secret)
+    return candidates
+
+
+def _verify_razorpay_signature(body_bytes: bytes, signature: str, project_id: str) -> bool:
+    """Fail-closed: no signature, no resolvable secret, or no matching
+    secret all mean 'reject'. Replaces the old `if key_secret and signature:`
+    check, which silently skipped verification entirely (and accepted the
+    payload unverified) whenever either side was empty."""
+    if not signature:
+        return False
+    for secret in _candidate_webhook_secrets(project_id):
+        expected = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return True
+    return False
+
+
 @router.post("/webhook/razorpay")
 async def razorpay_webhook(request: Request):
     from whatsapp import send_whatsapp_message
@@ -598,25 +639,47 @@ async def razorpay_webhook(request: Request):
     payload = json.loads(body_bytes)
     event = payload.get("event")
 
+    if event == "account.app.authorization_revoked":
+        # This event isn't tied to any order/project — only the shared
+        # Partner-app secret can possibly apply, since there's no per-
+        # project fallback to resolve without already knowing the account.
+        if not RAZORPAY_WEBHOOK_SECRET or not signature or not hmac.compare_digest(
+            hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest(), signature
+        ):
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        from razorpay_oauth import handle_authorization_revoked
+        handle_authorization_revoked(payload.get("account_id"))
+        return {"status": "ok"}
+
     if event == "payment_link.paid":
         payment_link_id = payload["payload"]["payment_link"]["entity"]["id"]
 
+        # Payment Link ids are Razorpay-global unique identifiers, so
+        # checking orders then appointments carries no collision risk.
         order_res = supabase.table("orders").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
-        if not order_res or not order_res.data:
+        order = order_res.data if order_res else None
+
+        if not order:
+            appt_res = supabase.table("appointments").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
+            appointment = appt_res.data if appt_res else None
+            if not appointment:
+                return {"status": "ok"}
+
+            if not _verify_razorpay_signature(body_bytes, signature, appointment["project_id"]):
+                raise HTTPException(status_code=400, detail="Invalid signature")
+
+            from appointments import handle_appointment_payment_paid
+            handle_appointment_payment_paid(appointment)
             return {"status": "ok"}
-        order = order_res.data
+
+        if not _verify_razorpay_signature(body_bytes, signature, order["project_id"]):
+            raise HTTPException(status_code=400, detail="Invalid signature")
 
         try:
             config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             config = (config_res.data if config_res else None) or {}
         except:
             config = {}
-
-        key_secret = config.get("razorpay_key_secret") or RAZORPAY_KEY_SECRET
-        if key_secret and signature:
-            expected = hmac.new(key_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(expected, signature):
-                raise HTTPException(status_code=400, detail="Invalid signature")
 
         currency = config.get("currency", "₹")
         store_phone = config.get("store_phone", "")
@@ -712,30 +775,48 @@ def _advance_flow_after_payment(project_id: str, phone: str, phone_number_id: st
 # ─────────────────────────────────────────────
 
 def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
+    """Prefers the project's Razorpay Partner OAuth connection; falls back
+    to the merchant's legacy manually-entered keys (or the global env-var
+    pair) if no OAuth connection exists yet — this is what lets shops keep
+    accepting payments uninterrupted while they migrate to OAuth."""
+    project_id = config.get("project_id") or order.get("project_id")
+    payload = {
+        "amount": int(order["total"] * 100),
+        # FIX: was hardcoded "INR" regardless of the store's real
+        # currency — harmless for every existing (INR-only) store, but
+        # would have silently charged a Shopify-sourced multi-currency
+        # catalog in the wrong currency. currency_code is a real
+        # ISO-4217 code; shop_config.currency is just a display symbol.
+        "currency": config.get("currency_code") or "INR",
+        "description": f"Order #{order['id'][:8].upper()}",
+        "customer": {"contact": f"+{order['phone_number']}"},
+        "notify": {"sms": False, "email": False},
+        "reminder_enable": False,
+        "expire_by": int(time.time()) + 5400,
+    }
+
     try:
-        import razorpay
+        link = None
 
-        key_id = config.get("razorpay_key_id") or RAZORPAY_KEY_ID
-        key_secret = config.get("razorpay_key_secret") or RAZORPAY_KEY_SECRET
+        if project_id:
+            from razorpay_oauth import _razorpay_api_request
+            try:
+                res = _razorpay_api_request("POST", "/payment_links", project_id, json=payload)
+                if res.status_code < 300:
+                    link = res.json()
+                else:
+                    sentry_sdk.capture_message(f"Razorpay OAuth payment_link.create failed ({res.status_code}) for project {project_id}: {res.text[:300]}")
+            except ValueError:
+                pass  # no OAuth connection for this project — fall through to legacy keys
 
-        if not key_id or not key_secret:
-            return None
-
-        client = razorpay.Client(auth=(key_id, key_secret))
-        link = client.payment_link.create({
-            "amount": int(order["total"] * 100),
-            # FIX: was hardcoded "INR" regardless of the store's real
-            # currency — harmless for every existing (INR-only) store, but
-            # would have silently charged a Shopify-sourced multi-currency
-            # catalog in the wrong currency. currency_code is a real
-            # ISO-4217 code; shop_config.currency is just a display symbol.
-            "currency": config.get("currency_code") or "INR",
-            "description": f"Order #{order['id'][:8].upper()}",
-            "customer": {"contact": f"+{order['phone_number']}"},
-            "notify": {"sms": False, "email": False},
-            "reminder_enable": False,
-            "expire_by": int(time.time()) + 5400,
-        })
+        if link is None:
+            import razorpay
+            key_id = config.get("razorpay_key_id") or RAZORPAY_KEY_ID
+            key_secret = config.get("razorpay_key_secret") or RAZORPAY_KEY_SECRET
+            if not key_id or not key_secret:
+                return None
+            client = razorpay.Client(auth=(key_id, key_secret))
+            link = client.payment_link.create(payload)
 
         supabase.table("orders").update({
             "payment_id": link["id"],

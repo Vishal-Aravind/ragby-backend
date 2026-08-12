@@ -119,14 +119,27 @@ APPOINTMENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_appointment_services",
+            "description": (
+                "Get the list of bookable services/appointment types this business offers (name, duration, "
+                "description). Always call this before checking availability or booking if you don't already "
+                "know which service the customer wants — never guess or invent a service name."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "check_appointment_availability",
-            "description": "Check which appointment time slots are free on a given date. Always call this before proposing a specific time to the customer.",
+            "description": "Check which appointment time slots are free on a given date, for a specific service. Always call this before proposing a specific time to the customer.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "date": {"type": "string", "description": "Date to check, format YYYY-MM-DD"},
+                    "service_name": {"type": "string", "description": "Exact service name as shown by list_appointment_services — required whenever the business offers more than one service"},
                 },
-                "required": ["date"],
+                "required": ["date", "service_name"],
             },
         },
     },
@@ -145,10 +158,11 @@ APPOINTMENT_TOOLS = [
                 "properties": {
                     "date": {"type": "string", "description": "Confirmed date, format YYYY-MM-DD"},
                     "time": {"type": "string", "description": "Confirmed start time, format HH:MM (24-hour)"},
+                    "service_name": {"type": "string", "description": "Exact service name as shown by list_appointment_services — required whenever the business offers more than one service"},
                     "customer_name": {"type": "string", "description": "The customer's name — only ask for this if it isn't already known from this conversation channel"},
                     "customer_phone": {"type": "string", "description": "Customer's phone number — only ask for this if it isn't already known from this conversation channel"},
                 },
-                "required": ["date", "time"],
+                "required": ["date", "time", "service_name"],
             },
         },
     },
@@ -473,15 +487,39 @@ def _shape_registration_for_ai(r: dict) -> dict:
 
 def execute_appointment_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
     """Never trusts the model's parameters as final — create_appointment
-    re-validates the slot is actually still free."""
-    from appointments import get_available_slots, create_appointment, get_latest_upcoming_appointment, get_upcoming_appointments, cancel_appointment as cancel_appointment_fn
+    re-validates the slot is actually still free, and service names are
+    always re-resolved against the real appointment_services table (the
+    model only ever sees a name, never an internal id)."""
+    from appointments import get_available_slots, create_appointment, get_latest_upcoming_appointment, get_upcoming_appointments, cancel_appointment as cancel_appointment_fn, find_service_by_name
 
     try:
+        if name == "list_appointment_services":
+            res = supabase.table("appointment_services").select("name, description, duration_minutes").eq("project_id", project_id).eq("is_active", True).order("sort_order", desc=False).execute()
+            services = res.data or []
+            if not services:
+                return {"message": "No bookable services are configured yet."}
+            return {"services": services}
+
         if name == "check_appointment_availability":
-            slots = get_available_slots(project_id, args["date"])
-            return {"date": args["date"], "available_slots": slots}
+            service = find_service_by_name(project_id, args["service_name"])
+            if not service:
+                return {"error": f"Couldn't find a service called '{args['service_name']}'. Call list_appointment_services to see the exact names, or ask the customer to clarify."}
+            slots = get_available_slots(project_id, args["date"], service["id"])
+            return {"date": args["date"], "service": service["name"], "available_slots": slots}
 
         if name == "book_appointment":
+            service = find_service_by_name(project_id, args["service_name"])
+            if not service:
+                return {"error": f"Couldn't find a service called '{args['service_name']}'. Call list_appointment_services to see the exact names, or ask the customer to clarify."}
+
+            # Paid services complete the same confirm/pay-link flow Shop's
+            # place_order uses, which only exists on WhatsApp today — mirrors
+            # SHOP_ORDER_TOOLS' exact restriction. Never trust the model
+            # alone on this; re-checked here regardless of what channel-gated
+            # tool list it was offered. Free services keep working everywhere.
+            if service.get("payment_mode", "free") != "free" and channel != "whatsapp":
+                return {"error": "Booking this service requires payment, which is currently only supported on WhatsApp — direct the customer to the booking page link instead."}
+
             # WhatsApp's own sender number is authoritative — never rely on
             # the model to transcribe a phone number correctly when we
             # already know it for certain from the channel itself.
@@ -495,6 +533,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
 
             return create_appointment(
                 project_id=project_id,
+                service_id=service["id"],
                 customer_name=customer_name,
                 customer_phone=phone,
                 appointment_date=args["date"],
@@ -733,7 +772,7 @@ def execute_shopify_cart_tool(name: str, args: dict, project_id: str, channel: s
 
 
 def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str, chat_id: str = None) -> dict:
-    if name in ("check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
+    if name in ("list_appointment_services", "check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
         return execute_appointment_tool(name, args, project_id, channel, external_id)
     if name in ("check_order_status", "browse_shop_catalog", "place_order"):
         return execute_shop_tool(name, args, project_id, channel, external_id)
@@ -894,6 +933,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "dates like 'tomorrow', 'next Monday', or 'this weekend' into an actual YYYY-MM-DD date "
                 "yourself, based on today's date, before calling any booking tool — never pass a relative "
                 "phrase as the date.\n"
+                "- This business may offer more than one bookable service. If you don't already know which "
+                "service the customer wants, call list_appointment_services first and ask them to pick one — "
+                "never guess or default to 'the only one' without checking, and never invent a service name "
+                "that wasn't in that list. Once a service is established in the conversation, don't ask again "
+                "unless the customer changes their mind.\n"
                 "- You can check appointment availability and book one using the tools provided.\n"
                 "- Always check availability before proposing a time.\n"
                 "- If the customer confirms a time without repeating the date (e.g. just says 'book 9am'), "
@@ -903,8 +947,8 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "- Confirmation is MANDATORY and always takes two separate messages, no exceptions — this "
                 "applies EVERY time, including when the customer just picks one of several times YOU offered "
                 "(e.g. after telling them a time was unavailable and listing alternatives). Picking an option "
-                "is still only the request. First you state the exact date and time back to the customer and "
-                "ask them to confirm; only on their NEXT reply, if it's a clear yes, do you call "
+                "is still only the request. First you state the exact service, date, and time back to the "
+                "customer and ask them to confirm; only on their NEXT reply, if it's a clear yes, do you call "
                 "book_appointment. A message that merely names or selects a date/time (even one containing "
                 "the word 'book') is the REQUEST, not the confirmation.\n"
                 "- If a slot turns out to be unavailable, apologize briefly and offer to check another time.\n"

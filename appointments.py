@@ -22,13 +22,18 @@ GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.getenv("GOOGLE_REDIRECT_URI", f"{os.getenv('BACKEND_URL', 'https://ragby-backend.onrender.com')}/appointments/google/callback")
 
+# How long a 'hold_to_confirm' booking provisionally reserves its slot
+# before the background sweep (see release_expired_holds / main.py's
+# scheduler) releases it back to availability if unpaid.
+HOLD_MINUTES = 15
+
 
 # -------------------------------------------------
 # MODELS
 # -------------------------------------------------
 class AppointmentSettingsUpdate(BaseModel):
-    service_name: Optional[str] = None
-    duration_minutes: Optional[int] = None
+    # service_name/duration_minutes moved to appointment_services (see
+    # ServiceCreate/ServiceUpdate below) — no longer editable here.
     buffer_minutes: Optional[int] = None
     slot_capacity: Optional[int] = None
     working_hours: Optional[dict] = None
@@ -36,11 +41,33 @@ class AppointmentSettingsUpdate(BaseModel):
     reminder_hours: Optional[int] = None
     google_calendar_id: Optional[str] = None
     accent_color: Optional[str] = None
+    currency_code: Optional[str] = None
     is_enabled: Optional[bool] = None
     bot_can_book: Optional[bool] = None
 
+class ServiceCreate(BaseModel):
+    project_id: str
+    name: str
+    description: Optional[str] = None
+    duration_minutes: int = 30
+    is_active: bool = True
+    sort_order: int = 0
+
+class ServiceUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
 class BookingCreate(BaseModel):
     project_id: str
+    # Optional only because a reschedule always inherits the original
+    # appointment's service — see create_appointment(), which resolves it
+    # authoritatively server-side rather than trusting whatever (if
+    # anything) the caller sends when reschedule_id is set. Required for a
+    # brand-new booking.
+    service_id: Optional[str] = None
     customer_name: str
     customer_phone: str
     appointment_date: str  # YYYY-MM-DD
@@ -112,11 +139,19 @@ def delete_google_event(access_token: str, calendar_id: str, event_id: str):
     )
 
 
-def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> List[str]:
-    """Generate available time slots for a given date."""
-    import re
+def generate_slots(date_str: str, settings: dict, service: dict, busy_slots: List[dict]) -> List[str]:
+    """Generate available time slots for a given date, for a specific
+    service (duration comes from `service`, everything else — working
+    hours, buffer, capacity — comes from the project-level `settings`).
 
-    # Get day of week
+    Booking-overlap check is interval-based, not exact-start-time-match:
+    once different services can have different durations, two bookings can
+    overlap in time without ever sharing a start time (e.g. a 60-min
+    booking at 10:00 and a 30-min booking at 10:15 overlap 10:15–10:30 but
+    never match on start_time). An exact-match count would silently allow
+    double-booking across services sharing the same calendar/capacity —
+    this checks real interval overlap against every one of the project's
+    existing bookings, not just ones for this same service."""
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     day_map = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
     day_key = day_map[dt.weekday()]
@@ -129,7 +164,7 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
 
     start_str = day_config.get("start", "09:00")
     end_str   = day_config.get("end", "18:00")
-    duration  = settings.get("duration_minutes", 30)
+    duration  = service.get("duration_minutes", 30)
     buffer    = settings.get("buffer_minutes", 0)
 
     # Parse start/end times
@@ -139,7 +174,7 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
     start_dt = datetime(dt.year, dt.month, dt.day, start_h, start_m)
     end_dt   = datetime(dt.year, dt.month, dt.day, end_h, end_m)
 
-    # Parse busy slots into datetime ranges
+    # Parse Google Calendar busy slots (genuinely UTC) into datetime ranges
     busy_ranges = []
     for b in busy_slots:
         b_start = datetime.fromisoformat(b["start"].replace("Z", "+00:00")).replace(tzinfo=None)
@@ -151,14 +186,29 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
 
     slot_capacity = settings.get("slot_capacity", 1)
 
-    # Count existing confirmed bookings per slot from our own DB
-    existing_bookings_res = supabase.table("appointments")         .select("start_time")         .eq("project_id", settings.get("project_id", ""))         .eq("appointment_date", date_str)         .in_("status", ["confirmed", "rescheduled"])         .execute()
+    # Existing bookings for this date, across ALL services of the project
+    # (they share the same provider/calendar/capacity) — start_time/end_time
+    # here are already IST wall-clock strings, so no UTC shift needed,
+    # unlike the Google busy_slots above. A 'pending_payment' hold blocks
+    # the slot too, but only while it's still live — an expired-but-not-
+    # yet-swept hold (see release_expired_holds) must NOT keep blocking it,
+    # hence the extra hold_expires_at condition alongside the status check.
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    existing_bookings_res = supabase.table("appointments") \
+        .select("start_time, end_time") \
+        .eq("project_id", settings.get("project_id", "")) \
+        .eq("appointment_date", date_str) \
+        .or_(f"status.in.(confirmed,rescheduled),and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
+        .execute()
 
-    # Build a count map: {start_time_str: count}
-    booking_counts = {}
+    booking_ranges = []
     for b in (existing_bookings_res.data or []):
-        t = str(b["start_time"])[:5]  # "HH:MM"
-        booking_counts[t] = booking_counts.get(t, 0) + 1
+        b_start_h, b_start_m = map(int, str(b["start_time"])[:5].split(":"))
+        b_end_h, b_end_m = map(int, str(b["end_time"])[:5].split(":"))
+        booking_ranges.append((
+            datetime(dt.year, dt.month, dt.day, b_start_h, b_start_m),
+            datetime(dt.year, dt.month, dt.day, b_end_h, b_end_m),
+        ))
 
     # Generate slots
     slots = []
@@ -179,30 +229,25 @@ def generate_slots(date_str: str, settings: dict, busy_slots: List[dict]) -> Lis
             current += timedelta(minutes=duration + buffer)
             continue
 
-        # Check capacity — if existing bookings >= capacity, slot is full
-        existing_count = booking_counts.get(slot_str, 0)
-        if existing_count >= slot_capacity:
+        # Interval-overlap capacity check — how many existing bookings
+        # (any service) overlap this candidate slot at all, not just ones
+        # starting at exactly this time.
+        overlap_count = sum(
+            1 for (b_start, b_end) in booking_ranges
+            if not (slot_end <= b_start or current >= b_end)
+        )
+        if overlap_count >= slot_capacity:
             current += timedelta(minutes=duration + buffer)
             continue
 
-        # Check Google Calendar busy only if capacity is 1 (exclusive slots)
-        # For capacity > 1, Google Calendar is used as a personal block-out only
         is_busy = False
-        if slot_capacity == 1:
-            for b_start, b_end in busy_ranges:
-                if not (slot_end <= b_start or current >= b_end):
-                    is_busy = True
-                    break
-        else:
-            # For capacity > 1, only block if entire capacity would be exceeded
-            # Google Calendar events still block the slot completely (owner blocked)
-            for b_start, b_end in busy_ranges:
-                if not (slot_end <= b_start or current >= b_end):
-                    is_busy = True
-                    break
+        for b_start, b_end in busy_ranges:
+            if not (slot_end <= b_start or current >= b_end):
+                is_busy = True
+                break
 
         if not is_busy:
-            remaining = slot_capacity - existing_count
+            remaining = slot_capacity - overlap_count
             slot_label = slot_str if slot_capacity == 1 else f"{slot_str} ({remaining} left)"
             slots.append(slot_label)
 
@@ -348,7 +393,7 @@ def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depen
 @router.get("/public/appointments/{project_id}/settings")
 def public_settings(project_id: str):
     res = supabase.table("appointment_settings").select(
-        "service_name,duration_minutes,working_hours,advance_booking_days,accent_color,is_enabled,google_refresh_token,google_calendar_id"
+        "working_hours,advance_booking_days,accent_color,currency_code,is_enabled,google_refresh_token,google_calendar_id"
     ).eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         raise HTTPException(status_code=404, detail="Booking not configured")
@@ -359,12 +404,88 @@ def public_settings(project_id: str):
     return data
 
 
-def get_available_slots(project_id: str, date: str) -> list:
+@router.get("/public/appointments/{project_id}/services")
+def public_services(project_id: str):
+    """Active services a customer can pick from on the public booking page
+    — no auth, matches the rest of the /public/* surface."""
+    res = supabase.table("appointment_services").select(
+        "id,name,description,duration_minutes,price,payment_mode"
+    ).eq("project_id", project_id).eq("is_active", True).order("sort_order", desc=False).execute()
+    return res.data or []
+
+
+@router.get("/public/appointments/{project_id}/booking-status/{appointment_id}")
+def public_booking_status(project_id: str, appointment_id: str, request: Request):
+    """Polled by the public booking page while a 'hold_to_confirm' payment
+    is in flight — the customer pays on Razorpay's hosted page in a new
+    tab, this is how the original tab finds out payment landed (mirrors
+    the Shopify storefront widget's cart-status refocus-poll). Rate-limited
+    generously (it's legitimately polled every few seconds by one honest
+    client) — just enough to stop it being an open, unbounded polling
+    target, matching every other /public/* write/lookup endpoint in this
+    file."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"booking-status:{project_id}:{ip}", limit=60, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
+    res = supabase.table("appointments").select("status, payment_status") \
+        .eq("id", appointment_id).eq("project_id", project_id).maybe_single().execute()
+    data = res.data if res else None
+    if not data:
+        raise HTTPException(status_code=404, detail="Not found")
+    return data
+
+
+@router.get("/public/appointments/{project_id}/reschedule/{appointment_id}")
+def public_reschedule_context(project_id: str, appointment_id: str):
+    """Used only by the reschedule flow on the public booking page to learn
+    which service the original appointment was for, so it can skip service
+    selection and fetch slots with the right duration — changing service on
+    reschedule isn't supported (see create_appointment's docstring)."""
+    res = supabase.table("appointments").select("service_id, service_name") \
+        .eq("id", appointment_id).eq("project_id", project_id).maybe_single().execute()
+    appt = res.data if res else None
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    return {"service_id": appt.get("service_id"), "service_name": appt.get("service_name")}
+
+
+def get_service(project_id: str, service_id: str) -> Optional[dict]:
+    res = supabase.table("appointment_services").select("*").eq("id", service_id).eq("project_id", project_id).maybe_single().execute()
+    service = res.data if res else None
+    if not service or not service.get("is_active", True):
+        return None
+    return service
+
+
+def find_service_by_name(project_id: str, name: str) -> Optional[dict]:
+    """Case-insensitive, substring-tolerant match against a project's real
+    active services — mirrors shop.py's find_product_by_name. Used by the
+    in-chat booking tools, which only ever see a service *name* from the
+    model, never an internal id. Returns None if there's no match OR more
+    than one equally-good match (ambiguous — caller should ask the customer
+    to clarify)."""
+    res = supabase.table("appointment_services").select("*").eq("project_id", project_id).eq("is_active", True).execute()
+    services = res.data or []
+    name_lower = name.strip().lower()
+
+    exact = [s for s in services if s["name"].strip().lower() == name_lower]
+    if len(exact) == 1:
+        return exact[0]
+
+    partial = [s for s in services if name_lower in s["name"].lower() or s["name"].lower() in name_lower]
+    if len(partial) == 1:
+        return partial[0]
+
+    return None
+
+
+def get_available_slots(project_id: str, date: str, service_id: str) -> list:
     """
     Core slot-lookup logic — used by the public booking page AND by the
     in-chat booking tool (backend/chat.py). Single source of truth so both
     paths can never disagree about what's actually free.
-    Raises ValueError on a bad date or missing settings.
+    Raises ValueError on a bad date, missing settings, or missing/inactive
+    service.
     """
     try:
         datetime.strptime(date, "%Y-%m-%d")
@@ -374,36 +495,84 @@ def get_available_slots(project_id: str, date: str) -> list:
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         raise ValueError("Appointment settings not found for this project")
-
     settings = res.data
+
+    service = get_service(project_id, service_id)
+    if not service:
+        raise ValueError("Service not found")
+
     refresh_token = settings.get("google_refresh_token")
     calendar_id   = settings.get("google_calendar_id", "primary")
 
+    # Google Calendar busy times only. FIX: this used to also fold the
+    # project's own appointments into this same list as fake UTC timestamps
+    # (f"{date}T{start_time}Z"), which then got shifted +5:30 *again* inside
+    # generate_slots — double-converting an already-IST wall-clock time as
+    # if it were UTC. Harmless before now only because the separate
+    # exact-start-time count also (correctly) blocked the real slot anyway;
+    # our own bookings are now checked directly and correctly inside
+    # generate_slots() via unshifted-IST interval overlap, so they no
+    # longer need to go through this UTC-oriented busy_slots path at all.
     busy_slots = []
     if refresh_token:
         access_token = get_google_access_token(refresh_token)
         if access_token:
             busy_slots = get_busy_slots(access_token, calendar_id, date)
 
-    our_appointments = supabase.table("appointments") \
-        .select("start_time, end_time") \
-        .eq("project_id", project_id) \
-        .eq("appointment_date", date) \
-        .neq("status", "cancelled") \
-        .execute()
-
-    for appt in (our_appointments.data or []):
-        busy_slots.append({
-            "start": f"{date}T{appt['start_time']}Z",
-            "end":   f"{date}T{appt['end_time']}Z",
-        })
-
     settings["project_id"] = project_id
-    return generate_slots(date, settings, busy_slots)
+    return generate_slots(date, settings, service, busy_slots)
+
+
+def generate_appointment_payment_link(appointment: dict, service: dict, settings: dict) -> Optional[str]:
+    """Razorpay Payment Link for a paid appointment. OAuth-only — unlike
+    shop.py's generate_razorpay_link, there's no legacy manual-key fallback
+    here, since appointments never had a manual-key UI; if the project
+    hasn't connected Razorpay yet this just returns None and the
+    appointment stays payment_status='unpaid' (booking still succeeds for
+    request_after mode; for hold_to_confirm the slot will simply expire
+    unpaid via the hold sweep — see the merchant-facing "connect Razorpay"
+    prompt on the payment_mode selector for why that's an acceptable
+    failure mode rather than something to special-case further here)."""
+    import time as time_module
+    from razorpay_oauth import _razorpay_api_request
+
+    price = service.get("price") or 0
+    if price <= 0:
+        return None
+
+    payload = {
+        "amount": int(round(price * 100)),
+        "currency": settings.get("currency_code") or "INR",
+        "description": f"{service.get('name', 'Appointment')} — Booking #{appointment['id'][:8].upper()}",
+        "customer": {"contact": f"+{appointment['customer_phone']}"},
+        "notify": {"sms": False, "email": False},
+        "reminder_enable": False,
+        "expire_by": int(time_module.time()) + 5400,
+    }
+
+    try:
+        res = _razorpay_api_request("POST", "/payment_links", appointment["project_id"], json=payload)
+    except ValueError:
+        return None  # project hasn't connected Razorpay yet
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return None
+
+    if res.status_code >= 300:
+        sentry_sdk.capture_message(f"Razorpay payment_link.create failed ({res.status_code}) for appointment {appointment['id']}: {res.text[:300]}")
+        return None
+
+    link = res.json()
+    supabase.table("appointments").update({
+        "payment_id": link["id"],
+        "payment_status": "link_sent",
+    }).eq("id", appointment["id"]).execute()
+    return link["short_url"]
 
 
 def create_appointment(
     project_id: str,
+    service_id: str,
     customer_name: str,
     customer_phone: str,
     appointment_date: str,
@@ -415,25 +584,80 @@ def create_appointment(
     Core booking logic — used by the public booking page AND by the in-chat
     booking tool (backend/chat.py). Callers are responsible for confirming
     the slot with the customer BEFORE calling this — this function books
-    unconditionally once called. Raises ValueError if settings are missing
-    or the slot is no longer free (re-checked here, not trusted from the
-    caller, since an AI-proposed slot could be stale by the time it's used).
+    unconditionally once called. Raises ValueError if settings/service are
+    missing or the slot is no longer free (re-checked here, not trusted
+    from the caller, since an AI-proposed slot could be stale by the time
+    it's used).
+
+    Changing service on reschedule is out of scope — if reschedule_id is
+    set, the ORIGINAL appointment's service is used regardless of what
+    service_id was passed in (present "change service" as cancel + rebook
+    instead). This is resolved authoritatively here, not trusted from the
+    caller, same "never trust the caller" philosophy as the slot re-check.
+
+    Payment handling by the resolved service's payment_mode — NEVER
+    re-triggered on a reschedule, even for a paid service: a reschedule
+    moves an already-decided booking to a new time, it is not a fresh
+    purchase decision, and re-running payment collection here would risk
+    double-charging a customer who already paid for the original slot.
+    Rescheduling a paid appointment instead directly carries over the
+    original's payment_status/payment_id and confirms immediately.
+      - 'free' (or a paid service with price <= 0, treated the same):
+        confirms immediately, Google event created immediately — today's
+        behavior, unchanged.
+      - 'hold_to_confirm': books as status='pending_payment' with a
+        HOLD_MINUTES-minute hold_expires_at, slot is excluded from
+        availability by the hold itself (see get_available_slots), no
+        Google event yet (deferred to the payment webhook finalizing it —
+        avoids creating-then-cleaning-up a tentative event for every
+        expired hold). A Razorpay payment link is generated and sent as
+        its own WhatsApp message.
+      - 'request_after': confirms immediately exactly like 'free' (Google
+        event included), then a payment link is generated and sent as a
+        second, non-blocking WhatsApp message right after the normal
+        confirmation.
     """
-    from whatsapp import send_whatsapp_buttons
+    from whatsapp import send_whatsapp_buttons, send_whatsapp_cta_url
     from config import WHATSAPP_TOKEN
 
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         raise ValueError("Appointment settings not found for this project")
-
     settings = res.data
-    duration  = settings.get("duration_minutes", 30)
-    service   = settings.get("service_name", "Appointment")
+
+    old_appt_data = None
+    if reschedule_id:
+        old_appt_res = supabase.table("appointments").select("*").eq("id", reschedule_id).maybe_single().execute()
+        old_appt_data = old_appt_res.data if old_appt_res else None
+        if old_appt_data and old_appt_data.get("service_id"):
+            service_id = old_appt_data["service_id"]
+
+    if not service_id:
+        raise ValueError("A service must be selected")
+
+    service_row = get_service(project_id, service_id)
+    if not service_row:
+        raise ValueError("Service not found")
+
+    duration = service_row.get("duration_minutes", 30)
+    service  = service_row.get("name", "Appointment")
+    price    = service_row.get("price") or 0
+
+    # Reschedule of an already-paid booking is never re-charged (see
+    # docstring) — otherwise, apply the service's real payment_mode.
+    if reschedule_id and old_appt_data and old_appt_data.get("payment_status") == "paid":
+        payment_mode = "free"
+    elif price <= 0:
+        payment_mode = "free"
+    else:
+        payment_mode = service_row.get("payment_mode") or "free"
+
+    is_fresh_hold = payment_mode == "hold_to_confirm" and not reschedule_id
 
     # Re-validate the slot is still actually free — never trust a
     # previously-computed slot list as still true at execution time.
     if not reschedule_id:
-        available = get_available_slots(project_id, appointment_date)
+        available = get_available_slots(project_id, appointment_date, service_id)
         available_times = {s.split(" ")[0] for s in available}  # strip "(N left)" suffix
         if start_time not in available_times:
             raise ValueError(f"{start_time} on {appointment_date} is no longer available")
@@ -446,7 +670,12 @@ def create_appointment(
     refresh_token   = settings.get("google_refresh_token")
     calendar_id     = settings.get("google_calendar_id", "primary")
 
-    if refresh_token:
+    # Skip creating a Google event for a fresh hold — the slot is already
+    # excluded from availability via the appointments row itself (see
+    # get_available_slots' pending_payment handling), and this avoids
+    # having to clean up a tentative event for every hold that expires
+    # unpaid. The event is created when the webhook finalizes payment.
+    if refresh_token and not is_fresh_hold:
         access_token = get_google_access_token(refresh_token)
         if access_token:
             event = {
@@ -469,36 +698,45 @@ def create_appointment(
 
     if reschedule_id:
         try:
-            old_appt = supabase.table("appointments").select("*").eq("id", reschedule_id).maybe_single().execute()
-            if old_appt and old_appt.data:
+            if old_appt_data:
                 supabase.table("appointments").update({"status": "rescheduled"}).eq("id", reschedule_id).execute()
-                old_refresh = (supabase.table("appointment_settings").select("google_refresh_token,google_calendar_id").eq("project_id", project_id).maybe_single().execute())
-                old_settings = (old_refresh.data if old_refresh else None) or {}
-                if old_settings.get("google_refresh_token") and old_appt.data.get("google_event_id"):
-                    old_token = get_google_access_token(old_settings["google_refresh_token"])
+                if settings.get("google_refresh_token") and old_appt_data.get("google_event_id"):
+                    old_token = get_google_access_token(settings["google_refresh_token"])
                     if old_token:
-                        delete_google_event(old_token, old_settings.get("google_calendar_id", "primary"), old_appt.data["google_event_id"])
+                        delete_google_event(old_token, calendar_id, old_appt_data["google_event_id"])
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"Reschedule old appointment error: {e}")
 
-    appt_res = supabase.table("appointments").insert({
+    insert_row = {
         "project_id": project_id,
+        "service_id": service_id,
         "customer_name": customer_name,
         "customer_phone": customer_phone.replace("+", ""),
         "service_name": service,
         "appointment_date": appointment_date,
         "start_time": start_time,
         "end_time": end_time,
-        "status": "confirmed",
+        "status": "pending_payment" if is_fresh_hold else "confirmed",
         "google_event_id": google_event_id,
         "notes": notes,
-    }).execute()
+        "payment_status": "not_required" if payment_mode == "free" else "unpaid",
+    }
+    if reschedule_id and old_appt_data and old_appt_data.get("payment_status") == "paid":
+        insert_row["payment_status"] = "paid"
+        insert_row["payment_id"] = old_appt_data.get("payment_id")
+    if is_fresh_hold:
+        insert_row["hold_expires_at"] = (datetime.utcnow() + timedelta(minutes=HOLD_MINUTES)).isoformat()
 
+    appt_res = supabase.table("appointments").insert(insert_row).execute()
     appointment = appt_res.data[0]
 
     date_obj = datetime.strptime(appointment_date, "%Y-%m-%d")
     date_formatted = date_obj.strftime("%A, %d %B %Y")
+
+    payment_url = None
+    if payment_mode in ("hold_to_confirm", "request_after") and not (reschedule_id and old_appt_data and old_appt_data.get("payment_status") == "paid"):
+        payment_url = generate_appointment_payment_link(appointment, service_row, settings)
 
     try:
         wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
@@ -509,24 +747,53 @@ def create_appointment(
             token = wa_data.get("access_token") or WHATSAPP_TOKEN
             phone = customer_phone.replace("+", "").replace(" ", "")
 
-            action = "Rescheduled" if reschedule_id else "Confirmed"
-            msg = f"✅ *Booking {action}!*\n\n"
-            msg += f"📋 Service: {service}\n"
-            msg += f"📅 Date: {date_formatted}\n"
-            msg += f"⏰ Time: {start_time}\n"
-            msg += f"👤 Name: {customer_name}\n\n"
-            msg += f"Booking ID: #{appointment['id'][:8].upper()}"
+            if is_fresh_hold:
+                # Not confirmed yet — no Reschedule/Cancel buttons (nothing
+                # to reschedule/cancel), just the summary + a "Pay Now"
+                # CTA-URL if a link was generated, or a plain heads-up if
+                # Razorpay isn't connected for this project yet.
+                msg = f"⏳ *Slot Reserved — Payment Needed*\n\n"
+                msg += f"📋 Service: {service}\n"
+                msg += f"📅 Date: {date_formatted}\n"
+                msg += f"⏰ Time: {start_time}\n\n"
+                if payment_url:
+                    msg += f"Pay within {HOLD_MINUTES} minutes to confirm your booking."
+                    send_whatsapp_cta_url(phone, msg, "Pay Now", payment_url, phone_number_id, token)
+                else:
+                    msg += "We'll be in touch shortly to arrange payment and confirm your booking."
+                    from whatsapp import send_whatsapp_message
+                    send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
+            else:
+                action = "Rescheduled" if reschedule_id else "Confirmed"
+                msg = f"✅ *Booking {action}!*\n\n"
+                msg += f"📋 Service: {service}\n"
+                msg += f"📅 Date: {date_formatted}\n"
+                msg += f"⏰ Time: {start_time}\n"
+                msg += f"👤 Name: {customer_name}\n\n"
+                msg += f"Booking ID: #{appointment['id'][:8].upper()}"
 
-            send_whatsapp_buttons(
-                to=phone,
-                body=msg,
-                buttons=[
-                    {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
-                    {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
-                ],
-                phone_number_id=phone_number_id,
-                token=token,
-            )
+                send_whatsapp_buttons(
+                    to=phone,
+                    body=msg,
+                    buttons=[
+                        {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
+                        {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
+                    ],
+                    phone_number_id=phone_number_id,
+                    token=token,
+                )
+
+                # Non-blocking payment request, sent as its own message —
+                # WhatsApp interactive messages can't mix quick-reply
+                # buttons and a CTA-URL in one message.
+                if payment_url:
+                    send_whatsapp_cta_url(
+                        phone,
+                        f"💳 Optional: pay {service} in advance.",
+                        "Pay Now",
+                        payment_url,
+                        phone_number_id, token,
+                    )
 
             supabase.table("whatsapp_sessions").upsert({
                 "project_id": project_id,
@@ -540,19 +807,22 @@ def create_appointment(
         print(f"WhatsApp confirmation error: {e}")
 
     return {
-        "status": "confirmed",
+        "status": appointment["status"],
         "appointment_id": appointment["id"],
         "date": date_formatted,
         "time": start_time,
         "service": service,
+        "payment_required": payment_mode != "free",
+        "payment_url": payment_url,
+        "hold_minutes": HOLD_MINUTES if is_fresh_hold else None,
     }
 
 
 @router.get("/public/appointments/{project_id}/slots")
-def public_slots(project_id: str, date: str):
-    """Get available slots for a specific date."""
+def public_slots(project_id: str, date: str, service_id: str):
+    """Get available slots for a specific date + service."""
     try:
-        slots = get_available_slots(project_id, date)
+        slots = get_available_slots(project_id, date, service_id)
     except ValueError as e:
         status = 400 if "format" in str(e) else 404
         raise HTTPException(status_code=status, detail=str(e))
@@ -565,9 +835,12 @@ def book_appointment(body: BookingCreate, request: Request):
     ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
     if is_rate_limited(f"book:{body.project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many booking attempts — please wait a moment and try again.")
+    if not body.service_id and not body.reschedule_id:
+        raise HTTPException(status_code=400, detail="A service must be selected")
     try:
         return create_appointment(
             project_id=body.project_id,
+            service_id=body.service_id,
             customer_name=body.customer_name,
             customer_phone=body.customer_phone,
             appointment_date=body.appointment_date,
@@ -578,6 +851,65 @@ def book_appointment(body: BookingCreate, request: Request):
     except ValueError as e:
         status = 404 if "not found" in str(e) else 409
         raise HTTPException(status_code=status, detail=str(e))
+
+
+# -------------------------------------------------
+# APPOINTMENT SERVICES CRUD (dashboard) — Calendly-style "event types"
+# -------------------------------------------------
+@router.get("/appointment-services")
+def list_services(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
+    res = supabase.table("appointment_services").select("*").eq("project_id", project_id).order("sort_order", desc=False).execute()
+    return res.data or []
+
+
+@router.post("/appointment-services")
+def create_service(body: ServiceCreate, user=Depends(verify_token)):
+    require_project_role(user.id, body.project_id)
+    supabase.table("appointment_services").insert({
+        "project_id": body.project_id,
+        "name": body.name,
+        "description": body.description,
+        "duration_minutes": body.duration_minutes,
+        "is_active": body.is_active,
+        "sort_order": body.sort_order,
+    }).execute()
+    res = supabase.table("appointment_services").select("*").eq("project_id", body.project_id).order("created_at", desc=True).limit(1).execute()
+    return res.data[0]
+
+
+def _require_role_for_service(user_id: str, service_id: str):
+    res = supabase.table("appointment_services").select("project_id").eq("id", service_id).maybe_single().execute()
+    service = res.data if res else None
+    if not service:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user_id, service["project_id"])
+    return service["project_id"]
+
+
+@router.put("/appointment-services/{service_id}")
+def update_service(service_id: str, body: ServiceUpdate, user=Depends(verify_token)):
+    _require_role_for_service(user.id, service_id)
+    update = {k: v for k, v in body.dict().items() if v is not None}
+    supabase.table("appointment_services").update(update).eq("id", service_id).execute()
+    res = supabase.table("appointment_services").select("*").eq("id", service_id).single().execute()
+    return res.data
+
+
+@router.delete("/appointment-services/{service_id}")
+def delete_service(service_id: str, user=Depends(verify_token)):
+    _require_role_for_service(user.id, service_id)
+    referenced = supabase.table("appointments").select("id").eq("service_id", service_id).limit(1).execute()
+    if referenced.data:
+        # Has historical bookings — deleting would orphan their service_id
+        # reference (appointments.service_id is ON DELETE SET NULL, so it
+        # wouldn't break, but the merchant almost certainly means "stop
+        # offering this," not "erase which service past customers booked").
+        # Deactivate instead; hard delete is only for services nobody's
+        # ever booked.
+        raise HTTPException(status_code=409, detail="This service has existing bookings — deactivate it instead of deleting.")
+    supabase.table("appointment_services").delete().eq("id", service_id).execute()
+    return {"status": "deleted"}
 
 
 # -------------------------------------------------
@@ -890,3 +1222,180 @@ def send_reminders_job():
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Reminder job fatal error: {e}")
+
+
+# -------------------------------------------------
+# PAYMENT FINALIZATION — called from shop.py's unified Razorpay webhook
+# -------------------------------------------------
+def is_appointment_slot_still_available(appointment: dict, settings: dict) -> bool:
+    """Re-validates that finalizing THIS appointment wouldn't put its slot
+    over capacity — i.e. counts overlapping bookings excluding the
+    appointment itself. Deliberately not implemented via
+    get_available_slots(), which would always report this exact slot as
+    unavailable (it's already counting this very appointment as a busy
+    booking)."""
+    date_str = appointment["appointment_date"]
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    start_h, start_m = map(int, str(appointment["start_time"])[:5].split(":"))
+    end_h, end_m = map(int, str(appointment["end_time"])[:5].split(":"))
+    my_start = datetime(dt.year, dt.month, dt.day, start_h, start_m)
+    my_end   = datetime(dt.year, dt.month, dt.day, end_h, end_m)
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    others_res = supabase.table("appointments") \
+        .select("start_time, end_time") \
+        .eq("project_id", appointment["project_id"]) \
+        .eq("appointment_date", date_str) \
+        .neq("id", appointment["id"]) \
+        .or_(f"status.in.(confirmed,rescheduled),and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
+        .execute()
+
+    overlap_count = 0
+    for b in (others_res.data or []):
+        b_start_h, b_start_m = map(int, str(b["start_time"])[:5].split(":"))
+        b_end_h, b_end_m = map(int, str(b["end_time"])[:5].split(":"))
+        b_start = datetime(dt.year, dt.month, dt.day, b_start_h, b_start_m)
+        b_end   = datetime(dt.year, dt.month, dt.day, b_end_h, b_end_m)
+        if not (my_end <= b_start or my_start >= b_end):
+            overlap_count += 1
+
+    slot_capacity = settings.get("slot_capacity", 1)
+    return overlap_count < slot_capacity
+
+
+def handle_appointment_payment_paid(appointment: dict):
+    """Finalizes a Razorpay-paid appointment — called from shop.py's
+    unified /webhook/razorpay handler once it's identified the paid
+    payment_link belongs to an appointment, not an order. Idempotent: a
+    retried webhook for an already-paid appointment is a safe no-op.
+    """
+    from whatsapp import send_whatsapp_buttons
+    from config import WHATSAPP_TOKEN
+
+    if appointment.get("payment_status") == "paid":
+        return
+
+    project_id = appointment["project_id"]
+
+    if appointment["status"] != "pending_payment":
+        # 'request_after' path — already confirmed at booking time (Google
+        # event included), this just records that payment came through.
+        supabase.table("appointments").update({"payment_status": "paid"}).eq("id", appointment["id"]).execute()
+        return
+
+    # 'hold_to_confirm' path — finalize now. Re-validate the slot wasn't
+    # taken by someone else in the interim before confirming — never trust
+    # a hold as still valid at payment time, same "never trust a
+    # previously-computed slot" philosophy create_appointment already uses.
+    settings_res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
+    settings = (settings_res.data if settings_res else None) or {}
+
+    if not is_appointment_slot_still_available(appointment, settings):
+        # Genuine conflict — money was collected but the slot's gone (e.g.
+        # payment landed right as the hold was swept to 'expired' and
+        # someone else's booking took it first). Flagged for manual ops
+        # resolution rather than silently dropping a paid booking or
+        # building automatic refund integration — refunds are a
+        # deliberate non-goal here.
+        supabase.table("appointments").update({
+            "payment_status": "paid",
+            "status": "payment_conflict",
+        }).eq("id", appointment["id"]).execute()
+        sentry_sdk.capture_message(f"Appointment {appointment['id']} paid but its slot was taken in the interim — needs manual resolution")
+        return
+
+    google_event_id = None
+    refresh_token = settings.get("google_refresh_token")
+    calendar_id   = settings.get("google_calendar_id", "primary")
+    if refresh_token:
+        access_token = get_google_access_token(refresh_token)
+        if access_token:
+            start_hm = str(appointment["start_time"])[:5]
+            end_hm   = str(appointment["end_time"])[:5]
+            event = {
+                "summary": f"{appointment['service_name']} — {appointment['customer_name']}",
+                "description": f"Customer: {appointment['customer_name']}\nPhone: {appointment['customer_phone']}\nNotes: {appointment.get('notes') or 'None'}",
+                "start": {"dateTime": f"{appointment['appointment_date']}T{start_hm}:00", "timeZone": "Asia/Kolkata"},
+                "end": {"dateTime": f"{appointment['appointment_date']}T{end_hm}:00", "timeZone": "Asia/Kolkata"},
+                "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]},
+            }
+            # A failed Google event here is logged (inside create_google_event)
+            # but never blocks finalizing a *paid* confirmation.
+            google_event_id = create_google_event(access_token, calendar_id, event)
+
+    supabase.table("appointments").update({
+        "payment_status": "paid",
+        "status": "confirmed",
+        "google_event_id": google_event_id,
+        "hold_expires_at": None,
+    }).eq("id", appointment["id"]).execute()
+
+    try:
+        wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", project_id).maybe_single().execute()
+        wa_data = (wa_res.data if wa_res else None)
+        if wa_data:
+            phone_number_id = wa_data["phone_number_id"]
+            token = wa_data.get("access_token") or WHATSAPP_TOKEN
+            date_obj = datetime.strptime(appointment["appointment_date"], "%Y-%m-%d")
+            date_formatted = date_obj.strftime("%A, %d %B %Y")
+            msg = f"✅ *Payment Confirmed — Booking Confirmed!*\n\n"
+            msg += f"📋 Service: {appointment['service_name']}\n"
+            msg += f"📅 Date: {date_formatted}\n"
+            msg += f"⏰ Time: {str(appointment['start_time'])[:5]}\n\n"
+            msg += f"Booking ID: #{appointment['id'][:8].upper()}"
+            send_whatsapp_buttons(
+                to=appointment["customer_phone"],
+                body=msg,
+                buttons=[
+                    {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
+                    {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
+                ],
+                phone_number_id=phone_number_id,
+                token=token,
+            )
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Appointment payment confirmation WhatsApp error: {e}")
+
+
+# -------------------------------------------------
+# HOLD-EXPIRY SWEEP — called by background scheduler in main.py
+# -------------------------------------------------
+def release_expired_holds():
+    """Runs periodically (every 2 minutes — see main.py's scheduler) to
+    flip unpaid 'hold_to_confirm' bookings whose HOLD_MINUTES window has
+    passed to status='expired', freeing their slot back up (see
+    generate_slots — a 'pending_payment' row only blocks availability
+    while hold_expires_at is still in the future). Kept distinct from
+    customer-initiated 'cancelled' so dashboard/reporting can tell a
+    genuine cancellation apart from an abandoned, unpaid checkout.
+
+    Never deletes the row — if a Razorpay webhook for this exact
+    appointment arrives just after the sweep fires, the payment webhook
+    handler (shop.py's razorpay_webhook) can still find it by payment_id
+    and re-confirm it if the slot is still free (see that handler's
+    'already-expired-but-paid' reconciliation path)."""
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    released = 0
+    failed = 0
+    try:
+        expired_res = supabase.table("appointments") \
+            .select("id") \
+            .eq("status", "pending_payment") \
+            .lt("hold_expires_at", now_iso) \
+            .execute()
+
+        for row in (expired_res.data or []):
+            try:
+                supabase.table("appointments").update({"status": "expired"}).eq("id", row["id"]).eq("status", "pending_payment").execute()
+                released += 1
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+                print(f"Hold release error for appointment {row.get('id')}: {e}")
+                failed += 1
+
+        print(f"Hold-expiry sweep done — released: {released}, failed: {failed}")
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Hold-expiry sweep fatal error: {e}")

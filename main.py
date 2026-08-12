@@ -42,6 +42,7 @@ from events import router as events_router
 from content_gaps import router as content_gaps_router
 from auth import router as auth_router
 from shopify_oauth import router as shopify_router
+from razorpay_oauth import router as razorpay_oauth_router
 
 
 # -------------------------------------------------
@@ -65,6 +66,17 @@ def run_scheduled_campaigns():
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler: campaign dispatch error: {e}")
+
+
+def run_release_expired_holds():
+    """Runs every 2 minutes — releases unpaid 'hold_to_confirm' appointment
+    bookings whose hold window has expired, freeing the slot back up."""
+    try:
+        from appointments import release_expired_holds
+        release_expired_holds()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Scheduler: hold-release job error: {e}")
 
 
 def run_shopify_reconciliation():
@@ -102,8 +114,9 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
         scheduler.add_job(run_scheduled_campaigns, 'interval', seconds=30, id='scheduled_campaigns')
         scheduler.add_job(run_shopify_reconciliation, 'interval', hours=6, id='shopify_reconciliation')
+        scheduler.add_job(run_release_expired_holds, 'interval', minutes=2, id='appointment_hold_release')
         scheduler.start()
-        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h")
+        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h, appointment hold release every 2m")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler failed to start: {e}")
@@ -155,6 +168,7 @@ app.include_router(events_router)
 app.include_router(content_gaps_router)
 app.include_router(auth_router)
 app.include_router(shopify_router)
+app.include_router(razorpay_oauth_router)
 
 
 # -------------------------------------------------
