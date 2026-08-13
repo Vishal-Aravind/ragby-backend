@@ -48,6 +48,13 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-07")
 RAZORPAY_PARTNER_CLIENT_ID = os.getenv("RAZORPAY_PARTNER_CLIENT_ID", "")
 RAZORPAY_PARTNER_CLIENT_SECRET = os.getenv("RAZORPAY_PARTNER_CLIENT_SECRET", "")
 RAZORPAY_PARTNER_REDIRECT_URI = os.getenv("RAZORPAY_PARTNER_REDIRECT_URI", f"{BACKEND_PUBLIC_URL}/razorpay/oauth/callback")
+# "test" | "live" — passed as the token endpoint's `mode` param. Razorpay
+# issues separate Development/Production client_id+secret pairs per
+# Partner app; per their docs a Production client can only ever request
+# live-mode tokens, but a Development client needs this explicit to get a
+# test-mode (sandbox) token instead of silently defaulting to live. Flip to
+# "live" (and swap in the Production client_id/secret) when going live.
+RAZORPAY_PARTNER_MODE = os.getenv("RAZORPAY_PARTNER_MODE", "test")
 # One shared secret covering every connected sub-merchant account — Razorpay
 # Partner webhooks are configured once at the application level, not per
 # merchant (confirmed against Razorpay's Partner OAuth docs).

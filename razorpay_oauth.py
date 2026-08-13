@@ -36,7 +36,7 @@ from clients import supabase
 from auth import verify_token, require_project_role
 from config import (
     RAZORPAY_PARTNER_CLIENT_ID, RAZORPAY_PARTNER_CLIENT_SECRET,
-    RAZORPAY_PARTNER_REDIRECT_URI,
+    RAZORPAY_PARTNER_REDIRECT_URI, RAZORPAY_PARTNER_MODE,
 )
 
 router = APIRouter()
@@ -123,6 +123,7 @@ def _refresh_access_token(connection: dict) -> Optional[dict]:
             "client_secret": RAZORPAY_PARTNER_CLIENT_SECRET,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
+            "mode": RAZORPAY_PARTNER_MODE,
         }, timeout=15)
         res.raise_for_status()
         token_data = res.json()
@@ -224,6 +225,7 @@ def razorpay_oauth_callback(request: Request):
             "grant_type": "authorization_code",
             "redirect_uri": RAZORPAY_PARTNER_REDIRECT_URI,
             "code": code,
+            "mode": RAZORPAY_PARTNER_MODE,
         }, timeout=15)
         token_res.raise_for_status()
         token_data = token_res.json()
