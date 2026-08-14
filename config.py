@@ -60,18 +60,43 @@ RAZORPAY_PARTNER_MODE = os.getenv("RAZORPAY_PARTNER_MODE", "test")
 # merchant (confirmed against Razorpay's Partner OAuth docs).
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-STRIPE_PRO_MONTHLY = os.getenv("STRIPE_PRO_MONTHLY")
-STRIPE_PRO_YEARLY = os.getenv("STRIPE_PRO_YEARLY")
-STRIPE_BUSINESS_MONTHLY = os.getenv("STRIPE_BUSINESS_MONTHLY")
-STRIPE_BUSINESS_YEARLY = os.getenv("STRIPE_BUSINESS_YEARLY")
+# Razorpay Billing — Zavo's OWN Razorpay merchant account, charging Zavo's
+# OWN SaaS customers (Pro/Business subscriptions). A THIRD, distinct
+# Razorpay credential concept in this codebase — do not confuse with:
+#   - RAZORPAY_PARTNER_* above (backend/razorpay_oauth.py) — OAuth so
+#     Zavo's Shop/Appointment merchants connect THEIR OWN account.
+#   - RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET (backend/shop.py) — legacy
+#     manual per-merchant fallback keys, also not Zavo's own account.
+# Zavo IS the merchant here — plain Basic Auth via the razorpay-python SDK
+# (razorpay.Client(auth=(id, secret))), no OAuth counterparty involved.
+RAZORPAY_BILLING_KEY_ID = os.getenv("RAZORPAY_BILLING_KEY_ID", "")
+RAZORPAY_BILLING_KEY_SECRET = os.getenv("RAZORPAY_BILLING_KEY_SECRET", "")
+RAZORPAY_BILLING_WEBHOOK_SECRET = os.getenv("RAZORPAY_BILLING_WEBHOOK_SECRET", "")
 
-PRICE_TO_PLAN = {
-    STRIPE_PRO_MONTHLY: "pro",
-    STRIPE_PRO_YEARLY: "pro",
-    STRIPE_BUSINESS_MONTHLY: "business",
-    STRIPE_BUSINESS_YEARLY: "business",
+RAZORPAY_PRO_MONTHLY = os.getenv("RAZORPAY_PRO_MONTHLY", "")
+RAZORPAY_PRO_YEARLY = os.getenv("RAZORPAY_PRO_YEARLY", "")
+RAZORPAY_BUSINESS_MONTHLY = os.getenv("RAZORPAY_BUSINESS_MONTHLY", "")
+RAZORPAY_BUSINESS_YEARLY = os.getenv("RAZORPAY_BUSINESS_YEARLY", "")
+
+# Server-side allowlist — /billing/subscribe resolves a {plan}/{billing} key
+# to a plan_id itself; the client never sends a raw price/plan id. This is
+# actually a fix over the old Stripe flow, where price_id came straight off
+# the request body with no validation it was one of the known prices.
+PLAN_TO_RAZORPAY_PLAN_ID = {
+    ("pro", "monthly"): RAZORPAY_PRO_MONTHLY,
+    ("pro", "yearly"): RAZORPAY_PRO_YEARLY,
+    ("business", "monthly"): RAZORPAY_BUSINESS_MONTHLY,
+    ("business", "yearly"): RAZORPAY_BUSINESS_YEARLY,
+}
+
+# Razorpay plan_id -> plan name, mirrors PRICE_TO_PLAN's old shape exactly.
+# Used by the billing webhook to resolve profiles.plan from a subscription's
+# current plan_id.
+RAZORPAY_PLAN_TO_PLAN = {
+    RAZORPAY_PRO_MONTHLY: "pro",
+    RAZORPAY_PRO_YEARLY: "pro",
+    RAZORPAY_BUSINESS_MONTHLY: "business",
+    RAZORPAY_BUSINESS_YEARLY: "business",
 }
 
 PLAN_LIMITS = {

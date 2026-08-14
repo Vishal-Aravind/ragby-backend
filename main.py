@@ -30,7 +30,7 @@ from leads import router as leads_router
 from telegram import router as telegram_router
 from slack import router as slack_router
 from whatsapp import router as whatsapp_router
-from stripe_handler import router as stripe_router
+from billing import router as billing_router
 from flows import router as flows_router
 from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
@@ -156,7 +156,7 @@ app.include_router(leads_router)
 app.include_router(telegram_router)
 app.include_router(slack_router)
 app.include_router(whatsapp_router)
-app.include_router(stripe_router)
+app.include_router(billing_router)
 app.include_router(flows_router)
 app.include_router(api_keys_router)
 app.include_router(campaigns_router)
