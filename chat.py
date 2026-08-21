@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from clients import supabase, openai_client, embeddings, qdrant
 from config import QDRANT_COLLECTION, FRONTEND_URL
-from auth import verify_token
+from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
 from ratelimit import is_rate_limited
 from qdrant_client import models
@@ -895,6 +895,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         from sources.postgres import run_text_to_sql
 
         history = history or []
+
+        # Admin kill switch — every channel (public widget, WhatsApp,
+        # Telegram, Slack, in-app test chat) funnels through this function
+        # before generating a reply, so this is the one place a suspension
+        # needs to be enforced to actually stop the bot everywhere.
+        project_row = supabase.table("projects").select("suspended").eq("id", project_id).maybe_single().execute()
+        if project_row and (project_row.data or {}).get("suspended"):
+            return {"answer": "This assistant is temporarily unavailable. Please contact support.", "sources": []}
+
         domain = get_project_domain(project_id)
 
         system_prompt = SYSTEM_PROMPT
@@ -1195,6 +1204,20 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 # -------------------------------------------------
 @router.post("/chat")
 def chat(req: ChatRequest, user=Depends(verify_token)):
+    require_project_role(user.id, req.projectId)
+
+    # FIX: chatId was previously trusted with no ownership check at all —
+    # run_chat() resolves the real customer's channel/external_id from
+    # chat_id alone (see chat_row lookup in run_chat), so an attacker who
+    # knew ANY chat_id belonging to a real customer conversation of a
+    # project they own could impersonate that customer (e.g. cancel their
+    # real appointment) by just supplying that chat_id here. Since this is
+    # an authenticated, project-scoped dashboard endpoint, the chat must
+    # actually belong to the project the caller was just authorized for.
+    chat_check = supabase.table("chats").select("id").eq("id", req.chatId).eq("project_id", req.projectId).maybe_single().execute()
+    if not chat_check or not chat_check.data:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
     rate_check = check_rate_limit(req.projectId)
     if not rate_check["allowed"]:
         raise HTTPException(status_code=429, detail=rate_check["reason"])

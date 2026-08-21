@@ -48,35 +48,65 @@ from razorpay_oauth import router as razorpay_oauth_router
 # -------------------------------------------------
 # BACKGROUND SCHEDULER — appointment reminders + scheduled campaigns
 # -------------------------------------------------
+def _record_job_run(job_name: str, started_at, status: str, detail: dict = None):
+    """Best-effort write to job_runs, powering the admin System Health tab's
+    last-run/success view. Never allowed to break the job itself — a failed
+    write here is swallowed, not raised."""
+    try:
+        from datetime import datetime, timezone
+        from clients import supabase
+        supabase.table("job_runs").insert({
+            "job_name": job_name,
+            "status": status,
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "detail": detail or {},
+        }).execute()
+    except Exception:
+        pass
+
+
 def run_appointment_reminders():
     """Runs every hour — sends WhatsApp reminders for upcoming appointments."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
     try:
         from appointments import send_reminders_job
         send_reminders_job()
+        _record_job_run("appointment_reminders", started_at, "success")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler: reminder job error: {e}")
+        _record_job_run("appointment_reminders", started_at, "failure", {"error": str(e)})
 
 
 def run_scheduled_campaigns():
     """Runs every 30 seconds — sends any campaign whose scheduled time has arrived."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
     try:
         from campaigns import dispatch_scheduled_campaigns
         dispatch_scheduled_campaigns()
+        _record_job_run("scheduled_campaigns", started_at, "success")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler: campaign dispatch error: {e}")
+        _record_job_run("scheduled_campaigns", started_at, "failure", {"error": str(e)})
 
 
 def run_release_expired_holds():
     """Runs every 2 minutes — releases unpaid 'hold_to_confirm' appointment
     bookings whose hold window has expired, freeing the slot back up."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
     try:
         from appointments import release_expired_holds
         release_expired_holds()
+        _record_job_run("appointment_hold_release", started_at, "success")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler: hold-release job error: {e}")
+        _record_job_run("appointment_hold_release", started_at, "failure", {"error": str(e)})
 
 
 def run_shopify_reconciliation():
@@ -84,6 +114,10 @@ def run_shopify_reconciliation():
     aren't 100% guaranteed to deliver (per Shopify's own docs). Webhooks are
     the fast primary path (see shopify_oauth.py); this just catches anything
     missed. One merchant's failure must never abort the loop for the rest."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
+    failed_count = 0
+    total_count = 0
     try:
         from clients import supabase, qdrant, embeddings
         from config import QDRANT_COLLECTION
@@ -92,17 +126,22 @@ def run_shopify_reconciliation():
         integrations = supabase.table("shopify_integrations").select("project_id").execute()
         for integration in (integrations.data or []):
             project_id = integration["project_id"]
+            total_count += 1
             try:
                 source_res = supabase.table("data_sources").select("id").eq("project_id", project_id).eq("type", "shopify").maybe_single().execute()
                 source_id = (source_res.data or {}).get("id") if source_res else None
                 if source_id:
                     sync_products(project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
             except Exception as e:
+                failed_count += 1
                 sentry_sdk.capture_exception(e)
                 print(f"Scheduler: Shopify reconciliation error for project {project_id}: {e}")
+        _record_job_run("shopify_reconciliation", started_at, "success" if failed_count == 0 else "failure",
+                         {"total": total_count, "failed": failed_count})
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler: Shopify reconciliation job error: {e}")
+        _record_job_run("shopify_reconciliation", started_at, "failure", {"error": str(e)})
 
 
 @asynccontextmanager
@@ -137,13 +176,42 @@ app = FastAPI(lifespan=lifespan)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # * needed for public shop page
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is scoped by path rather than applied globally. The only routes ever
+# called by real cross-origin browser JS are under /public/* (the embeddable
+# chat widget, loaded on arbitrary merchant sites whose origin can't be
+# known in advance — so that half stays a real wildcard). Every other route
+# is only ever called server-to-server from the Next.js frontend's own API
+# routes (not subject to browser CORS at all), so it gets a real allowlist
+# instead of "*" — pure defense-in-depth, doesn't change any real traffic.
+# allow_credentials is False on both: the backend never sets cookies (auth
+# is Bearer-token/X-API-Key only), so there's no session for CORS to guard,
+# and dropping it avoids Starlette's spec-mandated origin-reflection that
+# kicks in when "*" is combined with allow_credentials=True.
+class PathScopedCORSMiddleware:
+    def __init__(self, app):
+        self.public = CORSMiddleware(
+            app,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["*"],
+        )
+        self.restricted = CORSMiddleware(
+            app,
+            allow_origins=[FRONTEND_URL],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/public/"):
+            await self.public(scope, receive, send)
+        else:
+            await self.restricted(scope, receive, send)
+
+
+app.add_middleware(PathScopedCORSMiddleware)
 
 # -------------------------------------------------
 # ROUTERS

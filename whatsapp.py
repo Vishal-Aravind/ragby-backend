@@ -7,7 +7,7 @@ from starlette.responses import PlainTextResponse
 
 from clients import supabase
 from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, META_APP_ID, META_APP_SECRET
-from auth import verify_token
+from auth import verify_token, require_project_role
 
 router = APIRouter()
 
@@ -247,6 +247,7 @@ async def whatsapp_webhook(request: Request):
 # -------------------------------------------------
 @router.get("/whatsapp/status/{project_id}")
 def whatsapp_status(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("whatsapp_integrations") \
         .select("phone_number_id, display_phone_number, waba_id") \
         .eq("project_id", project_id) \
@@ -258,6 +259,7 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
 
 @router.post("/whatsapp/connect")
 def whatsapp_connect(data: dict, user=Depends(verify_token)):
+    require_project_role(user.id, data["projectId"])
     supabase.table("whatsapp_integrations").upsert({
         "project_id": data["projectId"],
         "phone_number_id": data["phone_number_id"],
@@ -269,6 +271,7 @@ def whatsapp_connect(data: dict, user=Depends(verify_token)):
 
 @router.delete("/whatsapp/disconnect/{project_id}")
 def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     supabase.table("whatsapp_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
 
@@ -277,16 +280,18 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
 def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     code = data["code"]
     project_id = data["projectId"]
+    require_project_role(user.id, project_id)
 
     token_res = requests.get(
         "https://graph.facebook.com/v19.0/oauth/access_token",
         params={"client_id": META_APP_ID, "client_secret": META_APP_SECRET, "code": code}
     )
     token_data = token_res.json()
-    print(f"Token exchange: {token_data}")
-
+    # FIX: was logging the full response, including the live access_token,
+    # to stdout on every onboarding — never log the raw token response.
     if "access_token" not in token_data:
-        raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_data}")
+        print(f"WhatsApp token exchange failed: {token_data.get('error', token_data)}")
+        raise HTTPException(status_code=400, detail="Token exchange failed")
 
     access_token = token_data["access_token"]
 
@@ -328,6 +333,7 @@ async def whatsapp_reply(data: dict, user=Depends(verify_token)):
     project_id  = data["project_id"]
     phone_number = data["phone_number"]
     message     = data["message"]
+    require_project_role(user.id, project_id)
 
     # Get WhatsApp integration for this project
     res = supabase.table("whatsapp_integrations") \

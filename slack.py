@@ -1,16 +1,46 @@
 import hmac
 import hashlib
+import secrets
 import time
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from clients import supabase
 from config import SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, FRONTEND_URL
-from auth import verify_token
+from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
 
 router = APIRouter()
+
+# Short-lived, single-use CSRF nonce for the OAuth handshake — same pattern
+# as shopify_oauth.py/razorpay_oauth.py. Previously this used a bare
+# state=project_id with nothing binding the callback to the request that
+# issued it, and the callback itself had no auth at all — together that
+# meant anyone who completed their own real Slack OAuth against this app
+# could attach their workspace to any project_id just by POSTing here.
+_oauth_states = {}
+_STATE_TTL_SECONDS = 600
+
+
+def _issue_state(project_id: str) -> str:
+    now = time.time()
+    for k, (_, exp) in list(_oauth_states.items()):
+        if exp < now:
+            _oauth_states.pop(k, None)
+    nonce = secrets.token_urlsafe(24)
+    _oauth_states[nonce] = (project_id, now + _STATE_TTL_SECONDS)
+    return nonce
+
+
+def _consume_state(nonce: str):
+    entry = _oauth_states.pop(nonce, None)
+    if not entry:
+        return None
+    project_id, expires_at = entry
+    if expires_at < time.time():
+        return None
+    return project_id
 
 
 # -------------------------------------------------
@@ -40,22 +70,27 @@ def send_slack_message(access_token: str, channel: str, text: str):
 # -------------------------------------------------
 @router.get("/slack/auth-url")
 def slack_auth_url(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
     scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
+    state = _issue_state(project_id)
     url = (
         f"https://slack.com/oauth/v2/authorize"
         f"?client_id={SLACK_CLIENT_ID}"
         f"&scope={scopes}"
         f"&redirect_uri={redirect_uri}"
-        f"&state={project_id}"
+        f"&state={state}"
     )
     return {"url": url}
 
 
 @router.post("/slack/callback")
-def slack_callback(data: dict):
+def slack_callback(data: dict, user=Depends(verify_token)):
     code = data["code"]
-    project_id = data["project_id"]
+    project_id = _consume_state(data["state"])
+    if not project_id:
+        raise HTTPException(status_code=400, detail="This connection link expired or was already used — please try connecting again.")
+    require_project_role(user.id, project_id)
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
 
     res = requests.post("https://slack.com/api/oauth.v2.access", data={
@@ -77,11 +112,12 @@ def slack_callback(data: dict):
         "bot_user_id": token_data["bot_user_id"],
     }, on_conflict="project_id").execute()
 
-    return {"success": True, "team_name": token_data["team"]["name"]}
+    return {"success": True, "team_name": token_data["team"]["name"], "project_id": project_id}
 
 
 @router.get("/slack/status/{project_id}")
 def slack_status(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("slack_integrations") \
         .select("team_name, team_id") \
         .eq("project_id", project_id) \
@@ -93,6 +129,7 @@ def slack_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/slack/disconnect/{project_id}")
 def slack_disconnect(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     supabase.table("slack_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
 

@@ -280,17 +280,26 @@ def get_registrations_for_phone(project_id: str, phone: str, limit: int = 20) ->
     return result
 
 
-def register_for_event_core(event_id: str, project_id: str, data: dict) -> dict:
+def register_for_event_core(event_id: str, data: dict) -> dict:
     """Core registration logic — shared by the public route and the
     in-chat tool. Re-validates is_active, registration_deadline, capacity,
     and duplicate-phone here — never trusts a stale snapshot (e.g. from an
     earlier browse call). Raises ValueError with a human-readable message
-    on any failure."""
+    on any failure.
+
+    project_id is deliberately NOT a parameter — it's derived from the
+    fetched event row below (FIX: a caller-supplied project_id used to be
+    trusted directly for both the registration insert and the WhatsApp
+    integration lookup, so an event_id from one project combined with an
+    unrelated project_id let an attacker trigger a real WhatsApp
+    confirmation — containing the victim event's real details — sent
+    through a DIFFERENT tenant's connected WhatsApp number to any phone)."""
     event_res = supabase.table("events").select("*").eq("id", event_id).maybe_single().execute()
     if not event_res or not event_res.data:
         raise ValueError("Event not found")
 
     event = event_res.data
+    project_id = event["project_id"]
     if not event.get("is_active"):
         raise ValueError("Registration is closed for this event")
 
@@ -476,7 +485,7 @@ def register_for_event(body: RegistrationCreate, request: Request):
     if is_rate_limited(f"register:{body.project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
     try:
-        return register_for_event_core(body.event_id, body.project_id, body.data or {})
+        return register_for_event_core(body.event_id, body.data or {})
     except ValueError as e:
         msg = str(e)
         if msg == "Event not found":

@@ -12,7 +12,7 @@ from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
-from auth import verify_token
+from auth import verify_token, require_project_role
 
 router = APIRouter()
 
@@ -70,6 +70,16 @@ EXTRACTORS = {
 # -------------------------------------------------
 @router.post("/ingest")
 def ingest(req: IngestRequest, user=Depends(verify_token)):
+    require_project_role(user.id, req.projectId)
+
+    # FIX: filePath is otherwise fully caller-controlled — without this
+    # check, a user with a role on their OWN project could point filePath
+    # at another project's storage object and have it indexed (crediting
+    # req.projectId) as if it were their own document, exfiltrating another
+    # tenant's file content into their own chatbot's knowledge base.
+    if not req.filePath.startswith(f"{req.projectId}/"):
+        raise HTTPException(status_code=403, detail="filePath does not belong to this project")
+
     row = supabase.table("files") \
         .select("id") \
         .eq("project_id", req.projectId) \
@@ -124,6 +134,12 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
 
 @router.delete("/document/{file_id}")
 def delete_document(file_id: str, user=Depends(verify_token)):
+    row = supabase.table("files").select("project_id").eq("id", file_id).maybe_single().execute()
+    file_row = row.data if row else None
+    if not file_row:
+        raise HTTPException(status_code=404, detail="Not found")
+    require_project_role(user.id, file_row["project_id"])
+
     qdrant.delete(
         collection_name=QDRANT_COLLECTION,
         points_selector=models.Filter(

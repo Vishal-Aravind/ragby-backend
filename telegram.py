@@ -1,10 +1,11 @@
+import hmac
 import os
 import sentry_sdk
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import TELEGRAM_WEBHOOK_SECRET
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
@@ -45,6 +46,7 @@ def get_bot_info(bot_token: str):
 def telegram_connect(data: dict, user=Depends(verify_token)):
     bot_token = data["bot_token"]
     project_id = data["projectId"]
+    require_project_role(user.id, project_id)
 
     bot_info = get_bot_info(bot_token)
     if not bot_info.get("ok"):
@@ -69,6 +71,7 @@ def telegram_connect(data: dict, user=Depends(verify_token)):
 
 @router.delete("/telegram/disconnect/{project_id}")
 def telegram_disconnect(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("telegram_integrations") \
         .select("bot_token") \
         .eq("project_id", project_id) \
@@ -84,6 +87,7 @@ def telegram_disconnect(project_id: str, user=Depends(verify_token)):
 
 @router.get("/telegram/status/{project_id}")
 def telegram_status(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("telegram_integrations") \
         .select("bot_username, created_at") \
         .eq("project_id", project_id) \
@@ -102,11 +106,11 @@ async def telegram_webhook(project_id: str, req: Request):
     # dashboard) so Telegram actually registers the secret_token — until
     # then its existing webhook registration has no secret to send, and
     # this check would reject it.
-    if not TELEGRAM_WEBHOOK_SECRET or req.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+    header_token = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not TELEGRAM_WEBHOOK_SECRET or not header_token or not hmac.compare_digest(header_token, TELEGRAM_WEBHOOK_SECRET):
         raise HTTPException(status_code=403, detail="Invalid secret token")
 
     body = await req.json()
-    print(f"TELEGRAM BODY: {body}")
 
     try:
         message = body.get("message") or body.get("edited_message")

@@ -5,7 +5,7 @@ Businesses can add these to their WABA with one click.
 """
 from fastapi import APIRouter, Depends, HTTPException
 from clients import supabase
-from auth import verify_token
+from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN
 import requests
 
@@ -220,6 +220,7 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
     """Submit a pre-built template to the customer's WABA."""
     project_id  = data["project_id"]
     template_id = data["template_id"]
+    require_project_role(user.id, project_id)
 
     # Find template
     template = next((t for t in TEMPLATE_LIBRARY if t["id"] == template_id), None)
@@ -290,6 +291,7 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
 @router.get("/template-library/sync/{project_id}")
 def sync_templates_from_meta(project_id: str, user=Depends(verify_token)):
     """Fetch all templates from the merchant's WABA and return with approval status."""
+    require_project_role(user.id, project_id)
 
     # Get WABA ID
     wa = supabase.table("whatsapp_integrations") \

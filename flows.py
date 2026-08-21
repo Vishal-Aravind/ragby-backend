@@ -445,6 +445,18 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     if trigger.startswith("cancel_appt_"):
         from appointments import cancel_appointment
         appointment_id = trigger.replace("cancel_appt_", "")
+
+        # FIX: previously cancelled whatever appointment_id was embedded in
+        # the button trigger with no check the sender is actually that
+        # appointment's customer — a forged/replayed trigger id (or a
+        # button payload observed some other way) could cancel someone
+        # else's booking. Confirm the appointment belongs to this exact
+        # sender + project before touching it.
+        appt_check = supabase.table("appointments").select("customer_phone").eq("id", appointment_id).eq("project_id", project_id).maybe_single().execute()
+        appt_data = appt_check.data if appt_check else None
+        if not appt_data or appt_data.get("customer_phone") != phone_number.replace("+", "").replace(" ", ""):
+            return
+
         try:
             # notify_customer=False — the message right below already tells
             # them; reuses the same logic that also cleans up the Google

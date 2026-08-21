@@ -391,23 +391,31 @@ def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depen
 # PUBLIC — Booking page APIs
 # -------------------------------------------------
 @router.get("/public/appointments/{project_id}/settings")
-def public_settings(project_id: str):
+def public_settings(project_id: str, request: Request):
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"appt-settings:{project_id}:{ip}", limit=60, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
+    # FIX: previously also selected google_refresh_token into memory (then
+    # popped it before returning) — this is a public, unauthenticated route,
+    # so don't pull a merchant's Calendar token into scope here at all.
     res = supabase.table("appointment_settings").select(
-        "working_hours,advance_booking_days,accent_color,currency_code,is_enabled,google_refresh_token,google_calendar_id"
+        "working_hours,advance_booking_days,accent_color,currency_code,is_enabled,google_calendar_id"
     ).eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         raise HTTPException(status_code=404, detail="Booking not configured")
     data = res.data
     if not data.get("is_enabled"):
         raise HTTPException(status_code=403, detail="Booking not enabled")
-    data.pop("google_refresh_token", None)
     return data
 
 
 @router.get("/public/appointments/{project_id}/services")
-def public_services(project_id: str):
+def public_services(project_id: str, request: Request):
     """Active services a customer can pick from on the public booking page
     — no auth, matches the rest of the /public/* surface."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"appt-services:{project_id}:{ip}", limit=60, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("appointment_services").select(
         "id,name,description,duration_minutes,price,payment_mode"
     ).eq("project_id", project_id).eq("is_active", True).order("sort_order", desc=False).execute()
@@ -436,11 +444,14 @@ def public_booking_status(project_id: str, appointment_id: str, request: Request
 
 
 @router.get("/public/appointments/{project_id}/reschedule/{appointment_id}")
-def public_reschedule_context(project_id: str, appointment_id: str):
+def public_reschedule_context(project_id: str, appointment_id: str, request: Request):
     """Used only by the reschedule flow on the public booking page to learn
     which service the original appointment was for, so it can skip service
     selection and fetch slots with the right duration — changing service on
     reschedule isn't supported (see create_appointment's docstring)."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"appt-reschedule-ctx:{project_id}:{ip}", limit=30, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("appointments").select("service_id, service_name") \
         .eq("id", appointment_id).eq("project_id", project_id).maybe_single().execute()
     appt = res.data if res else None
@@ -629,7 +640,20 @@ def create_appointment(
     if reschedule_id:
         old_appt_res = supabase.table("appointments").select("*").eq("id", reschedule_id).maybe_single().execute()
         old_appt_data = old_appt_res.data if old_appt_res else None
-        if old_appt_data and old_appt_data.get("service_id"):
+        if not old_appt_data:
+            raise ValueError("Original appointment not found")
+        # FIX: previously anyone who learned another customer's
+        # appointment_id (visible in WhatsApp button payloads and the
+        # public reschedule-context endpoint) could move that appointment
+        # to a new time under different customer details, cancelling the
+        # real customer's booking out from under them. Require the caller's
+        # own phone/project to match the original booking before honoring
+        # a reschedule — never trust reschedule_id alone.
+        if old_appt_data.get("project_id") != project_id:
+            raise ValueError("Original appointment not found")
+        if old_appt_data.get("customer_phone") != customer_phone.replace("+", "").replace(" ", ""):
+            raise ValueError("This appointment does not belong to that phone number")
+        if old_appt_data.get("service_id"):
             service_id = old_appt_data["service_id"]
 
     if not service_id:
@@ -819,8 +843,11 @@ def create_appointment(
 
 
 @router.get("/public/appointments/{project_id}/slots")
-def public_slots(project_id: str, date: str, service_id: str):
+def public_slots(project_id: str, date: str, service_id: str, request: Request):
     """Get available slots for a specific date + service."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"appt-slots:{project_id}:{ip}", limit=30, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     try:
         slots = get_available_slots(project_id, date, service_id)
     except ValueError as e:
@@ -1011,83 +1038,15 @@ def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=
 
 
 # -------------------------------------------------
-# REMINDER SENDER (called by a cron job or manually)
+# REMINDER SENDER — actual reminders are sent by send_reminders_job() below,
+# called directly by the in-process scheduler in main.py. There used to
+# also be an HTTP POST /appointments/send-reminders route here that ANY
+# logged-in user (not project-scoped at all) could hit to trigger a
+# reminder blast across every tenant's customers on demand — it had no
+# frontend caller (confirmed via repo-wide search), duplicated
+# send_reminders_job's logic, and served no legitimate purpose. Removed
+# rather than patched, per the security audit.
 # -------------------------------------------------
-@router.post("/appointments/send-reminders")
-def send_reminders(user=Depends(verify_token)):
-    """Send reminders for upcoming appointments. Call this every hour via a cron job."""
-    # appointment_date/start_time are IST wall-clock values — datetime.now()
-    # would read the server's UTC clock instead, same bug as generate_slots.
-    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    sent = 0
-    failed = 0
-
-    # Get all confirmed, unreminded appointments
-    appts_res = supabase.table("appointments") \
-        .select("*") \
-        .eq("status", "confirmed") \
-        .eq("reminder_sent", False) \
-        .execute()
-
-    for appt in (appts_res.data or []):
-        try:
-            settings_res = supabase.table("appointment_settings").select("reminder_hours").eq("project_id", appt["project_id"]).maybe_single().execute()
-            settings = (settings_res.data if settings_res else None) or {}
-            reminder_hours = settings.get("reminder_hours", 24)
-
-            # Parse start_time — handle both "HH:MM:SS" and "HH:MM" formats
-            start_time_str = str(appt["start_time"])[:5]
-            appt_dt = datetime.strptime(f"{appt['appointment_date']} {start_time_str}", "%Y-%m-%d %H:%M")
-            hours_until = (appt_dt - now).total_seconds() / 3600
-
-            if 0 < hours_until <= reminder_hours:
-                wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", appt["project_id"]).maybe_single().execute()
-                wa_data = (wa_res.data if wa_res else None)
-
-                if wa_data:
-                    phone_number_id = wa_data["phone_number_id"]
-                    token = wa_data.get("access_token") or WHATSAPP_TOKEN
-                    date_obj = datetime.strptime(appt["appointment_date"], "%Y-%m-%d")
-                    date_formatted = date_obj.strftime("%d %B %Y")
-
-                    # Try approved template first (works outside 24hr window)
-                    template_sent = _send_reminder_template(
-                        to=appt["customer_phone"],
-                        customer_name=appt["customer_name"],
-                        date=date_formatted,
-                        time=start_time_str,
-                        phone_number_id=phone_number_id,
-                        token=token,
-                    )
-
-                    if not template_sent:
-                        # Fallback to plain text (only works within 24hr window)
-                        from whatsapp import send_whatsapp_message
-                        msg = (
-                            f"\u23f0 *Appointment Reminder*\n\n"
-                            f"Hi {appt['customer_name']}! Your {appt['service_name']} is coming up.\n\n"
-                            f"\U0001f4c5 {date_formatted}\n"
-                            f"\u23f0 {start_time_str}\n\n"
-                            f"Reply *CANCEL* if you need to cancel."
-                        )
-                        send_whatsapp_message(
-                            to=appt["customer_phone"],
-                            text=msg,
-                            phone_number_id=phone_number_id,
-                            token=token,
-                        )
-
-                    supabase.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
-                    sent += 1
-
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
-            print(f"Reminder error for {appt['id']}: {e}")
-            failed += 1
-
-    return {"status": "done", "reminders_sent": sent, "failed": failed}
-
-
 def _send_reminder_template(to: str, customer_name: str, date: str, time: str, phone_number_id: str, token: str) -> bool:
     """
     Send appointment_reminder template message.

@@ -166,10 +166,23 @@ def get_active_catalog_summary(project_id: str) -> list:
 # SHOP CONFIG
 # ─────────────────────────────────────────────
 
+# FIX: shop_config.razorpay_key_secret was previously returned to the
+# browser on every GET/PUT via select("*") — a real, live merchant secret
+# key shipped into the dashboard's JS/network tab on every settings-page
+# load. Explicit column list, excluding it, used by both handlers below.
+# razorpay_key_id is kept (not sensitive on its own); razorpay_key_secret
+# is now write-only from the frontend's perspective.
+_SHOP_CONFIG_SAFE_COLUMNS = (
+    "project_id, store_name, store_phone, gst_percent, currency, currency_code, "
+    "accent_color, delivery_types, terms_note, razorpay_key_id, is_enabled, "
+    "bot_can_assist, bot_can_order"
+)
+
+
 @router.get("/shop-config/{project_id}")
 async def get_shop_config(project_id: str, user=Depends(verify_token)):
     require_project_role(user.id, project_id)
-    res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
+    res = supabase.table("shop_config").select(_SHOP_CONFIG_SAFE_COLUMNS).eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         return {
             "project_id": project_id,
@@ -182,7 +195,6 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
             "delivery_types": ["Takeaway"],
             "terms_note": "This order is not eligible for any kind of Discounts. T&C apply.",
             "razorpay_key_id": "",
-            "razorpay_key_secret": "",
             "is_enabled": False,
             "bot_can_assist": False,
             "bot_can_order": False,
@@ -198,7 +210,7 @@ async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depen
         supabase.table("shop_config").update(update).eq("project_id", project_id).execute()
     else:
         supabase.table("shop_config").insert({"project_id": project_id, **update}).execute()
-    res = supabase.table("shop_config").select("*").eq("project_id", project_id).single().execute()
+    res = supabase.table("shop_config").select(_SHOP_CONFIG_SAFE_COLUMNS).eq("project_id", project_id).single().execute()
     return res.data
 
 
@@ -333,8 +345,13 @@ async def public_products(project_id: str, catalog_id: Optional[str] = None):
     return res.data or []
 
 @router.get("/public/shop/order/{order_id}")
-async def public_get_order(order_id: str):
+async def public_get_order(order_id: str, request: Request):
     """Fetch an existing order's items — used to pre-populate cart for 'Add More' flow."""
+    # Keyed by IP alone (not order_id) — the point is slowing down someone
+    # probing many DIFFERENT order ids, not just repeated hits on one.
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"order-lookup:{ip}", limit=20, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("orders").select("*").eq("id", order_id).maybe_single().execute()
     if not res or not res.data:
         return {"items": []}
@@ -524,6 +541,18 @@ async def submit_cart(body: CartSubmit, request: Request):
 
     # ── If order_id is present, UPDATE the existing order (Add More flow) ──
     if body.order_id:
+        # FIX: this endpoint is public/unauthenticated by design (it's the
+        # web shop checkout) — previously it updated ANY order by id with
+        # no check that it actually belongs to this project_id/phone,
+        # letting anyone who learned an order UUID overwrite its items/
+        # price and (via _send_cart_confirmation below) trigger a WhatsApp
+        # message from a project they don't own to an arbitrary phone.
+        owned_order = supabase.table("orders").select("id") \
+            .eq("id", body.order_id).eq("project_id", project_id).eq("phone_number", phone) \
+            .maybe_single().execute()
+        if not owned_order or not owned_order.data:
+            raise HTTPException(status_code=404, detail="Order not found")
+
         supabase.table("orders").update({
             "items": items_data,
             "subtotal": subtotal,

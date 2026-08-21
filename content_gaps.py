@@ -16,7 +16,7 @@ from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
-from auth import verify_token
+from auth import verify_token, require_project_role
 
 router = APIRouter()
 
@@ -29,6 +29,7 @@ class FaqAnswerRequest(BaseModel):
 
 @router.post("/content-gaps/answer")
 def answer_content_gap(req: FaqAnswerRequest, user=Depends(verify_token)):
+    require_project_role(user.id, req.project_id)
     text = f"Q: {req.question}\nA: {req.answer}"
     filename = f"FAQ: {req.question[:50]} #{secrets.token_hex(4)}"
 

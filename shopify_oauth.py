@@ -31,10 +31,11 @@ from urllib.parse import urlencode
 import requests
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
+from ratelimit import is_rate_limited
 from fastapi.responses import HTMLResponse
 
 from clients import supabase, qdrant, embeddings
-from auth import verify_token
+from auth import verify_token, require_project_role
 from shopify_client import graphql as _graphql
 from config import (
     SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SHOPIFY_APP_SCOPES,
@@ -189,6 +190,7 @@ def _sync_shop_currency(project_id: str, shop_domain: str, access_token: str):
 
 @router.get("/shopify/oauth/start")
 def shopify_oauth_start(project_id: str, shop: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     if not SHOPIFY_API_KEY or not SHOPIFY_API_SECRET:
         raise HTTPException(status_code=400, detail="Shopify integration not configured. Add SHOPIFY_API_KEY and SHOPIFY_API_SECRET to env vars.")
 
@@ -279,6 +281,7 @@ def shopify_oauth_callback(request: Request):
 
 @router.get("/shopify/status/{project_id}")
 def shopify_status(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     res = supabase.table("shopify_integrations").select("shop_domain, last_synced_at, last_sync_error").eq("project_id", project_id).maybe_single().execute()
     data = res.data if res else None
     if not data:
@@ -292,6 +295,7 @@ def shopify_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/shopify/disconnect/{project_id}")
 def shopify_disconnect(project_id: str, user=Depends(verify_token)):
+    require_project_role(user.id, project_id)
     # Leaves products/catalogs rows in place — deleting them would break
     # historical orders.items display. The source='shopify' catalog just
     # stops receiving updates.
@@ -411,12 +415,15 @@ async def shopify_webhooks(request: Request):
 
 
 @router.get("/public/shopify/cart-status/{chat_id}")
-def shopify_cart_status(chat_id: str):
+def shopify_cart_status(chat_id: str, request: Request):
     """Polled by the storefront widget when the shopper's tab regains focus
     after being sent to Shopify's checkout — no auth, matching the rest of
     the /public/* surface. Looks up the most recent cart this conversation
     built (there could be more than one if the shopper abandoned an earlier
     one) rather than assuming exactly one ever exists per chat."""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    if is_rate_limited(f"shopify-cart-status:{chat_id}:{ip}", limit=60, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("shopify_cart_sessions") \
         .select("status, checkout_url, shopify_order_id") \
         .eq("chat_id", chat_id) \

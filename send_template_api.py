@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
 from config import WHATSAPP_TOKEN
+from api_keys import hash_key
+from ratelimit import is_rate_limited
 import requests
 
 router = APIRouter()
@@ -38,10 +40,11 @@ def get_project_from_api_key(api_key: str) -> dict:
     if not api_key:
         raise HTTPException(status_code=401, detail="API key required. Pass it as X-API-Key header.")
 
-    # Look up API key
+    # Look up API key by hash — the plaintext key column is no longer
+    # populated (see api_keys.py, keys are hashed at rest and shown once).
     key_res = supabase.table("api_keys") \
         .select("project_id, is_active") \
-        .eq("key", api_key) \
+        .eq("key_hash", hash_key(api_key)) \
         .maybe_single() \
         .execute()
 
@@ -93,6 +96,11 @@ def send_template(
     }
     """
     project = get_project_from_api_key(x_api_key)
+
+    # Short-window burst limit on top of the monthly cap below — a leaked
+    # key otherwise has no ceiling until that monthly cap is hit.
+    if is_rate_limited(f"api-send-template:{project['project_id']}", limit=20, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please slow down.")
 
     # A leaked/compromised API key previously had NO cost ceiling at all
     # here — not even the monthly cap every other send path in this app
@@ -244,6 +252,9 @@ def send_template_bulk(
     }
     """
     project = get_project_from_api_key(x_api_key)
+
+    if is_rate_limited(f"api-send-template-bulk:{project['project_id']}", limit=5, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many bulk requests — please slow down.")
 
     from usage import check_rate_limit, increment_usage
     rate_check = check_rate_limit(project["project_id"])

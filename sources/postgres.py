@@ -1,6 +1,10 @@
 # sources/postgres.py
 # Handles both PostgreSQL and MySQL via SQLAlchemy
 
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
 import sentry_sdk
 import sqlalchemy
 from functools import lru_cache
@@ -28,11 +32,35 @@ def normalize_url(db_url: str) -> str:
 
 
 def validate_url(db_url: str):
-    """Raise ValueError if URL is not a supported database type."""
+    """Raise ValueError if URL is not a supported database type, or if it
+    resolves to a private/internal/loopback address.
+
+    FIX: this previously only checked the scheme prefix — any authenticated
+    user could point this at an internal host (localhost, RFC1918 ranges,
+    cloud metadata endpoints, etc.) and get the full table/column schema of
+    whatever database lives there. This is a practical mitigation (resolves
+    the hostname once and checks the IP), not a complete defense against
+    DNS-rebinding-style TOCTOU attacks — reasonable given the trust level
+    here (any signed-up user can already point this at a real internet
+    database), not a fully isolated execution context."""
     if not any(db_url.startswith(p) for p in SUPPORTED_PREFIXES):
         raise ValueError(
             "Unsupported database. Supported: PostgreSQL (postgresql://) and MySQL (mysql:// or mysql+pymysql://)"
         )
+
+    host = urlsplit(db_url).hostname
+    if not host:
+        raise ValueError("Could not parse a host from this connection string.")
+
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise ValueError("Could not resolve this database host.")
+
+    for family, _, _, _, sockaddr in addrinfo:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError("This host is not reachable — internal/private network addresses aren't allowed.")
 
 
 def get_schema(db_url: str, allowed_schema: dict | None = None) -> str:
