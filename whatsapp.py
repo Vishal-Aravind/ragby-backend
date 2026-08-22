@@ -554,6 +554,13 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     code = data["code"]
     project_id = data["projectId"]
     is_coexistence = bool(data.get("isCoexistence"))
+    # For a coexistence completion, Meta's own FINISH_WHATSAPP_BUSINESS_APP_
+    # ONBOARDING session event hands us the waba_id directly in its payload
+    # — more reliable than /me/whatsapp_business_accounts, which came back
+    # empty for a real coexistence connection during testing (business-app-
+    # linked WABAs aren't guaranteed to show up in that generic listing, or
+    # there's a propagation delay after the phone's "tap Confirm" step).
+    waba_id_hint = data.get("wabaIdHint")
     require_project_role(user.id, project_id)
 
     token_res = requests.get(
@@ -569,17 +576,39 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 
     access_token = token_data["access_token"]
 
-    waba_res = requests.get(
-        "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
-        params={"access_token": access_token}
-    )
-    waba_id = waba_res.json().get("data", [{}])[0].get("id", "")
+    waba_id = waba_id_hint or ""
+    if not waba_id:
+        waba_res = requests.get(
+            "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
+            params={"access_token": access_token}
+        )
+        waba_json = waba_res.json()
+        waba_id = waba_json.get("data", [{}])[0].get("id", "")
+        if not waba_id:
+            print(f"WhatsApp onboard: no WABA found for project {project_id}, coexistence={is_coexistence}. Response: {waba_json}")
 
-    phone_res = requests.get(
-        f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
-        params={"access_token": access_token}
-    )
-    phone_data = phone_res.json().get("data", [{}])[0]
+    # A newly (or freshly re-)confirmed WABA/number can take a moment to
+    # show up via the phone_numbers endpoint — retry a few times rather
+    # than failing the whole connect on the first empty response.
+    phone_data = {}
+    phone_json = {}
+    for attempt in range(3):
+        phone_res = requests.get(
+            f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
+            params={"access_token": access_token}
+        )
+        phone_json = phone_res.json()
+        candidates = phone_json.get("data", [])
+        if candidates:
+            phone_data = candidates[0]
+            break
+        if attempt < 2:
+            import time
+            time.sleep(2)
+
+    if not phone_data:
+        print(f"WhatsApp onboard: no phone number found for project {project_id}, waba_id={waba_id}, coexistence={is_coexistence} after 3 attempts. Last response: {phone_json}")
+
     phone_number_id = phone_data.get("id", "")
     display_phone = phone_data.get("display_phone_number", "")
 
