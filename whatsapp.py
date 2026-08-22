@@ -543,8 +543,11 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
     New connections don't need this; it's for repairing ones made before
     the fix landed."""
     require_project_role(user.id, project_id)
-    res = supabase.table("whatsapp_integrations").select("waba_id").eq("project_id", project_id).maybe_single().execute()
-    waba_id = (res.data or {}).get("waba_id") if res else None
+    res = supabase.table("whatsapp_integrations") \
+        .select("waba_id, phone_number_id, coexistence_enabled, history_sync_status") \
+        .eq("project_id", project_id).maybe_single().execute()
+    row = res.data if res else None
+    waba_id = (row or {}).get("waba_id")
     if not waba_id:
         raise HTTPException(status_code=404, detail="No WhatsApp Business Account on file for this project")
 
@@ -556,7 +559,17 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
         print(f"WhatsApp resubscribe failed: project={project_id}, waba_id={waba_id}. Response: {subscribe_res.text}")
         raise HTTPException(status_code=502, detail=f"Meta rejected the subscription: {subscribe_res.text}")
 
-    return {"success": True, "waba_id": waba_id}
+    # The original history/contacts sync request may have been issued
+    # before this WABA was actually subscribed to receive webhooks — Meta
+    # had nowhere to deliver it, so that specific request is likely stale.
+    # Subscribing doesn't retroactively revive it; ask again now that
+    # subscription is confirmed working.
+    resynced = False
+    if row.get("coexistence_enabled") and row.get("history_sync_status") in ("pending", "failed") and row.get("phone_number_id"):
+        initiate_coexistence_sync(project_id, row["phone_number_id"], WHATSAPP_TOKEN)
+        resynced = True
+
+    return {"success": True, "waba_id": waba_id, "resynced": resynced}
 
 
 @router.get("/whatsapp/coexistence-status/{project_id}")
