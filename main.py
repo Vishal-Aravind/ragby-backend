@@ -144,6 +144,32 @@ def run_shopify_reconciliation():
         _record_job_run("shopify_reconciliation", started_at, "failure", {"error": str(e)})
 
 
+def run_whatsapp_sync_monitor():
+    """Runs every 30 minutes — surfaces WhatsApp Coexistence history syncs
+    that have been stuck in 'pending'/'in_progress' for a while. Meta gives
+    a hard 24-hour window to complete a sync or the client must be fully
+    offboarded and redo signup — this is the manual-intervention buffer
+    before that cliff, since there's no on-call/paging setup here, only
+    the admin System Health tab this surfaces into."""
+    from datetime import datetime, timezone, timedelta
+    started_at = datetime.now(timezone.utc)
+    try:
+        from clients import supabase
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+        stalled = supabase.table("whatsapp_integrations") \
+            .select("project_id, history_sync_status, history_sync_requested_at") \
+            .in_("history_sync_status", ["pending", "in_progress"]) \
+            .lt("history_sync_requested_at", cutoff) \
+            .execute()
+        count = len(stalled.data or [])
+        _record_job_run("whatsapp_sync_monitor", started_at, "success" if count == 0 else "failure",
+                         {"stalled_count": count})
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Scheduler: WhatsApp sync monitor error: {e}")
+        _record_job_run("whatsapp_sync_monitor", started_at, "failure", {"error": str(e)})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start scheduler on app startup
@@ -154,8 +180,9 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_scheduled_campaigns, 'interval', seconds=30, id='scheduled_campaigns')
         scheduler.add_job(run_shopify_reconciliation, 'interval', hours=6, id='shopify_reconciliation')
         scheduler.add_job(run_release_expired_holds, 'interval', minutes=2, id='appointment_hold_release')
+        scheduler.add_job(run_whatsapp_sync_monitor, 'interval', minutes=30, id='whatsapp_sync_monitor')
         scheduler.start()
-        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h, appointment hold release every 2m")
+        print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h, appointment hold release every 2m, WhatsApp sync monitor every 30m")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler failed to start: {e}")
