@@ -576,6 +576,18 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail="This project has no active WhatsApp Coexistence connection to resync")
 
     initiate_coexistence_sync(project_id, row["phone_number_id"], WHATSAPP_TOKEN)
+
+    # FIX: initiate_coexistence_sync() catches Meta API failures internally
+    # (writes them to last_sync_error, doesn't raise) so it can always
+    # finish writing the row — but that meant this endpoint always
+    # reported {"success": true} even when Meta rejected the request
+    # outright (e.g. the sync rate limit hit live during testing). Read
+    # the outcome back so the caller gets the truth, not just "it ran."
+    result = supabase.table("whatsapp_integrations").select("history_sync_status, last_sync_error").eq("project_id", project_id).maybe_single().execute()
+    row = result.data if result else {}
+    if (row or {}).get("history_sync_status") == "failed":
+        raise HTTPException(status_code=502, detail=(row or {}).get("last_sync_error") or "Sync request failed")
+
     return {"success": True}
 
 
