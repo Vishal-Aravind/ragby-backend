@@ -507,8 +507,24 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
     # than ship an unconfirmed disconnect path for something explicitly
     # meant to protect client data, refuse and point them at the one
     # mechanism we know is correct: their own phone.
-    existing = supabase.table("whatsapp_integrations").select("coexistence_enabled").eq("project_id", project_id).maybe_single().execute()
-    if existing and (existing.data or {}).get("coexistence_enabled"):
+    #
+    # Checked two ways, not one: coexistence_enabled directly, AND
+    # history_sync_status as a redundant signal (anything other than the
+    # not-a-coexistence-connection defaults) — belt-and-suspenders after a
+    # real incident where a plain coexistence_enabled check alone let a
+    # disconnect through it should have blocked, root cause not yet fully
+    # confirmed. Logged explicitly either way so a repeat is diagnosable
+    # from Render logs instead of another guessing round.
+    existing = supabase.table("whatsapp_integrations") \
+        .select("coexistence_enabled, history_sync_status") \
+        .eq("project_id", project_id).maybe_single().execute()
+    row = (existing.data if existing else None) or {}
+    print(f"WhatsApp disconnect check: project={project_id}, coexistence_enabled={row.get('coexistence_enabled')}, history_sync_status={row.get('history_sync_status')}")
+
+    is_coexistence_connection = bool(row.get("coexistence_enabled")) or \
+        row.get("history_sync_status") not in (None, "not_applicable", "declined")
+    if is_coexistence_connection:
+        print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection")
         raise HTTPException(
             status_code=400,
             detail="This number is connected via WhatsApp Coexistence. Disconnect it from the WhatsApp Business App on your phone instead — Zavo can't safely disconnect a coexistence number without risking your chat history.",
@@ -516,6 +532,31 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
 
     supabase.table("whatsapp_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
+
+
+@router.post("/whatsapp/resubscribe/{project_id}")
+def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
+    """One-off recovery for connections made before the POST
+    /{waba_id}/subscribed_apps call existed in whatsapp_onboard — without
+    it, Meta never routes ANY webhook (messages, history, echoes) to this
+    app for that WABA, regardless of the app-level webhook field toggles.
+    New connections don't need this; it's for repairing ones made before
+    the fix landed."""
+    require_project_role(user.id, project_id)
+    res = supabase.table("whatsapp_integrations").select("waba_id").eq("project_id", project_id).maybe_single().execute()
+    waba_id = (res.data or {}).get("waba_id") if res else None
+    if not waba_id:
+        raise HTTPException(status_code=404, detail="No WhatsApp Business Account on file for this project")
+
+    subscribe_res = requests.post(
+        f"https://graph.facebook.com/v25.0/{waba_id}/subscribed_apps",
+        params={"access_token": WHATSAPP_TOKEN}
+    )
+    if not subscribe_res.ok:
+        print(f"WhatsApp resubscribe failed: project={project_id}, waba_id={waba_id}. Response: {subscribe_res.text}")
+        raise HTTPException(status_code=502, detail=f"Meta rejected the subscription: {subscribe_res.text}")
+
+    return {"success": True, "waba_id": waba_id}
 
 
 @router.get("/whatsapp/coexistence-status/{project_id}")
@@ -588,6 +629,21 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
         waba_id = waba_json.get("data", [{}])[0].get("id", "")
         if not waba_id:
             print(f"WhatsApp onboard: no WABA found for project {project_id}, coexistence={is_coexistence}. Response: {waba_json}")
+
+    # REQUIRED, separate from the App Dashboard's webhook field toggles —
+    # those configure which fields your app CAN receive, but Meta won't
+    # route any webhook (messages, history, smb_app_state_sync, etc.) for
+    # this specific WABA to your app until the WABA is explicitly
+    # subscribed. Missing this call was the actual reason nothing arrived
+    # during testing, on live messages and history sync alike — not a
+    # Render/config issue.
+    if waba_id:
+        subscribe_res = requests.post(
+            f"https://graph.facebook.com/v25.0/{waba_id}/subscribed_apps",
+            params={"access_token": access_token}
+        )
+        if not subscribe_res.ok:
+            print(f"WhatsApp onboard: failed to subscribe app to waba_id={waba_id}, project={project_id}. Response: {subscribe_res.text}")
 
     # A newly (or freshly re-)confirmed WABA/number can take a moment to
     # show up via the phone_numbers endpoint — retry a few times rather
