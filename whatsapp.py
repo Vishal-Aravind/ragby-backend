@@ -209,7 +209,7 @@ def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_toke
     to 48h for deregistration to clear before they can retry), so this
     cannot ride on a queued background job with loose timing."""
     from datetime import datetime, timezone
-    url = f"https://graph.facebook.com/v19.0/{phone_number_id}/smb_app_data"
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/smb_app_data"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
     update = {
@@ -250,7 +250,7 @@ def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_toke
 def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None):
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
-    url = f"https://graph.facebook.com/v19.0/{pid}/messages"
+    url = f"https://graph.facebook.com/v25.0/{pid}/messages"
     headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
@@ -265,7 +265,7 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
 
 
 def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: str, token: str):
-    url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     # WhatsApp rejects the ENTIRE message if the body exceeds 1024 chars —
     # a last-resort safety net so a too-long body (e.g. a merchant-authored
@@ -294,7 +294,7 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: st
 
 
 def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, phone_number_id: str, token: str):
-    url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
@@ -313,7 +313,7 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
 
 
 def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, phone_number_id: str, token: str):
-    url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
@@ -531,7 +531,7 @@ def whatsapp_coexistence_status(project_id: str, user=Depends(verify_token)):
     is_on_biz_app = None
     try:
         check_res = requests.get(
-            f"https://graph.facebook.com/v19.0/{row['phone_number_id']}",
+            f"https://graph.facebook.com/v25.0/{row['phone_number_id']}",
             params={"fields": "is_on_biz_app,platform_type", "access_token": WHATSAPP_TOKEN},
         )
         if check_res.ok:
@@ -551,8 +551,10 @@ def whatsapp_coexistence_status(project_id: str, user=Depends(verify_token)):
 
 @router.post("/whatsapp/onboard")
 def whatsapp_onboard(data: dict, user=Depends(verify_token)):
-    code = data["code"]
-    project_id = data["projectId"]
+    code = data.get("code")
+    project_id = data.get("projectId")
+    if not code or not project_id:
+        raise HTTPException(status_code=400, detail="Missing code or projectId")
     is_coexistence = bool(data.get("isCoexistence"))
     # For a coexistence completion, Meta's own FINISH_WHATSAPP_BUSINESS_APP_
     # ONBOARDING session event hands us the waba_id directly in its payload
@@ -564,7 +566,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     require_project_role(user.id, project_id)
 
     token_res = requests.get(
-        "https://graph.facebook.com/v19.0/oauth/access_token",
+        "https://graph.facebook.com/v25.0/oauth/access_token",
         params={"client_id": META_APP_ID, "client_secret": META_APP_SECRET, "code": code}
     )
     token_data = token_res.json()
@@ -579,7 +581,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     waba_id = waba_id_hint or ""
     if not waba_id:
         waba_res = requests.get(
-            "https://graph.facebook.com/v19.0/me/whatsapp_business_accounts",
+            "https://graph.facebook.com/v25.0/me/whatsapp_business_accounts",
             params={"access_token": access_token}
         )
         waba_json = waba_res.json()
@@ -594,7 +596,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     phone_json = {}
     for attempt in range(3):
         phone_res = requests.get(
-            f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
+            f"https://graph.facebook.com/v25.0/{waba_id}/phone_numbers",
             params={"access_token": access_token}
         )
         phone_json = phone_res.json()
