@@ -249,6 +249,16 @@ def change_plan(body: SubscribeRequest, user=Depends(verify_token)):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Billing change_plan error: subscription_id={subscription_id}, new_plan_id={new_plan_id}, user={user.id}, error={e}")
+        # Real, permanent Razorpay platform limitation, not a transient
+        # failure — a UPI AutoPay mandate is registered for one specific
+        # plan/amount and can't be edited in place the way a card can.
+        # "Please try again" would be actively misleading here since
+        # retrying can never succeed; tell the customer what to actually do.
+        if "payment mode is upi" in str(e).lower():
+            raise HTTPException(
+                status_code=400,
+                detail="UPI payments don't support changing plans. Please cancel your subscription and re-subscribe to a different plan — using a card instead of UPI lets you change plans directly next time.",
+            )
         raise HTTPException(status_code=502, detail="Could not change your plan. Please try again.")
 
     # Does NOT optimistically flip profiles.plan — waits for the resulting
