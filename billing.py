@@ -207,6 +207,11 @@ def get_plan(user=Depends(verify_token)):
             sub = client.subscription.fetch(subscription_id)
             result["status"] = sub.get("status")
             result["charge_at"] = sub.get("charge_at")
+            # Razorpay flips status to "cancelled" immediately when a
+            # cancel-at-cycle-end is requested, even though access keeps
+            # running until current_end — the frontend needs this to show
+            # "cancels on X" instead of silently looking unchanged.
+            result["current_end"] = sub.get("current_end")
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"Billing get_plan fetch error: subscription_id={subscription_id}, user={user.id}, error={e}")
