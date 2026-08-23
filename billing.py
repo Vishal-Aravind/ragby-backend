@@ -22,7 +22,6 @@
 import hashlib
 import hmac
 import json
-import time
 
 import razorpay
 import sentry_sdk
@@ -42,17 +41,17 @@ router = APIRouter()
 
 client = razorpay.Client(auth=(RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET))
 
-# Razorpay subscriptions require SOME bound (total_count or end_at, max 100
-# years) — there's no "bill until cancelled" flag. ~50 years was the
-# original choice to emulate indefinite billing, but that pushes end_at
-# past ~2076 — well beyond the year-2038 boundary where a 32-bit signed
-# Unix timestamp overflows. Confirmed via a live ServerError from Razorpay's
-# API (opaque 5xx, no validation error) that this was breaking real
-# subscription creation, consistent with an overflow somewhere in their
-# stack. 10 years is still effectively indefinite for this purpose (no real
-# subscription survives a full decade untouched) and stays safely inside
-# the 32-bit range for the foreseeable future of this codebase.
-_INDEFINITE_SECONDS = 60 * 60 * 24 * 365 * 10
+# Razorpay subscriptions require SOME bound — there's no "bill until
+# cancelled" flag. Originally used end_at (a far-future timestamp), which
+# consistently caused a live, unexplained 5xx ServerError from Razorpay's
+# API on every real subscribe attempt, confirmed NOT to be an account-side
+# issue (an identical request made directly via curl, using total_count
+# instead of end_at, succeeded immediately with the same plan and key).
+# total_count (a cycle count) is Razorpay's own more standard way to bound
+# a subscription, and it's what's actually proven to work — 10 years'
+# worth of cycles is still effectively indefinite for this purpose (no
+# real subscription survives a full decade untouched).
+_INDEFINITE_CYCLES = {"monthly": 120, "yearly": 10}  # ~10 years either way
 
 
 class SubscribeRequest(BaseModel):
@@ -79,13 +78,14 @@ def _get_profile(user_id: str) -> dict:
 @router.post("/billing/subscribe")
 def subscribe(body: SubscribeRequest, user=Depends(verify_token)):
     plan_id = _resolve_plan_id(body.plan, body.billing)
+    total_count = _INDEFINITE_CYCLES.get(body.billing, 120)
 
     try:
         subscription = client.subscription.create({
             "plan_id": plan_id,
             "quantity": 1,
             "customer_notify": 1,
-            "end_at": int(time.time()) + _INDEFINITE_SECONDS,
+            "total_count": total_count,
             "notes": {
                 "supabase_user_id": user.id,
                 "plan": body.plan,
