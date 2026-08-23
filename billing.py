@@ -43,9 +43,16 @@ router = APIRouter()
 client = razorpay.Client(auth=(RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET))
 
 # Razorpay subscriptions require SOME bound (total_count or end_at, max 100
-# years) — there's no "bill until cancelled" flag. ~50 years emulates
-# indefinite billing without ever realistically hitting subscription.completed.
-_INDEFINITE_SECONDS = 60 * 60 * 24 * 365 * 50
+# years) — there's no "bill until cancelled" flag. ~50 years was the
+# original choice to emulate indefinite billing, but that pushes end_at
+# past ~2076 — well beyond the year-2038 boundary where a 32-bit signed
+# Unix timestamp overflows. Confirmed via a live ServerError from Razorpay's
+# API (opaque 5xx, no validation error) that this was breaking real
+# subscription creation, consistent with an overflow somewhere in their
+# stack. 10 years is still effectively indefinite for this purpose (no real
+# subscription survives a full decade untouched) and stays safely inside
+# the 32-bit range for the foreseeable future of this codebase.
+_INDEFINITE_SECONDS = 60 * 60 * 24 * 365 * 10
 
 
 class SubscribeRequest(BaseModel):
@@ -87,6 +94,7 @@ def subscribe(body: SubscribeRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
+        print(f"Billing subscribe error: plan_id={plan_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not start the subscription. Please try again.")
 
     # Persisted immediately — the subscription id exists before payment is
@@ -201,6 +209,7 @@ def get_plan(user=Depends(verify_token)):
             result["charge_at"] = sub.get("charge_at")
         except Exception as e:
             sentry_sdk.capture_exception(e)
+            print(f"Billing get_plan fetch error: subscription_id={subscription_id}, user={user.id}, error={e}")
 
     return result
 
@@ -217,6 +226,7 @@ def list_invoices(user=Depends(verify_token)):
         return {"invoices": res.get("items", [])}
     except Exception as e:
         sentry_sdk.capture_exception(e)
+        print(f"Billing list_invoices error: subscription_id={subscription_id}, user={user.id}, error={e}")
         return {"invoices": []}
 
 
@@ -238,6 +248,7 @@ def change_plan(body: SubscribeRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
+        print(f"Billing change_plan error: subscription_id={subscription_id}, new_plan_id={new_plan_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not change your plan. Please try again.")
 
     # Does NOT optimistically flip profiles.plan — waits for the resulting
@@ -259,6 +270,7 @@ def cancel_subscription(body: CancelRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
+        print(f"Billing cancel_subscription error: subscription_id={subscription_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not cancel your subscription. Please try again.")
 
     return {"status": "pending"}
