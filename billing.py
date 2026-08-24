@@ -105,6 +105,10 @@ def subscribe(body: SubscribeRequest, user=Depends(verify_token)):
     supabase.table("profiles").upsert({
         "id": user.id,
         "razorpay_subscription_id": subscription["id"],
+        # Reset in case they're re-subscribing after a previous
+        # cancel-at-cycle-end — this is a brand new subscription, not
+        # scheduled to end.
+        "subscription_cancel_scheduled": False,
     }, on_conflict="id").execute()
 
     return {"url": subscription["short_url"]}
@@ -166,7 +170,9 @@ async def billing_webhook(request: Request):
 
     if event in ("subscription.activated", "subscription.charged", "subscription.updated", "subscription.resumed"):
         plan = RAZORPAY_PLAN_TO_PLAN.get(plan_id, "free")
-        update = {"plan": plan, "razorpay_subscription_id": subscription_id}
+        # subscription.resumed specifically means a cancel-at-cycle-end got
+        # reversed — not scheduled to end anymore either way here.
+        update = {"plan": plan, "razorpay_subscription_id": subscription_id, "subscription_cancel_scheduled": False}
         if customer_id:
             update["razorpay_customer_id"] = customer_id
         supabase.table("profiles").update(update).eq("id", user_id).execute()
@@ -184,7 +190,7 @@ async def billing_webhook(request: Request):
         print(f"Billing: {user_id} payment pending/retrying, no plan change")
 
     elif event in ("subscription.halted", "subscription.paused", "subscription.completed", "subscription.cancelled"):
-        update = {"plan": "free"}
+        update = {"plan": "free", "subscription_cancel_scheduled": False}
         if event == "subscription.cancelled":
             update["razorpay_subscription_id"] = None
         supabase.table("profiles").update(update).eq("id", user_id).execute()
@@ -200,6 +206,12 @@ def get_plan(user=Depends(verify_token)):
     result = {
         "plan": profile.get("plan", "free"),
         "has_subscription": bool(subscription_id),
+        # NOT derived from Razorpay's live status field — confirmed live
+        # that Razorpay keeps status "active" the whole time for a
+        # cancel-at-cycle-end subscription, right up until it actually
+        # ends. Tracked on our own side instead (set in cancel_subscription
+        # below) so the frontend can reliably show "cancels on X".
+        "cancel_scheduled": bool(profile.get("subscription_cancel_scheduled")),
     }
 
     if subscription_id:
@@ -207,10 +219,6 @@ def get_plan(user=Depends(verify_token)):
             sub = client.subscription.fetch(subscription_id)
             result["status"] = sub.get("status")
             result["charge_at"] = sub.get("charge_at")
-            # Razorpay flips status to "cancelled" immediately when a
-            # cancel-at-cycle-end is requested, even though access keeps
-            # running until current_end — the frontend needs this to show
-            # "cancels on X" instead of silently looking unchanged.
             result["current_end"] = sub.get("current_end")
         except Exception as e:
             sentry_sdk.capture_exception(e)
@@ -287,5 +295,15 @@ def cancel_subscription(body: CancelRequest, user=Depends(verify_token)):
         sentry_sdk.capture_exception(e)
         print(f"Billing cancel_subscription error: subscription_id={subscription_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not cancel your subscription. Please try again.")
+
+    # See get_plan's comment — Razorpay's own status field won't reflect
+    # this, so this is the only record that a cancel-at-cycle-end is
+    # scheduled. Only meaningful for at_cycle_end=True; an immediate cancel
+    # gets caught by the subscription.cancelled webhook flipping plan to
+    # free almost immediately anyway, but setting it False either way keeps
+    # this field always accurate rather than stale from a previous cancel.
+    supabase.table("profiles").update({
+        "subscription_cancel_scheduled": body.at_cycle_end,
+    }).eq("id", user.id).execute()
 
     return {"status": "pending"}
