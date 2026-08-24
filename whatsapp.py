@@ -702,6 +702,18 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     phone_number_id = phone_data.get("id", "")
     display_phone = phone_data.get("display_phone_number", "")
 
+    if phone_number_id:
+        conflict_res = supabase.table("whatsapp_integrations") \
+            .select("project_id") \
+            .eq("phone_number_id", phone_number_id) \
+            .neq("project_id", project_id) \
+            .execute()
+        if conflict_res.data:
+            raise HTTPException(
+                status_code=409,
+                detail="This WhatsApp number is already connected to a different Zavo project. Disconnect it there first before connecting it here."
+            )
+
     supabase.table("whatsapp_integrations").upsert({
         "project_id": project_id,
         "phone_number_id": phone_number_id,
