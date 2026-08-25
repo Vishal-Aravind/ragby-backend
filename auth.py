@@ -64,8 +64,12 @@ def require_project_role(user_id: str, project_id: str):
 router = APIRouter()
 
 _AUTH_RATE_LIMITS = {
-    "login": (10, 900),     # 10 attempts / 15 min per IP
-    "signup": (5, 3600),    # 5 signups / hour per IP
+    "login": (10, 900),        # 10 attempts / 15 min per IP
+    "signup": (5, 3600),       # 5 signups / hour per IP
+    "team_invite": (10, 600),  # 10 invite attempts / 10 min per IP — the
+                                # invite endpoint's "no account found for
+                                # that email" response is an email-existence
+                                # oracle; this caps how fast it can be probed.
 }
 
 class AuthRateLimitCheck(BaseModel):
