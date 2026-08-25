@@ -412,6 +412,21 @@ async def whatsapp_webhook(request: Request):
         msg_type = message.get("type")
         from_number = message["from"]
 
+        # Meta redelivers a webhook at-least-once if we don't ack fast enough
+        # or error transiently — without this, a redelivery re-triggers the
+        # whole flow below and sends a duplicate reply. Confirmed live: the
+        # same bot reply fired 6 extra times over ~2.5 hours with no new
+        # customer message in between. First writer wins; a duplicate-key
+        # violation here means we've already processed this exact message.
+        wa_message_id = message.get("id")
+        if wa_message_id:
+            try:
+                supabase.table("whatsapp_webhook_dedup").insert({"wa_message_id": wa_message_id}).execute()
+            except Exception as e:
+                if "duplicate key" in str(e).lower():
+                    return {"status": "duplicate_ignored"}
+                raise
+
         # WhatsApp includes the sender's real profile name on every message —
         # previously never captured anywhere, so bookings/orders had no real
         # name to fall back on and leads showed no name either.
