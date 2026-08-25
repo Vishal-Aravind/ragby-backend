@@ -279,6 +279,20 @@ def google_auth(project_id: str, user=Depends(verify_token)):
     return {"auth_url": auth_url}
 
 
+def _popup_html(event: str, error: str = None) -> HTMLResponse:
+    # Matches razorpay_oauth.py/shopify_oauth.py's own helper — json.dumps
+    # so a raw error string (which may contain quotes) can't break the
+    # <script> tag's syntax, unlike the old inline f-string interpolation.
+    payload = {"type": "GOOGLE_AUTH", "event": event}
+    if error:
+        payload["error"] = error
+    return HTMLResponse(
+        f"<html><body><script>"
+        f"window.opener.postMessage({json.dumps(payload)}, '*'); window.close();"
+        f"</script></body></html>"
+    )
+
+
 @router.get("/appointments/google/callback")
 def google_callback(code: str, state: str):
     """Handle Google OAuth callback — exchange code for tokens."""
@@ -301,13 +315,14 @@ def google_callback(code: str, state: str):
     # Wrapping every return in HTMLResponse() makes the popup really close
     # and notify its opener as intended.
     if not res.ok:
-        return HTMLResponse(f"<html><body><script>window.opener.postMessage({{type:'GOOGLE_AUTH',event:'ERROR',error:'{res.text}'}}, '*'); window.close();</script></body></html>")
+        print(f"Google Calendar OAuth token exchange failed: {res.text}")
+        return _popup_html("ERROR", "Could not connect Google Calendar. Please try again.")
 
     token_data = res.json()
     refresh_token = token_data.get("refresh_token")
 
     if not refresh_token:
-        return HTMLResponse("<html><body><script>window.opener.postMessage({type:'GOOGLE_AUTH',event:'ERROR',error:'No refresh token returned. Try disconnecting and reconnecting.'}, '*'); window.close();</script></body></html>")
+        return _popup_html("ERROR", "No refresh token returned. Try disconnecting and reconnecting.")
 
     # Save refresh token
     existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
@@ -321,7 +336,7 @@ def google_callback(code: str, state: str):
             "google_refresh_token": refresh_token,
         }).execute()
 
-    return HTMLResponse("<html><body><script>window.opener.postMessage({type:'GOOGLE_AUTH',event:'FINISH'}, '*'); window.close();</script></body></html>")
+    return _popup_html("FINISH")
 
 
 @router.delete("/appointments/google/disconnect/{project_id}")

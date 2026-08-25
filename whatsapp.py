@@ -569,7 +569,7 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
     )
     if not subscribe_res.ok:
         print(f"WhatsApp resubscribe failed: project={project_id}, waba_id={waba_id}. Response: {subscribe_res.text}")
-        raise HTTPException(status_code=502, detail=f"Meta rejected the subscription: {subscribe_res.text}")
+        raise HTTPException(status_code=502, detail="Meta rejected the subscription request. Please try again shortly.")
 
     return {"success": True, "waba_id": waba_id}
 

@@ -64,7 +64,11 @@ def telegram_connect(data: dict, user=Depends(verify_token)):
     result = set_telegram_webhook(bot_token, webhook_url)
 
     if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=f"Could not set webhook: {result}")
+        print(f"Telegram setWebhook failed: {result}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not connect to Telegram — {result.get('description', 'please check your bot token and try again.')}"
+        )
 
     return {"success": True, "bot_username": bot_username}
 

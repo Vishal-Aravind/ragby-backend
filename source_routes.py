@@ -195,7 +195,11 @@ def introspect(data: dict, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        raise HTTPException(status_code=400, detail=f"Could not connect: {str(e)}")
+        # Unlike the Meta/Shopify/Razorpay cases elsewhere, this one IS
+        # worth showing close to verbatim — it's about the user's OWN
+        # database (wrong host, bad password, firewall), not our
+        # integration, so the driver's message is genuinely actionable.
+        raise HTTPException(status_code=400, detail=f"Couldn't connect to that database — {str(e)}")
 
 
 @router.post("/sources/upload-excel")
