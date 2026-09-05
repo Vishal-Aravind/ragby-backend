@@ -553,12 +553,19 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
             try:
                 check_res = requests.get(
                     f"https://graph.facebook.com/v25.0/{phone_number_id}",
-                    params={"fields": "is_on_biz_app", "access_token": WHATSAPP_TOKEN},
+                    params={"fields": "is_on_biz_app,platform_type", "access_token": WHATSAPP_TOKEN},
                 )
+                # Logged raw regardless of outcome — is_on_biz_app coming
+                # back None is ambiguous (failed request? field just absent
+                # in this state? different shape than expected?) and this
+                # is the only way to tell which from Render logs instead of
+                # guessing again.
+                print(f"WhatsApp disconnect live check: project={project_id}, phone_number_id={phone_number_id}, status={check_res.status_code}, body={check_res.text}")
                 if check_res.ok:
                     is_on_biz_app = check_res.json().get("is_on_biz_app")
             except Exception as e:
                 sentry_sdk.capture_exception(e)
+                print(f"WhatsApp disconnect live check FAILED: project={project_id}, error={e}")
 
         if is_on_biz_app is not False:
             print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection (is_on_biz_app={is_on_biz_app})")
