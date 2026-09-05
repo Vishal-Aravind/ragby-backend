@@ -531,7 +531,7 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
     # confirmed. Logged explicitly either way so a repeat is diagnosable
     # from Render logs instead of another guessing round.
     existing = supabase.table("whatsapp_integrations") \
-        .select("coexistence_enabled, history_sync_status") \
+        .select("coexistence_enabled, history_sync_status, phone_number_id") \
         .eq("project_id", project_id).maybe_single().execute()
     row = (existing.data if existing else None) or {}
     print(f"WhatsApp disconnect check: project={project_id}, coexistence_enabled={row.get('coexistence_enabled')}, history_sync_status={row.get('history_sync_status')}")
@@ -539,11 +539,34 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
     is_coexistence_connection = bool(row.get("coexistence_enabled")) or \
         row.get("history_sync_status") not in (None, "not_applicable", "declined")
     if is_coexistence_connection:
-        print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection")
-        raise HTTPException(
-            status_code=400,
-            detail="This number is connected via WhatsApp Coexistence. Disconnect it from the WhatsApp Business App on your phone instead — Zavo can't safely disconnect a coexistence number without risking your chat history.",
-        )
+        # coexistence_enabled is set once at connect time and nothing ever
+        # clears it — disconnecting from the phone happens entirely inside
+        # WhatsApp Business App, with no webhook telling us it happened, so
+        # a customer who correctly unlinked their phone was stuck here
+        # forever. Check live with Meta (same call coexistence-status
+        # already uses) before blocking — only lift the block on an
+        # explicit False; any error or missing field fails safe and keeps
+        # blocking, same as before.
+        is_on_biz_app = None
+        phone_number_id = row.get("phone_number_id")
+        if phone_number_id:
+            try:
+                check_res = requests.get(
+                    f"https://graph.facebook.com/v25.0/{phone_number_id}",
+                    params={"fields": "is_on_biz_app", "access_token": WHATSAPP_TOKEN},
+                )
+                if check_res.ok:
+                    is_on_biz_app = check_res.json().get("is_on_biz_app")
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+
+        if is_on_biz_app is not False:
+            print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection (is_on_biz_app={is_on_biz_app})")
+            raise HTTPException(
+                status_code=400,
+                detail="This number is connected via WhatsApp Coexistence. Disconnect it from the WhatsApp Business App on your phone instead — Zavo can't safely disconnect a coexistence number without risking your chat history.",
+            )
+        print(f"WhatsApp disconnect ALLOWED: project={project_id} confirmed no longer on Business App")
 
     supabase.table("whatsapp_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
