@@ -547,7 +547,7 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
         # already uses) before blocking — only lift the block on an
         # explicit False; any error or missing field fails safe and keeps
         # blocking, same as before.
-        is_on_biz_app = None
+        confirmed_unlinked = False
         phone_number_id = row.get("phone_number_id")
         if phone_number_id:
             try:
@@ -555,20 +555,34 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
                     f"https://graph.facebook.com/v25.0/{phone_number_id}",
                     params={"fields": "is_on_biz_app,platform_type", "access_token": WHATSAPP_TOKEN},
                 )
-                # Logged raw regardless of outcome — is_on_biz_app coming
-                # back None is ambiguous (failed request? field just absent
-                # in this state? different shape than expected?) and this
-                # is the only way to tell which from Render logs instead of
-                # guessing again.
                 print(f"WhatsApp disconnect live check: project={project_id}, phone_number_id={phone_number_id}, status={check_res.status_code}, body={check_res.text}")
                 if check_res.ok:
-                    is_on_biz_app = check_res.json().get("is_on_biz_app")
+                    # Confirmed live: is_on_biz_app is NOT the signal — once
+                    # a number actually disconnects from the phone side, it
+                    # leaves our WABA entirely and this lookup starts
+                    # failing instead of returning is_on_biz_app: false.
+                    confirmed_unlinked = check_res.json().get("is_on_biz_app") is False
+                else:
+                    err = (check_res.json() or {}).get("error", {})
+                    # Meta's specific "this object no longer exists /
+                    # isn't accessible" error (GraphMethodException,
+                    # code 100, subcode 33) — confirmed live as exactly
+                    # what a real phone-side disconnect produces. Checked
+                    # narrowly on all three fields, not "any 400", since a
+                    # broken/expired access token would also 400 here but
+                    # via a different error type (OAuthException) and
+                    # must NOT be treated as "safe to disconnect."
+                    confirmed_unlinked = (
+                        err.get("type") == "GraphMethodException"
+                        and err.get("code") == 100
+                        and err.get("error_subcode") == 33
+                    )
             except Exception as e:
                 sentry_sdk.capture_exception(e)
                 print(f"WhatsApp disconnect live check FAILED: project={project_id}, error={e}")
 
-        if is_on_biz_app is not False:
-            print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection (is_on_biz_app={is_on_biz_app})")
+        if not confirmed_unlinked:
+            print(f"WhatsApp disconnect BLOCKED: project={project_id} is a coexistence connection (confirmed_unlinked=False)")
             raise HTTPException(
                 status_code=400,
                 detail="This number is connected via WhatsApp Coexistence. Disconnect it from the WhatsApp Business App on your phone instead — Zavo can't safely disconnect a coexistence number without risking your chat history.",
