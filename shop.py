@@ -637,7 +637,11 @@ def _candidate_webhook_secrets(project_id: str) -> list:
         legacy_secret = ((config_res.data if config_res else None) or {}).get("razorpay_key_secret")
     except Exception:
         legacy_secret = None
-    legacy_secret = legacy_secret or RAZORPAY_KEY_SECRET
+    # Deliberately NOT falling back to the global RAZORPAY_KEY_SECRET here.
+    # As a candidate for every project it meant one shared secret could sign
+    # a forged payment event for any tenant, and now that payment links are
+    # never created with the global keys (see generate_razorpay_link) no
+    # legitimate event can be signed with them either.
     if legacy_secret:
         candidates.append(legacy_secret)
     return candidates
@@ -665,7 +669,15 @@ async def razorpay_webhook(request: Request):
     body_bytes = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
 
-    payload = json.loads(body_bytes)
+    # Parsing before verifying meant malformed JSON from an unauthenticated
+    # caller raised an uncaught 500, and the differing responses per branch
+    # leaked whether a given payment_link id existed in our database.
+    try:
+        payload = json.loads(body_bytes)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
     event = payload.get("event")
 
     if event == "account.app.authorization_revoked":
@@ -827,21 +839,33 @@ def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
     try:
         link = None
 
+        has_oauth_connection = False
         if project_id:
             from razorpay_oauth import _razorpay_api_request
             try:
                 res = _razorpay_api_request("POST", "/payment_links", project_id, json=payload)
+                has_oauth_connection = True
                 if res.status_code < 300:
                     link = res.json()
                 else:
                     sentry_sdk.capture_message(f"Razorpay OAuth payment_link.create failed ({res.status_code}) for project {project_id}: {res.text[:300]}")
+                    # Do NOT fall through to the legacy/global keys here. This
+                    # project HAS an OAuth connection that simply failed (token
+                    # expired, Razorpay 5xx). Falling back would create the
+                    # payment link on whichever account the global env keys
+                    # point at, so the customer's money would land in the wrong
+                    # Razorpay account. Failing the link is the safe outcome.
+                    return None
             except ValueError:
                 pass  # no OAuth connection for this project — fall through to legacy keys
 
-        if link is None:
+        if link is None and not has_oauth_connection:
             import razorpay
-            key_id = config.get("razorpay_key_id") or RAZORPAY_KEY_ID
-            key_secret = config.get("razorpay_key_secret") or RAZORPAY_KEY_SECRET
+            # The global env-var pair is only a sane default for a merchant
+            # who configured their OWN legacy keys. Without per-project keys
+            # this would silently bill into our account, so require them.
+            key_id = config.get("razorpay_key_id")
+            key_secret = config.get("razorpay_key_secret")
             if not key_id or not key_secret:
                 return None
             client = razorpay.Client(auth=(key_id, key_secret))

@@ -34,7 +34,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from ratelimit import is_rate_limited, client_ip
 from fastapi.responses import HTMLResponse
 
-from clients import supabase, qdrant, embeddings
+from clients import supabase
+from webhook_dedup import already_processed, qdrant, embeddings
 from auth import verify_token, require_project_role
 from shopify_client import graphql as _graphql
 from config import (
@@ -310,11 +311,26 @@ async def shopify_webhooks(request: Request):
     topic = request.headers.get("X-Shopify-Topic", "")
     shop_domain = request.headers.get("X-Shopify-Shop-Domain", "")
 
+    # Fail CLOSED on a missing secret. SHOPIFY_API_SECRET defaults to "" in
+    # config.py, and an HMAC keyed on the empty string is one anybody can
+    # compute — so on a misconfigured deploy this endpoint would have
+    # accepted forged app/uninstalled and products/delete events for any
+    # shop. billing.py and shop.py already guard this; this one didn't.
+    if not SHOPIFY_API_SECRET:
+        print("Shopify webhook rejected: SHOPIFY_API_SECRET is not configured")
+        raise HTTPException(status_code=503, detail="Webhooks are not configured")
+
     computed = base64.b64encode(
         hmac.new(SHOPIFY_API_SECRET.encode(), body_bytes, hashlib.sha256).digest()
     ).decode()
     if not signature or not hmac.compare_digest(computed, signature):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # Shopify retries; each replay of a products/update costs a GraphQL
+    # fetch plus a fresh embedding.
+    webhook_id = request.headers.get("X-Shopify-Webhook-Id")
+    if webhook_id and already_processed("shopify", webhook_id):
+        return {"status": "duplicate_ignored"}
 
     # Every branch below always returns 200 even after a caught failure — a
     # non-2xx response makes Shopify retry, and after sustained failures

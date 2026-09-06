@@ -378,9 +378,15 @@ async def whatsapp_webhook(request: Request):
         # and normal inbound messages all need the same project lookup —
         # resolved once here, before branching.
         webhook_phone_number_id = value.get("metadata", {}).get("phone_number_id")
+        # Previously fell back to WHATSAPP_PHONE_NUMBER_ID when metadata was
+        # absent, which routed the message to whichever project holds the
+        # global/dev number - an unrelated tenant. Ignoring it is correct.
+        if not webhook_phone_number_id:
+            print("WhatsApp webhook: no phone_number_id in metadata, ignoring")
+            return {"status": "ignored"}
         res = supabase.table("whatsapp_integrations") \
             .select("project_id, phone_number_id") \
-            .eq("phone_number_id", webhook_phone_number_id or WHATSAPP_PHONE_NUMBER_ID) \
+            .eq("phone_number_id", webhook_phone_number_id) \
             .execute()
 
         if not res.data:
@@ -501,16 +507,15 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
     return {"connected": False}
 
 
-@router.post("/whatsapp/connect")
-def whatsapp_connect(data: dict, user=Depends(verify_token)):
-    require_project_role(user.id, data["projectId"])
-    supabase.table("whatsapp_integrations").upsert({
-        "project_id": data["projectId"],
-        "phone_number_id": data["phone_number_id"],
-        "waba_id": data.get("waba_id", ""),
-        "display_phone_number": data.get("display_phone_number", ""),
-    }, on_conflict="project_id").execute()
-    return {"success": True}
+# REMOVED: /whatsapp/connect.
+# It upserted a caller-supplied phone_number_id with no ownership proof and
+# no conflict check (unlike whatsapp_onboard, which rejects a number already
+# bound to another project). Since the webhook resolves the project by
+# phone_number_id and takes the first row of an unordered query, an attacker
+# could bind a victim's number and receive a share of that merchant's real
+# customer conversations, answered from the attacker's knowledge base.
+# The frontend deliberately stopped calling it (see the note in
+# IntegrationsTab.js), so there was no behaviour left to preserve.
 
 
 @router.delete("/whatsapp/disconnect/{project_id}")

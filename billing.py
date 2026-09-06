@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from clients import supabase
+from webhook_dedup import already_processed
 from auth import verify_token
 from config import (
     RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET,
@@ -145,7 +146,19 @@ async def billing_webhook(request: Request):
     if not _verify_billing_webhook_signature(body_bytes, signature):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    payload = json.loads(body_bytes)
+    try:
+        payload = json.loads(body_bytes)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    # A valid signature proves Razorpay sent this body — it does NOT prove
+    # we haven't already acted on it. Razorpay retries, and without this a
+    # replayed subscription.cancelled downgrades a paying customer to free,
+    # while a replayed subscription.activated resurrects a cancelled plan.
+    event_id = request.headers.get("X-Razorpay-Event-Id")
+    if event_id and already_processed("razorpay-billing", event_id):
+        return {"status": "duplicate_ignored"}
+
     event = payload.get("event")
     entity = ((payload.get("payload") or {}).get("subscription") or {}).get("entity") or {}
     subscription_id = entity.get("id")
