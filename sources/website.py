@@ -29,7 +29,7 @@ SKIP_URL_PATTERNS = [
 
 
 from config import MAX_CHUNKS_PER_INGEST
-from sources.url_guard import assert_public_http_url
+from sources.url_guard import assert_public_http_url, is_public_http_url
 
 
 def get_domain(url: str) -> str:
@@ -61,8 +61,15 @@ async def _crawl(url: str, full_site: bool, max_pages: int) -> list[dict]:
         if not full_site:
             config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
             result = await crawler.arun(url=url, config=config)
-            if result.success and result.markdown:
-                pages.append({"url": url, "text": result.markdown.strip()})
+            # The browser follows redirects itself, so validating only the
+            # URL the user typed isn't enough — a public address can bounce
+            # to an internal one. Re-check whatever actually got fetched
+            # before its content is allowed anywhere near the index.
+            final_url = getattr(result, "url", None) or url
+            if result.success and result.markdown and is_public_http_url(final_url):
+                pages.append({"url": final_url, "text": result.markdown.strip()})
+            elif result.success and not is_public_http_url(final_url):
+                print(f"Refused to index redirected URL: {final_url}")
 
         else:
             domain = get_domain(url)
@@ -82,6 +89,11 @@ async def _crawl(url: str, full_site: bool, max_pages: int) -> list[dict]:
 
             for r in result_list:
                 if not r.success or not r.markdown:
+                    continue
+
+                # Same redirect concern as above, per crawled page.
+                if not is_public_http_url(r.url):
+                    print(f"Refused to index redirected URL: {r.url}")
                     continue
 
                 # Skip low-value URLs

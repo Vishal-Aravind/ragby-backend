@@ -8,7 +8,7 @@ like this; the website crawler had none at all.
 """
 import ipaddress
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 
 def assert_safe_host(host: str):
@@ -54,3 +54,34 @@ def assert_public_http_url(url: str):
         raise ValueError("Only http:// and https:// addresses can be indexed.")
 
     assert_safe_host(parts.hostname)
+
+
+def is_public_http_url(url: str) -> bool:
+    """Non-raising form of assert_public_http_url, for filtering a list of
+    already-fetched URLs rather than gating a single request."""
+    try:
+        assert_public_http_url(url)
+        return True
+    except ValueError:
+        return False
+
+
+def safe_get(session, url: str, max_redirects: int = 5, timeout: int = 30):
+    """GET a URL, validating EVERY hop instead of only the first.
+
+    Validating just the entered URL is not enough on its own: a public
+    address that 302s to an internal one passes the front-door check and
+    then fetches the internal resource anyway. Redirects are disabled and
+    followed manually so each destination is re-validated before we go
+    there."""
+    current = url
+    for _ in range(max_redirects + 1):
+        assert_public_http_url(current)
+        res = session.get(current, allow_redirects=False, timeout=timeout)
+        if res.status_code not in (301, 302, 303, 307, 308):
+            return res
+        location = res.headers.get("Location")
+        if not location:
+            return res
+        current = urljoin(current, location)
+    raise ValueError("That link redirected too many times.")

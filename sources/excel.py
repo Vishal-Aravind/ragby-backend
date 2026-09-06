@@ -7,7 +7,7 @@ import pandas as pd
 from qdrant_client import models
 
 from config import MAX_CHUNKS_PER_INGEST
-from sources.url_guard import assert_public_http_url
+from sources.url_guard import assert_public_http_url, safe_get
 
 MAX_EXCEL_BYTES = 25 * 1024 * 1024
 
@@ -23,7 +23,7 @@ def fetch_excel_from_url(url: str) -> bytes:
     assert_public_http_url(url)
 
     session = requests.Session()
-    res = session.get(url, allow_redirects=True, timeout=30)
+    res = safe_get(session, url)
     resolved_url = res.url
 
     content_type = res.headers.get("Content-Type", "")
@@ -33,10 +33,10 @@ def fetch_excel_from_url(url: str) -> bytes:
             resolved_url = resolved_url.replace("download=0", "download=1")
             if "download=" not in resolved_url:
                 resolved_url += "&download=1"
-            res = session.get(resolved_url, allow_redirects=True, timeout=30)
+            res = safe_get(session, resolved_url)
         elif "sharepoint.com" in resolved_url:
             sep = "&" if "?" in resolved_url else "?"
-            res = session.get(resolved_url + sep + "download=1", allow_redirects=True, timeout=30)
+            res = safe_get(session, resolved_url + sep + "download=1")
         else:
             raise ValueError(
                 "This link returns a webpage, not an Excel file. "
