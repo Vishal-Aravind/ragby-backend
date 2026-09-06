@@ -7,6 +7,8 @@ from config import QDRANT_COLLECTION
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
 from usage import get_plan_limits
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
@@ -307,6 +309,14 @@ async def upload_excel(
 
     file_bytes = await file.read()
 
+    # No byte cap existed anywhere on this path — not here, not in the
+    # Next.js proxy — so a scripted 2GB POST was read straight into the
+    # worker's memory. Mirrors the 25MB cap on the document upload route.
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="That file is too large. The limit is 25MB.")
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+
     if source_id:
         # source_id is caller-supplied and was previously trusted on the
         # strength of the projectId check above — but that only proves the
@@ -315,12 +325,31 @@ async def upload_excel(
         # wiped their vectors and overwrote their row via the service-role
         # client below.
         owning_project_id = _require_role_for_source(user.id, source_id)
-        sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+        try:
+            sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"upload_excel re-upload error (source {source_id}): {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
+            )
         supabase.table("data_sources").update({
             "config": {"filename": file.filename},
             "label": label or file.filename,
         }).eq("id", source_id).execute()
         return {"id": source_id, "filename": file.filename}
+
+    # This endpoint creates a data_sources row just like add_source does,
+    # but skipped the plan cap entirely — so uploading here instead of
+    # through /sources/add was an unlimited way around it.
+    limits = get_plan_limits(projectId)
+    existing = supabase.table("data_sources")         .select("id", count="exact")         .eq("project_id", projectId)         .execute()
+    if (existing.count or 0) >= limits["sources"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You've reached your plan's limit of {limits['sources']} connected sources. Disconnect one, or upgrade your plan, to add more.",
+        )
 
     res = supabase.table("data_sources").insert({
         "project_id": projectId,
@@ -331,5 +360,19 @@ async def upload_excel(
     }).execute()
     source = res.data[0]
 
-    sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
+    # Was completely unguarded, unlike add_source — a corrupt workbook left
+    # a permanently orphaned row showing as "connected" with no content,
+    # and returned a raw 500 whose body was shown to the user.
+    try:
+        sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"upload_excel error (project {projectId}): {e}")
+        _purge_source_points(source["id"])
+        supabase.table("data_sources").delete().eq("id", source["id"]).execute()
+        raise HTTPException(
+            status_code=400,
+            detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
+        )
+
     return {"id": source["id"], "filename": file.filename}

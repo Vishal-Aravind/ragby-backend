@@ -1228,6 +1228,16 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     if not chat_check or not chat_check.data:
         raise HTTPException(status_code=404, detail="Chat not found")
 
+    # The public widget has a burst limiter (_public_chat_rate_limited) but
+    # this authenticated endpoint had only the MONTHLY quota — so a scripted
+    # loop, or a stuck client-side retry, could run at full speed against our
+    # OpenAI key until the whole month's allowance was gone in minutes.
+    if is_rate_limited(f"dash-chat:{req.projectId}", limit=30, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="You're sending messages too quickly. Please wait a moment.",
+        )
+
     rate_check = check_rate_limit(req.projectId)
     if not rate_check["allowed"]:
         raise HTTPException(status_code=429, detail=rate_check["reason"])

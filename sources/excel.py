@@ -6,11 +6,22 @@ import requests
 import pandas as pd
 from qdrant_client import models
 
+from config import MAX_CHUNKS_PER_INGEST
+from sources.url_guard import assert_public_http_url
+
+MAX_EXCEL_BYTES = 25 * 1024 * 1024
+
 
 def fetch_excel_from_url(url: str) -> bytes:
     """
     Fetch Excel bytes from a URL, handling OneDrive/SharePoint sharing links.
     """
+    # This fetches a caller-supplied URL server-side and indexes whatever
+    # comes back into their chatbot, so without this an internal address
+    # could be read out through chat. Reachable via POST /sources/add with
+    # type "excel_online" — there is no UI for it, so nobody would notice.
+    assert_public_http_url(url)
+
     session = requests.Session()
     res = session.get(url, allow_redirects=True, timeout=30)
     resolved_url = res.url
@@ -40,6 +51,10 @@ def fetch_excel_from_url(url: str) -> bytes:
             "Please open the file in OneDrive, click File → Download, "
             "and copy the URL from the browser address bar before the file saves."
         )
+
+    # No size cap meant the whole body was buffered into the worker's RAM.
+    if len(res.content) > MAX_EXCEL_BYTES:
+        raise ValueError("That file is too large. The limit is 25MB.")
 
     return res.content
 
@@ -97,20 +112,18 @@ def sync_excel_bytes(
 
 
 def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection, source_label):
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
+    # Purge happens after a successful parse (see below). Deleting first
+    # meant re-uploading a corrupt or password-protected workbook wiped the
+    # working index and left the source "connected" with nothing in it.
     rows = excel_bytes_to_chunks(file_bytes)
 
+    # Previously returned success here, so an empty or header-only workbook
+    # produced a green "connected" source the bot could never answer from.
     if not rows:
-        return {"chunks_indexed": 0}
+        raise ValueError(
+            "Couldn't read any rows from that file. Check that it has a header "
+            "row and at least one row of data."
+        )
 
     chunks = [text for _, text in rows]
     metas = [
@@ -124,7 +137,25 @@ def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, col
         for sheet, text in rows
     ]
 
+    # One row is one embedding, so a 200k-row workbook was 200k embeddings
+    # in a single unbounded call against our own OpenAI key.
+    if len(chunks) > MAX_CHUNKS_PER_INGEST:
+        print(f"excel source {source_id} truncated to {MAX_CHUNKS_PER_INGEST} rows")
+        chunks = chunks[:MAX_CHUNKS_PER_INGEST]
+        metas = metas[:MAX_CHUNKS_PER_INGEST]
+
     vectors = embeddings.embed_documents(chunks)
+
+    # Safe to drop the old index only now that replacement content exists.
+    qdrant.delete(
+        collection_name=collection,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="source_id",
+                match=models.MatchValue(value=source_id)
+            )]
+        )
+    )
 
     qdrant.upload_points(
         collection_name=collection,

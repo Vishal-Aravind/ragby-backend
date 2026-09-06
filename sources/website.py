@@ -28,6 +28,10 @@ SKIP_URL_PATTERNS = [
 ]
 
 
+from config import MAX_CHUNKS_PER_INGEST
+from sources.url_guard import assert_public_http_url
+
+
 def get_domain(url: str) -> str:
     return urlparse(url).netloc
 
@@ -44,6 +48,12 @@ def should_skip(url: str) -> bool:
 
 
 async def _crawl(url: str, full_site: bool, max_pages: int) -> list[dict]:
+    # Nothing validated this URL before it reached the browser: any scheme
+    # and any host was fetched server-side and indexed into the project's
+    # chatbot. file:// could read this server's own .env (service-role key,
+    # OpenAI key), and 169.254.169.254 reaches cloud metadata.
+    assert_public_http_url(url)
+
     pages = []
     seen_urls = set()
 
@@ -109,16 +119,10 @@ def sync_website(
     full_site: bool = True,
     max_pages: int = 30,          # FIX: default reduced from 50 to 30
 ):
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
+    # The purge deliberately happens after a successful crawl (see below).
+    # Deleting first meant a site that was temporarily down, rate-limiting
+    # us, or blocking the crawler wiped the working index and left the
+    # chatbot with nothing.
     pages = crawl_website(url, full_site=full_site, max_pages=max_pages)
 
     if not pages:
@@ -146,7 +150,25 @@ def sync_website(
     if not all_chunks:
         return {"pages_indexed": len(pages), "chunks_indexed": 0}
 
+    # One unbounded embed call for a large documentation site is an
+    # unbounded bill on our own OpenAI key.
+    if len(all_chunks) > MAX_CHUNKS_PER_INGEST:
+        print(f"website {url} truncated to {MAX_CHUNKS_PER_INGEST} chunks")
+        all_chunks = all_chunks[:MAX_CHUNKS_PER_INGEST]
+        all_metas = all_metas[:MAX_CHUNKS_PER_INGEST]
+
     vectors = embeddings.embed_documents(all_chunks)
+
+    # Safe to drop the old index only now that replacement content exists.
+    qdrant.delete(
+        collection_name=collection,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="source_id",
+                match=models.MatchValue(value=source_id)
+            )]
+        )
+    )
 
     qdrant.upload_points(
         collection_name=collection,
