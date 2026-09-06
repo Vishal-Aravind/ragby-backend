@@ -5,6 +5,8 @@ from qdrant_client import models
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
 from auth import verify_token, require_project_access
+from ratelimit import is_rate_limited
+from usage import get_plan_limits
 from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
@@ -57,6 +59,22 @@ def list_sources(project_id: str, user=Depends(verify_token)):
 @router.post("/sources/add")
 def add_source(data: dict, user=Depends(verify_token)):
     require_project_access(user.id, data["projectId"], tab="documents")
+
+    project_id = data["projectId"]
+    if is_rate_limited(f"source-add:{project_id}", limit=10, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many sources added at once. Please wait a minute and try again.",
+        )
+
+    limits = get_plan_limits(project_id)
+    existing = supabase.table("data_sources")         .select("id", count="exact")         .eq("project_id", project_id)         .execute()
+    if (existing.count or 0) >= limits["sources"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You've reached your plan's limit of {limits['sources']} connected sources. Disconnect one, or upgrade your plan, to add more.",
+        )
+
     res = supabase.table("data_sources").insert({
         "project_id": data["projectId"],
         "type": data["type"],
@@ -165,6 +183,16 @@ def delete_source(source_id: str, user=Depends(verify_token)):
 @router.post("/sources/sync/{source_id}")
 def resync_source(source_id: str, user=Depends(verify_token)):
     _require_role_for_source(user.id, source_id)
+
+    # The Reload button has no in-flight guard in the UI, and every press
+    # re-embeds the ENTIRE source against our OpenAI key. This is the
+    # cheapest place to stop a stuck-refresh loop from becoming a bill.
+    if is_rate_limited(f"source-sync:{source_id}", limit=5, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="This source was just refreshed. Please wait a few minutes before refreshing it again.",
+        )
+
     res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
     s = res.data
 
@@ -239,6 +267,12 @@ def introspect(data: dict, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail="projectId is required")
     require_project_access(user.id, project_id, tab="documents")
 
+    if is_rate_limited(f"db-introspect:{project_id}", limit=10, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many connection attempts. Please wait a minute and try again.",
+        )
+
     db_url = data.get("db_url", "")
     try:
         validate_url(db_url)
@@ -264,6 +298,13 @@ async def upload_excel(
     user=Depends(verify_token)
 ):
     require_project_access(user.id, projectId, tab="documents")
+
+    if is_rate_limited(f"excel-upload:{projectId}", limit=10, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many uploads at once. Please wait a minute and try again.",
+        )
+
     file_bytes = await file.read()
 
     if source_id:

@@ -13,6 +13,20 @@ def get_current_month() -> str:
     return datetime.utcnow().strftime("%Y-%m")
 
 
+def get_plan_limits(project_id: str) -> dict:
+    """Plan limits for whoever OWNS this project (not the caller — a
+    teammate's uploads count against the owner's plan). Single source of
+    truth: config.PLAN_LIMITS, so these can't drift the way the seat limit
+    did when it was copied into three different files."""
+    proj = supabase.table("projects")         .select("user_id")         .eq("id", project_id)         .maybe_single()         .execute()
+    if not proj or not proj.data:
+        return PLAN_LIMITS["free"]
+
+    profile = supabase.table("profiles")         .select("plan")         .eq("id", proj.data["user_id"])         .maybe_single()         .execute()
+    plan = (profile.data or {}).get("plan") or "free" if profile else "free"
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+
 def check_rate_limit(project_id: str) -> dict:
     # FIX: was .single(), which raises PGRST116 ("0 rows") instead of
     # returning empty data — any chat request against a stale/deleted

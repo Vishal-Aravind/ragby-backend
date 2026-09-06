@@ -8,6 +8,8 @@ import sentry_sdk
 import pandas as pd
 from qdrant_client import models
 
+from config import MAX_SHEET_ROWS
+
 # FIX: removed unused RecursiveCharacterTextSplitter import
 
 
@@ -107,6 +109,14 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             })
 
         synced.append(tab_label)
+
+        # Stop reading once we hit the ceiling rather than embedding an
+        # unbounded number of rows on our own OpenAI key.
+        if len(all_chunks) >= MAX_SHEET_ROWS:
+            print(f"sheet {sheet_id} truncated at {MAX_SHEET_ROWS} rows")
+            all_chunks = all_chunks[:MAX_SHEET_ROWS]
+            all_metas = all_metas[:MAX_SHEET_ROWS]
+            break
 
     # Previously this returned successfully, so a private/deleted/unreachable
     # sheet was saved as a "connected" source with nothing behind it — the

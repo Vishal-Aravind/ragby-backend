@@ -100,9 +100,16 @@ RAZORPAY_PLAN_TO_PLAN = {
 }
 
 PLAN_LIMITS = {
-    "free":     {"conversations": 300,   "seats": 1},
-    "pro":      {"conversations": 5000,  "seats": 5},
-    "business": {"conversations": 25000, "seats": 100},
+    "free":     {"conversations": 300,   "seats": 1,   "documents": 25,   "sources": 3},
+    "pro":      {"conversations": 5000,  "seats": 5,   "documents": 500,  "sources": 20},
+    "business": {"conversations": 25000, "seats": 100, "documents": 5000, "sources": 100},
 }
+
+# Hard ceilings that apply on EVERY plan, including business. Embedding is
+# billed per chunk against our own OpenAI key, so without these a single
+# 5,000-page PDF or a 100k-row sheet is one unbounded bill that no
+# per-plan document count would catch.
+MAX_CHUNKS_PER_INGEST = 3000
+MAX_SHEET_ROWS = 5000
 
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
