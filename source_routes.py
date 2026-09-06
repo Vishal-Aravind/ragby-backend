@@ -313,7 +313,10 @@ async def upload_excel(
 ):
     require_project_access(user.id, projectId, tab="documents")
 
-    if is_rate_limited(f"excel-upload:{projectId}", limit=10, window_seconds=60):
+    # Keyed on the verified user id, not the caller-supplied projectId —
+    # naming a different project you also belong to otherwise handed you a
+    # fresh bucket, making the limit trivial to sidestep.
+    if is_rate_limited(f"excel-upload:{user.id}", limit=10, window_seconds=60):
         raise HTTPException(
             status_code=429,
             detail="Too many uploads at once. Please wait a minute and try again.",
@@ -336,7 +339,11 @@ async def upload_excel(
         # belongs to it. Without this, passing another tenant's source_id
         # wiped their vectors and overwrote their row via the service-role
         # client below.
-        owning_project_id = _require_role_for_source(user.id, source_id)
+        # Replacing a source's entire contents destroys the existing index
+        # just as thoroughly as deleting it, so it takes the same admin
+        # role that delete_source requires. Creating a NEW source only
+        # needs the documents permission.
+        owning_project_id = _require_role_for_source(user.id, source_id, min_role="admin")
         try:
             sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
         except Exception as e:
