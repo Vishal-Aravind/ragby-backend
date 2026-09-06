@@ -2,6 +2,8 @@ import hmac
 import hashlib
 import sentry_sdk
 import requests
+import json
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import PlainTextResponse
 
@@ -391,8 +393,22 @@ async def whatsapp_webhook(request: Request):
     if not verify_meta_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-    body = await request.json()
+    try:
+        body = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
 
+    # Everything below is blocking: Supabase queries, an OpenAI completion,
+    # and outbound Graph calls. Running that directly in an async handler
+    # occupied the event loop for the whole duration, so ONE inbound message
+    # froze every other request the backend was serving, dashboard included
+    # — and Meta's ack timeout then triggered redeliveries. run_in_threadpool
+    # puts it on a worker thread where blocking is fine.
+    return await run_in_threadpool(_process_webhook, body)
+
+
+def _process_webhook(body: dict):
+    wa_message_id = None
     try:
         entry = body.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
@@ -528,7 +544,17 @@ async def whatsapp_webhook(request: Request):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"WHATSAPP WEBHOOK ERROR: {e}")
-        return {"status": "error"}
+        # The dedup row was written before processing, so leaving it in place
+        # meant a message that failed midway was marked "seen" forever: no
+        # reply was sent, and returning 200 told Meta not to redeliver, so
+        # the customer was silently ignored. Releasing it lets the retry
+        # through; the 500 is what prompts Meta to send one.
+        if wa_message_id:
+            try:
+                supabase.table("whatsapp_webhook_dedup").delete().eq("wa_message_id", wa_message_id).execute()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail="Processing failed")
 
 
 # -------------------------------------------------
