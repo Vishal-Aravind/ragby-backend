@@ -9,6 +9,18 @@ from ratelimit import is_rate_limited
 from usage import get_plan_limits
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_CRAWL_PAGES = 100
+
+
+def _clamp_max_pages(raw) -> int:
+    """max_pages is caller-supplied and drives how many pages we fetch and
+    embed. It was passed through unclamped, so `max_pages: 1000000` was
+    accepted; a null/NaN value also crashed the crawl loop on a comparison."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(value, MAX_CRAWL_PAGES))
 from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
@@ -122,7 +134,7 @@ def add_source(data: dict, user=Depends(verify_token)):
                 embeddings=embeddings,
                 collection=QDRANT_COLLECTION,
                 full_site=cfg.get("full_site", True),
-                max_pages=cfg.get("max_pages", 50),
+                max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
@@ -227,7 +239,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
                 embeddings=embeddings,
                 collection=QDRANT_COLLECTION,
                 full_site=cfg.get("full_site", True),
-                max_pages=cfg.get("max_pages", 50),
+                max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
             if result["pages_indexed"] == 0:
                 raise ValueError("Could not crawl this website. It may be blocking automated access.")
