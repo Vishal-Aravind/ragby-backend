@@ -1,3 +1,4 @@
+import sentry_sdk
 import hmac
 import hashlib
 import secrets
@@ -6,6 +7,8 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from clients import supabase
+from ratelimit import is_rate_limited
+from webhook_dedup import already_processed
 from config import SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, FRONTEND_URL
 from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
@@ -57,12 +60,30 @@ def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
     ).hexdigest()
     return hmac.compare_digest(my_sig, signature)
 
-def send_slack_message(access_token: str, channel: str, text: str):
-    requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {access_token}"},
-        json={"channel": channel, "text": text}
-    )
+def send_slack_message(access_token: str, channel: str, text: str) -> bool:
+    """Returns True if Slack actually accepted the message.
+
+    Slack answers HTTP 200 with {"ok": false, "error": ...} for
+    not_in_channel, invalid_auth, token_revoked and friends. The response
+    used to be discarded entirely, so a revoked token produced a silent
+    void: the customer got no reply and usage was still charged.
+    """
+    try:
+        res = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"channel": channel, "text": text},
+            timeout=10,
+        )
+        data = res.json()
+        if not data.get("ok"):
+            print(f"Slack chat.postMessage failed: {data.get('error')}")
+            return False
+        return True
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Slack chat.postMessage error: {e}")
+        return False
 
 
 # -------------------------------------------------
@@ -93,7 +114,7 @@ def slack_callback(data: dict, user=Depends(verify_token)):
     require_project_role(user.id, project_id)
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
 
-    res = requests.post("https://slack.com/api/oauth.v2.access", data={
+    res = requests.post("https://slack.com/api/oauth.v2.access", timeout=15, data={
         "client_id": SLACK_CLIENT_ID,
         "client_secret": SLACK_CLIENT_SECRET,
         "code": code,
@@ -137,24 +158,46 @@ def slack_disconnect(project_id: str, user=Depends(verify_token)):
 @router.post("/webhook/slack")
 async def slack_webhook(req: Request):
     body_bytes = await req.body()
-    body = await req.json()
 
-    if body.get("type") == "url_verification":
-        return {"challenge": body["challenge"]}
-
+    # Signature first. url_verification used to be answered before this,
+    # which made the endpoint an open reflector for unauthenticated callers,
+    # and body["challenge"] was an unguarded index (missing key = 500).
     timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
     signature = req.headers.get("X-Slack-Signature", "")
     if not verify_slack_signature(body_bytes, timestamp, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    if body.get("type") == "url_verification":
+        return {"challenge": body.get("challenge", "")}
+
+    # Slack retries when it doesn't get a 200 within 3 seconds, and run_chat
+    # routinely takes longer — so without this the NORMAL path was up to four
+    # identical replies and four times the OpenAI spend for one question.
+    if req.headers.get("X-Slack-Retry-Num"):
+        return {"status": "retry_ignored"}
+
     event = body.get("event", {})
     event_type = event.get("type")
 
-    if event_type not in ("app_mention", "message"):
+    # Slack delivers BOTH app_mention and message.channels for a single
+    # mention, so handling both double-charged every question. Only
+    # app_mention is handled now, which also means the bot no longer replies
+    # to every unrelated message in a channel it happens to be in.
+    if event_type != "app_mention":
         return {"status": "ignored"}
 
     if event.get("bot_id") or event.get("subtype"):
         return {"status": "ignored"}
+
+    # Belt and braces against redelivery that arrives without a retry header.
+    event_id = body.get("event_id")
+    if event_id and already_processed("slack", event_id):
+        return {"status": "duplicate_ignored"}
 
     text = event.get("text", "").strip()
     channel = event.get("channel")
@@ -201,6 +244,11 @@ async def slack_webhook(req: Request):
         }).execute()
         chat_id = new_chat.data[0]["id"]
 
+    # This endpoint had no per-minute cap at all — only the monthly quota —
+    # so anyone in the workspace could drain a project's whole allowance.
+    if is_rate_limited(f"slack-webhook:{project_id}", limit=20, window_seconds=60):
+        return {"status": "rate_limited"}
+
     rate_check = check_rate_limit(project_id)
     if not rate_check["allowed"]:
         send_slack_message(access_token, channel, "⚠️ Monthly message limit reached. Please try again next month.")
@@ -208,6 +256,8 @@ async def slack_webhook(req: Request):
 
     history = get_history(chat_id, limit=5)
     result = run_chat(project_id, chat_id, text, history)
-    send_slack_message(access_token, channel, result["answer"])
-    increment_usage(project_id)
-    return {"status": "ok"}
+    delivered = send_slack_message(access_token, channel, result["answer"])
+    # Only bill for a message the customer actually received.
+    if delivered:
+        increment_usage(project_id)
+    return {"status": "ok" if delivered else "send_failed"}

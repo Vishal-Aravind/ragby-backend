@@ -6,10 +6,28 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import PlainTextResponse
 
 from clients import supabase
+from ratelimit import is_rate_limited
 from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, META_APP_ID, META_APP_SECRET
 from auth import verify_token, require_project_role
 
 router = APIRouter()
+
+
+class _TimeoutSession(requests.Session):
+    """Applies a default timeout to every Graph API call.
+
+    None of the outbound requests in this module set one, and Python's
+    requests waits forever by default. A slow (not even down) Meta meant a
+    pinned worker thread per call; on the webhook path that wedged the
+    event loop and stalled the whole backend, dashboard included.
+    """
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 20)
+        return super().request(*args, **kwargs)
+
+
+http = _TimeoutSession()
 
 
 def verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
@@ -219,7 +237,7 @@ def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_toke
     }
 
     try:
-        contacts_res = requests.post(url, headers=headers, json={
+        contacts_res = http.post(url, headers=headers, json={
             "messaging_product": "whatsapp", "sync_type": "smb_app_state_sync",
         })
         if contacts_res.ok:
@@ -227,7 +245,7 @@ def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_toke
         else:
             print(f"WhatsApp coexistence contacts-sync request failed: {contacts_res.text}")
 
-        history_res = requests.post(url, headers=headers, json={
+        history_res = http.post(url, headers=headers, json={
             "messaging_product": "whatsapp", "sync_type": "history",
         })
         if history_res.ok:
@@ -258,7 +276,7 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
         "type": "text",
         "text": {"body": text},
     }
-    res = requests.post(url, headers=headers, json=payload)
+    res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp send error: {res.text}")
     return res
@@ -287,7 +305,7 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: st
             }
         }
     }
-    res = requests.post(url, headers=headers, json=payload)
+    res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp button send error: {res.text}")
     return res
@@ -306,7 +324,7 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
             "action": {"button": button_text, "sections": sections}
         }
     }
-    res = requests.post(url, headers=headers, json=payload)
+    res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp list send error: {res.text}")
     return res
@@ -331,7 +349,7 @@ def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, p
             }
         }
     }
-    res = requests.post(url, headers=headers, json=payload)
+    res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp CTA send error: {res.text}")
     return res
@@ -347,9 +365,18 @@ async def whatsapp_verify(request: Request):
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+    # Failed OPEN before: WHATSAPP_VERIFY_TOKEN is None when unset, and a
+    # request that also omits hub.verify_token gave None == None, so on a
+    # misconfigured deploy an attacker could register this URL as their own
+    # app's webhook. Requires both sides and compares in constant time.
+    if (
+        mode == "subscribe"
+        and WHATSAPP_VERIFY_TOKEN
+        and token
+        and hmac.compare_digest(token, WHATSAPP_VERIFY_TOKEN)
+    ):
         print("WhatsApp webhook verified")
-        return PlainTextResponse(challenge)
+        return PlainTextResponse(challenge or "")
 
     raise HTTPException(status_code=403, detail="Verification failed")
 
@@ -432,6 +459,18 @@ async def whatsapp_webhook(request: Request):
                 if "duplicate key" in str(e).lower():
                     return {"status": "duplicate_ignored"}
                 raise
+
+        # Dedup stops REPEATS of one message; it does nothing about a flood
+        # of distinct ones. Signature verification means this needs real
+        # WhatsApp traffic, but a single hostile sender could still burn a
+        # project's whole monthly quota (and the matching OpenAI + Meta send
+        # cost) in minutes. Per-sender first, then a project-wide ceiling.
+        if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
+            print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
+            return {"status": "rate_limited"}
+        if is_rate_limited(f"wa-in:{project_id}", limit=120, window_seconds=60):
+            print(f"WhatsApp inbound rate limited (project-wide): {project_id}")
+            return {"status": "rate_limited"}
 
         # WhatsApp includes the sender's real profile name on every message —
         # previously never captured anywhere, so bookings/orders had no real
@@ -556,7 +595,7 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
         phone_number_id = row.get("phone_number_id")
         if phone_number_id:
             try:
-                check_res = requests.get(
+                check_res = http.get(
                     f"https://graph.facebook.com/v25.0/{phone_number_id}",
                     params={"fields": "is_on_biz_app,platform_type", "access_token": WHATSAPP_TOKEN},
                 )
@@ -612,7 +651,7 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
     if not waba_id:
         raise HTTPException(status_code=404, detail="No WhatsApp Business Account on file for this project")
 
-    subscribe_res = requests.post(
+    subscribe_res = http.post(
         f"https://graph.facebook.com/v25.0/{waba_id}/subscribed_apps",
         params={"access_token": WHATSAPP_TOKEN}
     )
@@ -667,7 +706,7 @@ def whatsapp_coexistence_status(project_id: str, user=Depends(verify_token)):
 
     is_on_biz_app = None
     try:
-        check_res = requests.get(
+        check_res = http.get(
             f"https://graph.facebook.com/v25.0/{row['phone_number_id']}",
             params={"fields": "is_on_biz_app,platform_type", "access_token": WHATSAPP_TOKEN},
         )
@@ -702,7 +741,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     waba_id_hint = data.get("wabaIdHint")
     require_project_role(user.id, project_id)
 
-    token_res = requests.get(
+    token_res = http.get(
         "https://graph.facebook.com/v25.0/oauth/access_token",
         params={"client_id": META_APP_ID, "client_secret": META_APP_SECRET, "code": code}
     )
@@ -717,7 +756,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 
     waba_id = waba_id_hint or ""
     if not waba_id:
-        waba_res = requests.get(
+        waba_res = http.get(
             "https://graph.facebook.com/v25.0/me/whatsapp_business_accounts",
             params={"access_token": access_token}
         )
@@ -734,7 +773,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     # during testing, on live messages and history sync alike — not a
     # Render/config issue.
     if waba_id:
-        subscribe_res = requests.post(
+        subscribe_res = http.post(
             f"https://graph.facebook.com/v25.0/{waba_id}/subscribed_apps",
             params={"access_token": access_token}
         )
@@ -747,7 +786,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     phone_data = {}
     phone_json = {}
     for attempt in range(3):
-        phone_res = requests.get(
+        phone_res = http.get(
             f"https://graph.facebook.com/v25.0/{waba_id}/phone_numbers",
             params={"access_token": access_token}
         )
@@ -810,6 +849,15 @@ async def whatsapp_reply(data: dict, user=Depends(verify_token)):
     phone_number = data["phone_number"]
     message     = data["message"]
     require_project_role(user.id, project_id)
+
+    # Had no rate limit and no usage accounting at all, unlike the template
+    # send path - a stolen dashboard session could loop this endpoint and
+    # send unbounded WhatsApp messages billed to us, counted against nobody.
+    if is_rate_limited(f"wa-reply:{project_id}", limit=30, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="You're sending messages too quickly. Please wait a moment.",
+        )
 
     # Get WhatsApp integration for this project
     res = supabase.table("whatsapp_integrations") \

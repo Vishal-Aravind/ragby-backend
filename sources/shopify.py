@@ -205,6 +205,11 @@ def _reindex_product_in_qdrant(project_id: str, source_id: str, product: dict, q
     )
 
 
+# Ceiling for a single catalog sync. Each product costs one embedding
+# call, so this bounds what one store can spend per run.
+MAX_PRODUCTS_PER_SYNC = 2000
+
+
 def sync_products(project_id: str, source_id: str, qdrant, embeddings, collection: str) -> dict:
     """Full/backstop reconciliation sync — paginates the entire catalog.
     Used both for the first sync right after OAuth connect and for the
@@ -220,10 +225,19 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
         cursor = None
         sort_order = 0
         product_count = 0
+        truncated = False
         while True:
             data = _graphql(shop_domain, access_token, _PRODUCT_QUERY, {"cursor": cursor})
             connection = data["products"]
             for product in connection["nodes"]:
+                # Unlike every other source, this had no ceiling: one
+                # embed_documents call PER PRODUCT, over the whole catalog,
+                # repeated every 6 hours and on every manual sync. A large
+                # store was unbounded OpenAI spend with nothing to stop it.
+                if product_count >= MAX_PRODUCTS_PER_SYNC:
+                    truncated = True
+                    break
+
                 _upsert_variant_rows(project_id, catalog_id, product, sort_order)
                 _reindex_product_in_qdrant(project_id, source_id, product, qdrant, embeddings, collection)
                 # Step by the full variant cap, not a small fixed amount —
@@ -233,12 +247,15 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
                 # next product's range, scrambling the merchant-facing order.
                 sort_order += _MAX_VARIANTS_PER_PRODUCT
                 product_count += 1
+            if truncated:
+                print(f"Shopify sync truncated at {MAX_PRODUCTS_PER_SYNC} products for project {project_id}")
+                break
             if not connection["pageInfo"]["hasNextPage"]:
                 break
             cursor = connection["pageInfo"]["endCursor"]
 
         _mark_sync_result(project_id, error=None)
-        return {"products_synced": product_count}
+        return {"products_synced": product_count, "truncated": truncated}
     except Exception as e:
         sentry_sdk.capture_exception(e)
         _mark_sync_result(project_id, error=str(e))
