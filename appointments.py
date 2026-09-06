@@ -10,7 +10,7 @@ from typing import Optional, List
 from clients import supabase
 from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN, FRONTEND_URL
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 import os
 import requests
 from datetime import datetime, date, timedelta, time
@@ -407,7 +407,7 @@ def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depen
 # -------------------------------------------------
 @router.get("/public/appointments/{project_id}/settings")
 def public_settings(project_id: str, request: Request):
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"appt-settings:{project_id}:{ip}", limit=60, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     # FIX: previously also selected google_refresh_token into memory (then
@@ -428,7 +428,7 @@ def public_settings(project_id: str, request: Request):
 def public_services(project_id: str, request: Request):
     """Active services a customer can pick from on the public booking page
     — no auth, matches the rest of the /public/* surface."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"appt-services:{project_id}:{ip}", limit=60, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("appointment_services").select(
@@ -447,7 +447,7 @@ def public_booking_status(project_id: str, appointment_id: str, request: Request
     client) — just enough to stop it being an open, unbounded polling
     target, matching every other /public/* write/lookup endpoint in this
     file."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"booking-status:{project_id}:{ip}", limit=60, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("appointments").select("status, payment_status") \
@@ -464,7 +464,7 @@ def public_reschedule_context(project_id: str, appointment_id: str, request: Req
     which service the original appointment was for, so it can skip service
     selection and fetch slots with the right duration — changing service on
     reschedule isn't supported (see create_appointment's docstring)."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"appt-reschedule-ctx:{project_id}:{ip}", limit=30, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("appointments").select("service_id, service_name") \
@@ -860,7 +860,7 @@ def create_appointment(
 @router.get("/public/appointments/{project_id}/slots")
 def public_slots(project_id: str, date: str, service_id: str, request: Request):
     """Get available slots for a specific date + service."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"appt-slots:{project_id}:{ip}", limit=30, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     try:
@@ -874,7 +874,7 @@ def public_slots(project_id: str, date: str, service_id: str, request: Request):
 @router.post("/public/appointments/book")
 def book_appointment(body: BookingCreate, request: Request):
     """Create a new appointment."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"book:{body.project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many booking attempts — please wait a moment and try again.")
     if not body.service_id and not body.reschedule_id:

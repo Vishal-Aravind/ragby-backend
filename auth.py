@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from clients import supabase
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 
 bearer_scheme = HTTPBearer()
 
@@ -132,7 +132,7 @@ def auth_rate_limit_check(body: AuthRateLimitCheck, request: Request):
     if body.action not in _AUTH_RATE_LIMITS:
         raise HTTPException(status_code=400, detail="Unknown action")
     limit, window = _AUTH_RATE_LIMITS[body.action]
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"{body.action}:{ip}", limit=limit, window_seconds=window):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait and try again.")
     return {"allowed": True}

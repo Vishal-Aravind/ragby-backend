@@ -10,7 +10,7 @@ from typing import Optional
 from clients import supabase
 from auth import verify_token, require_project_role
 from config import WHATSAPP_TOKEN, FRONTEND_URL
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 from datetime import datetime, timedelta
 
 router = APIRouter()
@@ -481,7 +481,7 @@ def public_event_details(event_id: str):
 
 @router.post("/public/events/register")
 def register_for_event(body: RegistrationCreate, request: Request):
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"register:{body.project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
     try:

@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from clients import supabase
 from auth import verify_token, require_project_role
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 
 router = APIRouter()
 
@@ -33,7 +33,7 @@ class LeadSubmitRequest(BaseModel):
 
 @router.post("/public/leads")
 def submit_lead(req: LeadSubmitRequest, request: Request):
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"leads:{req.project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
 

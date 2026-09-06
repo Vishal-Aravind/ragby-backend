@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
 from auth import verify_token, require_project_role
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 from shopify_client import graphql as shopify_graphql
 from config import RAZORPAY_WEBHOOK_SECRET
 import os
@@ -349,7 +349,7 @@ async def public_get_order(order_id: str, request: Request):
     """Fetch an existing order's items — used to pre-populate cart for 'Add More' flow."""
     # Keyed by IP alone (not order_id) — the point is slowing down someone
     # probing many DIFFERENT order ids, not just repeated hits on one.
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"order-lookup:{ip}", limit=20, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("orders").select("*").eq("id", order_id).maybe_single().execute()
@@ -517,7 +517,7 @@ async def submit_cart(body: CartSubmit, request: Request):
     project_id = body.project_id
     phone = body.phone.replace("+", "").replace(" ", "")
 
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"cart:{project_id}:{ip}", limit=5):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a moment and try again.")
 

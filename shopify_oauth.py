@@ -31,7 +31,7 @@ from urllib.parse import urlencode
 import requests
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 from fastapi.responses import HTMLResponse
 
 from clients import supabase, qdrant, embeddings
@@ -421,7 +421,7 @@ def shopify_cart_status(chat_id: str, request: Request):
     the /public/* surface. Looks up the most recent cart this conversation
     built (there could be more than one if the shopper abandoned an earlier
     one) rather than assuming exactly one ever exists per chat."""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"shopify-cart-status:{chat_id}:{ip}", limit=60, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
     res = supabase.table("shopify_cart_sessions") \

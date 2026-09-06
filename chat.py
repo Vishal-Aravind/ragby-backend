@@ -9,7 +9,7 @@ from clients import supabase, openai_client, embeddings, qdrant
 from config import QDRANT_COLLECTION, FRONTEND_URL
 from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
-from ratelimit import is_rate_limited
+from ratelimit import is_rate_limited, client_ip
 from qdrant_client import models
 
 router = APIRouter()
@@ -1254,7 +1254,7 @@ def verify_chat_password(req: VerifyPasswordRequest, request: Request):
     # all — straightforwardly brute-forceable. A tighter, longer window
     # than the chat burst limiter, since this guards a password rather than
     # just costing money per attempt.
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    ip = client_ip(request)
     if is_rate_limited(f"pw:{req.projectId}:{ip}", limit=5, window_seconds=300):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a few minutes and try again.")
 
@@ -1290,7 +1290,7 @@ def public_chat_history(session_id: str):
 
 @router.post("/public/chat")
 def public_chat(req: PublicChatRequest, request: Request):
-    visitor_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    visitor_ip = client_ip(request)
     if _public_chat_rate_limited(req.projectId, visitor_ip):
         return {
             "answer": "You're sending messages a bit too fast — please wait a moment and try again.",
