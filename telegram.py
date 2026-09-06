@@ -86,6 +86,24 @@ def telegram_connect(data: dict, user=Depends(verify_token)):
 
     bot_username = bot_info["result"]["username"]
 
+    # Nothing stopped two projects registering the same bot. Telegram allows
+    # only ONE webhook per bot, so the second connect silently repointed it:
+    # the first project's bot began answering from the second's knowledge
+    # base and billing them, with no error shown to either. Same collision
+    # WhatsApp already guards against on phone_number_id.
+    conflict = (
+        supabase.table("telegram_integrations")
+        .select("project_id")
+        .eq("bot_token", bot_token)
+        .neq("project_id", project_id)
+        .execute()
+    )
+    if conflict.data:
+        raise HTTPException(
+            status_code=409,
+            detail="This bot is already connected to a different Zavo project. Disconnect it there first.",
+        )
+
     supabase.table("telegram_integrations").upsert({
         "project_id": project_id,
         "bot_token": bot_token,
@@ -111,11 +129,20 @@ def telegram_disconnect(project_id: str, user=Depends(verify_token)):
     res = supabase.table("telegram_integrations") \
         .select("bot_token") \
         .eq("project_id", project_id) \
-        .single() \
         .execute()
 
+    # .single() raised on zero rows rather than returning empty, so
+    # disconnecting an already-disconnected project was a 500.
     if res.data:
-        requests.post(f"https://api.telegram.org/bot{res.data['bot_token']}/deleteWebhook", timeout=15)
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{res.data[0]['bot_token']}/deleteWebhook",
+                timeout=15,
+            )
+        except Exception as e:
+            # The local row still gets deleted below; a failure to reach
+            # Telegram shouldn't block the merchant from disconnecting.
+            sentry_sdk.capture_message(f"Telegram deleteWebhook failed: {type(e).__name__}")
 
     supabase.table("telegram_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
@@ -177,14 +204,15 @@ async def telegram_webhook(project_id: str, req: Request):
         res = supabase.table("telegram_integrations") \
             .select("bot_token, bot_username") \
             .eq("project_id", project_id) \
-            .single() \
             .execute()
 
+        # Same .single() problem: a webhook arriving after the integration
+        # was removed raised instead of hitting this guard.
         if not res.data:
-            return {"error": "integration not found"}
+            return {"status": "integration_not_found"}
 
-        bot_token = res.data["bot_token"]
-        bot_username = res.data["bot_username"]
+        bot_token = res.data[0]["bot_token"]
+        bot_username = res.data[0]["bot_username"]
 
         if chat_type in ("group", "supergroup"):
             mention = f"@{bot_username}"

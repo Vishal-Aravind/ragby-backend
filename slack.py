@@ -7,6 +7,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from clients import supabase
+from oauth_state import issue_state, consume_state
 from ratelimit import is_rate_limited
 from webhook_dedup import already_processed
 from config import SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, FRONTEND_URL
@@ -22,28 +23,10 @@ router = APIRouter()
 # issued it, and the callback itself had no auth at all — together that
 # meant anyone who completed their own real Slack OAuth against this app
 # could attach their workspace to any project_id just by POSTing here.
-_oauth_states = {}
-_STATE_TTL_SECONDS = 600
 
 
-def _issue_state(project_id: str) -> str:
-    now = time.time()
-    for k, (_, exp) in list(_oauth_states.items()):
-        if exp < now:
-            _oauth_states.pop(k, None)
-    nonce = secrets.token_urlsafe(24)
-    _oauth_states[nonce] = (project_id, now + _STATE_TTL_SECONDS)
-    return nonce
 
 
-def _consume_state(nonce: str):
-    entry = _oauth_states.pop(nonce, None)
-    if not entry:
-        return None
-    project_id, expires_at = entry
-    if expires_at < time.time():
-        return None
-    return project_id
 
 
 # -------------------------------------------------
@@ -94,7 +77,7 @@ def slack_auth_url(project_id: str, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
     scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
-    state = _issue_state(project_id)
+    state = issue_state("slack", project_id, user.id)
     url = (
         f"https://slack.com/oauth/v2/authorize"
         f"?client_id={SLACK_CLIENT_ID}"
@@ -108,9 +91,14 @@ def slack_auth_url(project_id: str, user=Depends(verify_token)):
 @router.post("/slack/callback")
 def slack_callback(data: dict, user=Depends(verify_token)):
     code = data["code"]
-    project_id = _consume_state(data["state"])
-    if not project_id:
+    state_row = consume_state("slack", data.get("state"))
+    if not state_row:
         raise HTTPException(status_code=400, detail="This connection link expired or was already used — please try connecting again.")
+    # The nonce recorded only the project before, so any member could redeem
+    # one another member had minted.
+    if state_row["user_id"] != str(user.id):
+        raise HTTPException(status_code=403, detail="This connection link was started by someone else.")
+    project_id = state_row["project_id"]
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
 
@@ -123,7 +111,30 @@ def slack_callback(data: dict, user=Depends(verify_token)):
     token_data = res.json()
 
     if not token_data.get("ok"):
-        raise HTTPException(status_code=400, detail=f"Slack OAuth failed: {token_data.get('error')}")
+        # Codes like invalid_client_id / bad_redirect_uri describe OUR app's
+        # misconfiguration and mean nothing to the merchant.
+        print(f"Slack OAuth failed: {token_data.get('error')}")
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't connect to Slack. Please try again.",
+        )
+
+    # Nothing stopped two projects installing into the same workspace; the
+    # webhook then resolves by team_id and would pick one arbitrarily.
+    team_id_new = (token_data.get("team") or {}).get("id")
+    if team_id_new:
+        conflict = (
+            supabase.table("slack_integrations")
+            .select("project_id")
+            .eq("team_id", team_id_new)
+            .neq("project_id", project_id)
+            .execute()
+        )
+        if conflict.data:
+            raise HTTPException(
+                status_code=409,
+                detail="This Slack workspace is already connected to a different Zavo project. Disconnect it there first.",
+            )
 
     supabase.table("slack_integrations").upsert({
         "project_id": project_id,
@@ -188,6 +199,16 @@ async def slack_webhook(req: Request):
     # mention, so handling both double-charged every question. Only
     # app_mention is handled now, which also means the bot no longer replies
     # to every unrelated message in a channel it happens to be in.
+    # A workspace that uninstalls the app used to leave a live row with a
+    # dead token forever: the dashboard kept saying "Connected to {team}"
+    # while every reply silently failed.
+    if event_type in ("app_uninstalled", "tokens_revoked"):
+        team_id = body.get("team_id")
+        if team_id:
+            supabase.table("slack_integrations").delete().eq("team_id", team_id).execute()
+            print(f"Slack {event_type}: removed integration for team {team_id}")
+        return {"status": "ok"}
+
     if event_type != "app_mention":
         return {"status": "ignored"}
 
@@ -210,15 +231,19 @@ async def slack_webhook(req: Request):
     res = supabase.table("slack_integrations") \
         .select("project_id, access_token, bot_user_id") \
         .eq("team_id", team_id) \
-        .single() \
         .execute()
 
+    # Was .single(), which RAISES on zero rows (workspace uninstalled, or
+    # the project deleted mid-flight) and on two rows (same workspace
+    # connected to two projects) — so this guard was dead code and either
+    # case became a 500, which makes Slack retry the delivery.
     if not res.data:
-        return {"error": "integration not found"}
+        return {"status": "integration_not_found"}
 
-    project_id = res.data["project_id"]
-    access_token = res.data["access_token"]
-    bot_user_id = res.data["bot_user_id"]
+    row = res.data[0]
+    project_id = row["project_id"]
+    access_token = row["access_token"]
+    bot_user_id = row["bot_user_id"]
 
     text = text.replace(f"<@{bot_user_id}>", "").strip()
     if not text:

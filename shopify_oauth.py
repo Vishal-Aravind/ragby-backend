@@ -35,6 +35,7 @@ from ratelimit import is_rate_limited, client_ip
 from fastapi.responses import HTMLResponse
 
 from clients import supabase
+from oauth_state import issue_state, consume_state
 from webhook_dedup import already_processed, qdrant, embeddings
 from auth import verify_token, require_project_access
 from shopify_client import graphql as _graphql
@@ -53,31 +54,10 @@ SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*\.myshopify\.com$")
 # is reachable by anyone who knows a shop domain, so (unlike Google/Slack's
 # simple state=project_id) a forged callback must not be able to attach a
 # stranger's Shopify store to the wrong project.
-_oauth_states = {}
-_STATE_TTL_SECONDS = 600
 
 
-def _issue_state(project_id: str) -> str:
-    now = time.time()
-    for k, (_, exp) in list(_oauth_states.items()):
-        if exp < now:
-            _oauth_states.pop(k, None)
-    nonce = secrets.token_urlsafe(24)
-    _oauth_states[nonce] = (project_id, now + _STATE_TTL_SECONDS)
-    return nonce
 
 
-def _consume_state(nonce: str):
-    """Pops and returns the project_id this nonce was issued for, or None if
-    it's missing/expired/already used. One-time use — a callback can only
-    ever complete a given /start call once."""
-    entry = _oauth_states.pop(nonce, None)
-    if not entry:
-        return None
-    project_id, expires_at = entry
-    if expires_at < time.time():
-        return None
-    return project_id
 
 
 def _verify_oauth_hmac(query_params: dict) -> bool:
@@ -199,7 +179,7 @@ def shopify_oauth_start(project_id: str, shop: str, user=Depends(verify_token)):
     if not SHOP_DOMAIN_RE.match(shop_domain):
         raise HTTPException(status_code=400, detail="Enter your shop domain like mystore.myshopify.com")
 
-    state = _issue_state(project_id)
+    state = issue_state("shopify", project_id, user.id, target=shop_domain)
     auth_url = (
         f"https://{shop_domain}/admin/oauth/authorize"
         f"?client_id={SHOPIFY_API_KEY}"
@@ -224,9 +204,18 @@ def shopify_oauth_callback(request: Request):
         sentry_sdk.capture_message(f"Shopify OAuth callback failed HMAC verification for shop={shop_domain}")
         return _popup_html("ERROR", "Could not verify this request came from Shopify")
 
-    project_id = _consume_state(state)
-    if not project_id:
+    state_row = consume_state("shopify", state)
+    if not state_row:
         return _popup_html("ERROR", "This connection link expired or was already used — please try connecting again.")
+    # The callback's shop param is supplied by the redirect. Confirm it is
+    # the store this flow was actually started for, so a different store
+    # can't be bound to the project than the one the user asked for.
+    if state_row.get("target") and state_row["target"] != shop_domain:
+        sentry_sdk.capture_message(
+            f"Shopify OAuth shop mismatch: started for {state_row['target']}, callback for {shop_domain}"
+        )
+        return _popup_html("ERROR", "This link was started for a different store.")
+    project_id = state_row["project_id"]
 
     try:
         token_res = requests.post(

@@ -33,6 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from clients import supabase
+from oauth_state import issue_state, consume_state
 from auth import verify_token, require_project_access
 from config import (
     RAZORPAY_PARTNER_CLIENT_ID, RAZORPAY_PARTNER_CLIENT_SECRET,
@@ -52,30 +53,10 @@ OAUTH_SCOPE = "read_write"
 # exactly as the token expires mid-flight.
 _REFRESH_SAFETY_MARGIN_SECONDS = 120
 
-# Short-lived CSRF nonce store for the OAuth handshake — in-memory,
-# single-process, same convention as shopify_oauth.py's _oauth_states.
-_oauth_states = {}
-_STATE_TTL_SECONDS = 600
 
 
-def _issue_state(project_id: str) -> str:
-    now = time.time()
-    for k, (_, exp) in list(_oauth_states.items()):
-        if exp < now:
-            _oauth_states.pop(k, None)
-    nonce = secrets.token_urlsafe(24)
-    _oauth_states[nonce] = (project_id, now + _STATE_TTL_SECONDS)
-    return nonce
 
 
-def _consume_state(nonce: str):
-    entry = _oauth_states.pop(nonce, None)
-    if not entry:
-        return None
-    project_id, expires_at = entry
-    if expires_at < time.time():
-        return None
-    return project_id
 
 
 def _popup_html(event: str, error: str = None) -> HTMLResponse:
@@ -194,7 +175,7 @@ def razorpay_oauth_start(project_id: str, user=Depends(verify_token)):
     if not RAZORPAY_PARTNER_CLIENT_ID or not RAZORPAY_PARTNER_CLIENT_SECRET:
         raise HTTPException(status_code=400, detail="Razorpay Partner OAuth not configured. Add RAZORPAY_PARTNER_CLIENT_ID and RAZORPAY_PARTNER_CLIENT_SECRET to env vars.")
 
-    state = _issue_state(project_id)
+    state = issue_state("razorpay", project_id, user.id)
     auth_url = (
         f"{AUTHORIZE_URL}?response_type=code"
         f"&client_id={RAZORPAY_PARTNER_CLIENT_ID}"
@@ -211,9 +192,10 @@ def razorpay_oauth_callback(request: Request):
     code = query.get("code", "")
     state = query.get("state", "")
 
-    project_id = _consume_state(state)
-    if not project_id:
+    state_row = consume_state("razorpay", state)
+    if not state_row:
         return _popup_html("ERROR", "This connection link expired or was already used — please try connecting again.")
+    project_id = state_row["project_id"]
 
     if not code:
         return _popup_html("ERROR", "Razorpay did not return an authorization code.")
