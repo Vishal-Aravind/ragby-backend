@@ -2,6 +2,7 @@
 # Handles both PostgreSQL and MySQL via SQLAlchemy
 
 import ipaddress
+import re
 import socket
 from urllib.parse import urlsplit
 
@@ -63,13 +64,22 @@ def validate_url(db_url: str):
             raise ValueError("This host is not reachable — internal/private network addresses aren't allowed.")
 
 
+def _connect_args(db_url: str) -> dict:
+    """Per-dialect connect-time timeout so a slow/unreachable customer DB
+    can't hang the request indefinitely."""
+    if "mysql" in db_url:
+        return {"connect_timeout": 5, "read_timeout": 10}
+    return {"connect_timeout": 5, "options": "-c statement_timeout=10000"}
+
+
 def get_schema(db_url: str, allowed_schema: dict | None = None) -> str:
     """
     Introspect the database and return a schema string for the LLM.
     Filters to allowed_schema if provided.
     """
     db_url = normalize_url(db_url)
-    engine = sqlalchemy.create_engine(db_url)
+    validate_url(db_url)
+    engine = sqlalchemy.create_engine(db_url, connect_args=_connect_args(db_url))
     try:
         insp = sqlalchemy.inspect(engine)
         lines = []
@@ -94,7 +104,8 @@ def introspect_schema(db_url: str) -> dict:
     Returns full schema as { table: [col, ...] } for frontend checkbox picker.
     """
     db_url = normalize_url(db_url)
-    engine = sqlalchemy.create_engine(db_url)
+    validate_url(db_url)
+    engine = sqlalchemy.create_engine(db_url, connect_args=_connect_args(db_url))
     try:
         insp = sqlalchemy.inspect(engine)
         schema = {}
@@ -106,6 +117,16 @@ def introspect_schema(db_url: str) -> dict:
         engine.dispose()
 
 
+def _only_allowed_tables(sql: str, allowed_schema: dict) -> bool:
+    """Conservative check that every table named after FROM/JOIN is one of
+    the allowed tables. Not a real SQL parser — just guards against the LLM
+    (via prompt injection or drift) reaching past the tables it was shown,
+    since the prompt instruction alone isn't a hard boundary."""
+    referenced = re.findall(r'(?:FROM|JOIN)\s+["`]?([a-zA-Z_][a-zA-Z0-9_]*)', sql, re.IGNORECASE)
+    allowed_lower = {t.lower() for t in allowed_schema.keys()}
+    return all(t.lower() in allowed_lower for t in referenced)
+
+
 def run_text_to_sql(
     question: str,
     db_url: str,
@@ -113,6 +134,7 @@ def run_text_to_sql(
     allowed_schema: dict | None = None
 ) -> str:
     db_url = normalize_url(db_url)
+    validate_url(db_url)
     schema = get_schema(db_url, allowed_schema)
 
     # Tell LLM which dialect to use
@@ -145,15 +167,27 @@ Return ONLY the SQL query, nothing else."""
             sql = sql.split("\n", 1)[1]
         sql = sql.strip()
 
-    # Hard safety: only SELECT allowed
-    if not sql.upper().strip().startswith("SELECT"):
+    # Hard safety: only a single SELECT allowed, no stacked statements.
+    stripped = sql.strip().rstrip(";")
+    if not stripped.upper().startswith("SELECT"):
         return "Query blocked: only SELECT statements are allowed."
+    if ";" in stripped:
+        return "Query blocked: multiple statements are not allowed."
 
-    engine = sqlalchemy.create_engine(db_url)
+    # allowed_schema is what the picker UI/customer actually consented to
+    # exposing — enforce it here too, not just via the prompt instruction,
+    # since the LLM's output isn't a trusted boundary on its own.
+    if allowed_schema and not _only_allowed_tables(stripped, allowed_schema):
+        return "Query blocked: references a table outside the allowed schema."
+
+    if "LIMIT" not in stripped.upper():
+        stripped = f"{stripped} LIMIT 200"
+
+    engine = sqlalchemy.create_engine(db_url, connect_args=_connect_args(db_url))
     try:
         with engine.connect() as conn:
-            result = conn.execute(sqlalchemy.text(sql))
-            rows = result.fetchmany(50)
+            result = conn.execute(sqlalchemy.text(stripped))
+            rows = result.fetchmany(200)
             if not rows:
                 return "Query returned no results."
             cols = list(result.keys())
@@ -163,6 +197,7 @@ Return ONLY the SQL query, nothing else."""
             return "\n".join(lines)
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        return f"Query failed: {str(e)}"
+        print(f"run_text_to_sql query failed: {e}")
+        return "I couldn't get that information from the database right now."
     finally:
         engine.dispose()

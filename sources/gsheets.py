@@ -1,8 +1,10 @@
 # sources/gsheets.py
 
+import re
 import uuid
+from urllib.parse import quote
+
 import sentry_sdk
-import requests
 import pandas as pd
 from qdrant_client import models
 
@@ -16,8 +18,29 @@ def get_sheet_names(sheet_id: str, range_name: str):
     return requested, []
 
 
+SHEET_ID_RE = re.compile(r"^[A-Za-z0-9-_]{20,}$")
+
+
+def validate_sheet_id(sheet_id: str):
+    """The sheet id goes straight into a docs.google.com URL path. The host
+    is hardcoded so this isn't SSRF, but an unvalidated value reshapes the
+    path (`?`, `#`, `../`) and, more commonly, is simply a mis-parsed URL
+    that would 404 and produce a silently empty source."""
+    if not sheet_id or not SHEET_ID_RE.match(sheet_id):
+        raise ValueError(
+            "That doesn't look like a Google Sheet link. Open your sheet, "
+            "click Share → Anyone with the link → Viewer, then paste the URL "
+            "from your browser's address bar."
+        )
+
+
 def fetch_tab(sheet_id: str, tab_name: str):
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={tab_name}"
+    # tab_name is user-supplied and goes into a query string — a name
+    # containing & or # would otherwise rewrite the gviz parameters.
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote(tab_name, safe='')}"
+    )
     try:
         df = pd.read_csv(url)
         return df
@@ -27,37 +50,21 @@ def fetch_tab(sheet_id: str, tab_name: str):
         return None
 
 
-def get_all_tab_names(sheet_id: str):
-    try:
-        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/feed/worksheets?alt=json"
-        res = requests.get(url)
-        data = res.json()
-        entries = data.get("feed", {}).get("entry", [])
-        return [e["title"]["$t"] for e in entries]
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        print(f"Could not fetch tab list: {e}")
-        return None
-
-
 def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, qdrant, embeddings, collection: str):
+    validate_sheet_id(sheet_id)
     requested_tabs, _ = get_sheet_names(sheet_id, range_name)
 
-    if requested_tabs is None:
-        all_tabs = get_all_tab_names(sheet_id)
-        tabs_to_read = all_tabs if all_tabs else [None]
-    else:
-        tabs_to_read = requested_tabs
+    # There is no way to enumerate a sheet's tabs without Google credentials
+    # — the old code called the v3 "worksheets feed" API, which Google shut
+    # down in 2021, so it ALWAYS failed and silently fell back to reading
+    # only the first tab while reporting a full sync. Rather than lie, read
+    # the first tab when no tabs are named, and let the caller tell the user
+    # to name tabs explicitly if they need more than one.
+    tabs_to_read = requested_tabs if requested_tabs is not None else [None]
 
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
+    # NOTE: the purge deliberately happens AFTER the fetch loop below, not
+    # here. Deleting first meant a sheet that had since been made private
+    # wiped the existing index and then "succeeded" with nothing.
 
     all_chunks = []
     all_metas = []
@@ -73,6 +80,7 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             except Exception as e:
                 sentry_sdk.capture_exception(e)
                 print(f"Could not fetch default tab: {e}")
+                skipped.append("default")
                 continue
         else:
             df = fetch_tab(sheet_id, tab)
@@ -100,11 +108,30 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
 
         synced.append(tab_label)
 
+    # Previously this returned successfully, so a private/deleted/unreachable
+    # sheet was saved as a "connected" source with nothing behind it — the
+    # single most likely real-world failure, and completely invisible.
+    # Raising lets add_source's existing handler clean up the orphaned row
+    # and show the user a real message (same guard the website branch uses).
     if not all_chunks:
-        print("No data found in any sheet tab.")
-        return {"synced_tabs": synced, "skipped_tabs": skipped}
+        raise ValueError(
+            "Couldn't read any data from that sheet. Check that it's shared "
+            "as 'Anyone with the link can view', that it isn't empty, and "
+            "that any tab names you entered match exactly."
+        )
 
     vectors = embeddings.embed_documents(all_chunks)
+
+    # Only now that we have real data is it safe to drop the old index.
+    qdrant.delete(
+        collection_name=collection,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="source_id",
+                match=models.MatchValue(value=source_id)
+            )]
+        )
+    )
 
     qdrant.upload_points(
         collection_name=collection,

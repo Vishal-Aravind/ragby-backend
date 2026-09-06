@@ -1128,6 +1128,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 collection_name=QDRANT_COLLECTION,
                 query=q,
                 limit=7,
+                # A project can have BOTH a spreadsheet and a database
+                # source. Without a relevance floor, any single low-quality
+                # spreadsheet hit (even a near-irrelevant one) permanently
+                # blocked the database fallback below from ever running.
+                score_threshold=0.5,
                 query_filter=models.Filter(
                     must=[
                         models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
@@ -1149,10 +1154,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     .limit(1) \
                     .execute()
 
-                if pg_source.data:
-                    db_url = pg_source.data[0]["config"]["url"]
+                db_url = (pg_source.data[0].get("config") or {}).get("url") if pg_source.data else None
+                if db_url:
                     allowed_schema = pg_source.data[0].get("allowed_schema")
-                    sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
+                    try:
+                        sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
+                    except Exception as e:
+                        sentry_sdk.capture_exception(e)
+                        print(f"run_text_to_sql failed: {e}")
+                        sql_result = "I couldn't get that information from the database right now."
                     context = f"[Source: database]\n{sql_result}"
                 else:
                     source_intent = "conceptual"

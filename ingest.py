@@ -1,5 +1,7 @@
 import io
 import uuid
+
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -12,9 +14,22 @@ from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 
 router = APIRouter()
+
+
+def _purge_file_points(file_id: str):
+    """Delete every Qdrant point belonging to a file."""
+    qdrant.delete(
+        collection_name=QDRANT_COLLECTION,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="file_id",
+                match=models.MatchValue(value=file_id)
+            )]
+        )
+    )
 
 
 # -------------------------------------------------
@@ -70,7 +85,7 @@ EXTRACTORS = {
 # -------------------------------------------------
 @router.post("/ingest")
 def ingest(req: IngestRequest, user=Depends(verify_token)):
-    require_project_role(user.id, req.projectId)
+    require_project_access(user.id, req.projectId, tab="documents")
 
     # FIX: filePath is otherwise fully caller-controlled — without this
     # check, a user with a role on their OWN project could point filePath
@@ -87,46 +102,76 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
         .execute()
 
     if not row.data:
-        return {"error": "file not found"}
+        # Was returning this with HTTP 200, so the caller's .ok check passed
+        # and a failed ingest looked identical to a successful one.
+        raise HTTPException(status_code=404, detail="File not found")
 
     file_id = row.data[0]["id"]
     supabase.table("files").update({"status": "processing"}).eq("id", file_id).execute()
 
-    b = supabase.storage.from_("documents").download(req.filePath)
     ext = req.filename.lower().split(".")[-1]
-
     extractor = EXTRACTORS.get(ext)
     if not extractor:
         supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
-        return {"error": "unsupported file type"}
+        raise HTTPException(status_code=400, detail="That file type isn't supported.")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-    chunks, metas = [], []
+    # Everything below can fail on someone else's infrastructure (Supabase
+    # storage, OpenAI, Qdrant) or on a corrupt/password-protected file. Without
+    # this, any of those left the row pinned at "processing" forever with no
+    # reason recorded and an unhandled 500 to the caller.
+    try:
+        b = supabase.storage.from_("documents").download(req.filePath)
 
-    for page, text in extractor(b):
-        for c in splitter.split_text(text):
-            chunks.append(c)
-            metas.append({
-                "project_id": req.projectId,
-                "file_id": file_id,
-                "filename": req.filename,
-                "page_number": page,
-                "source_type": "document",
-                "text": c,
-            })
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+        chunks, metas = [], []
 
-    vectors = embeddings.embed_documents(chunks)
+        for page, text in extractor(b):
+            for c in splitter.split_text(text):
+                chunks.append(c)
+                metas.append({
+                    "project_id": req.projectId,
+                    "file_id": file_id,
+                    "filename": req.filename,
+                    "page_number": page,
+                    "source_type": "document",
+                    "text": c,
+                })
 
-    qdrant.upload_points(
-        collection_name=QDRANT_COLLECTION,
-        points=[
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=v,
-                payload=m
-            ) for v, m in zip(vectors, metas)
-        ]
-    )
+        if not chunks:
+            supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
+            raise HTTPException(
+                status_code=400,
+                detail="Couldn't read any text from that file. If it's a scanned PDF, it needs to contain selectable text.",
+            )
+
+        vectors = embeddings.embed_documents(chunks)
+
+        # Re-ingesting reuses the same file_id (the row is upserted), so
+        # without this the previous version's chunks stayed in Qdrant
+        # alongside the new ones and the bot kept answering from content
+        # the user believed they had replaced.
+        _purge_file_points(file_id)
+
+        qdrant.upload_points(
+            collection_name=QDRANT_COLLECTION,
+            points=[
+                models.PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=v,
+                    payload=m
+                ) for v, m in zip(vectors, metas)
+            ]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"ingest failed for file {file_id}: {e}")
+        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't process that file. Please try uploading it again.",
+        )
 
     supabase.table("files").update({"status": "indexed"}).eq("id", file_id).execute()
     return {"status": "indexed", "chunks_indexed": len(chunks)}
@@ -138,16 +183,8 @@ def delete_document(file_id: str, user=Depends(verify_token)):
     file_row = row.data if row else None
     if not file_row:
         raise HTTPException(status_code=404, detail="Not found")
-    require_project_role(user.id, file_row["project_id"])
+    require_project_access(user.id, file_row["project_id"], tab="documents")
 
-    qdrant.delete(
-        collection_name=QDRANT_COLLECTION,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="file_id",
-                match=models.MatchValue(value=file_id)
-            )]
-        )
-    )
+    _purge_file_points(file_id)
     supabase.table("files").delete().eq("id", file_id).execute()
     return {"status": "deleted"}

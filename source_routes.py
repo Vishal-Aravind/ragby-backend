@@ -4,7 +4,7 @@ from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from sources.gsheets import sync_sheet
 from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
@@ -14,19 +14,49 @@ from sources.shopify import sync_products as sync_shopify_products
 router = APIRouter()
 
 
+def _purge_source_points(source_id: str):
+    """Delete every Qdrant point belonging to a source."""
+    qdrant.delete(
+        collection_name=QDRANT_COLLECTION,
+        points_selector=models.Filter(
+            must=[models.FieldCondition(
+                key="source_id",
+                match=models.MatchValue(value=source_id)
+            )]
+        )
+    )
+
+
+def _redact_source(source: dict) -> dict:
+    """Postgres sources store the raw connection string (with credentials)
+    in config.url — never send that back to the browser once it's stored,
+    only at introspect-time when the user is actively typing it in."""
+    if source.get("type") == "postgres" and (source.get("config") or {}).get("url"):
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(source["config"]["url"])
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+        if parts.username:
+            netloc = f"{parts.username}:***@{netloc}"
+        redacted = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        source = {**source, "config": {**source["config"], "url": redacted}}
+    return source
+
+
 @router.get("/sources")
 def list_sources(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="documents")
     res = supabase.table("data_sources") \
         .select("*") \
         .eq("project_id", project_id) \
         .execute()
-    return res.data
+    return [_redact_source(s) for s in res.data]
 
 
 @router.post("/sources/add")
 def add_source(data: dict, user=Depends(verify_token)):
-    require_project_role(user.id, data["projectId"])
+    require_project_access(user.id, data["projectId"], tab="documents")
     res = supabase.table("data_sources").insert({
         "project_id": data["projectId"],
         "type": data["type"],
@@ -85,9 +115,25 @@ def add_source(data: dict, user=Depends(verify_token)):
             sync_shopify_products(
                 data["projectId"], source["id"], qdrant, embeddings, QDRANT_COLLECTION
             )
+
+        elif data["type"] == "postgres":
+            # Unlike the other types, there's nothing to embed — this just
+            # re-verifies the connection is real (same checks as
+            # /sources/introspect) before treating the row as connected.
+            # Previously this branch didn't exist at all, so a postgres
+            # source skipped both the SSRF check and any connectivity
+            # verification and was always reported as saved successfully.
+            cfg = data["config"]
+            validate_url(cfg["url"])
+            introspect_schema(cfg["url"])
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"add_source sync error ({data['type']}): {e}")
+        # Purge points too, not just the row — a sync that failed partway
+        # may already have uploaded vectors, and once the row is gone
+        # nothing can ever reach them again (no delete path takes an
+        # orphaned source_id), so they'd keep answering questions forever.
+        _purge_source_points(source["id"])
         supabase.table("data_sources").delete().eq("id", source["id"]).execute()
         raise HTTPException(
             status_code=400,
@@ -97,25 +143,21 @@ def add_source(data: dict, user=Depends(verify_token)):
     return {"id": source["id"], "skipped_tabs": skipped_tabs}
 
 
-def _require_role_for_source(user_id: str, source_id: str):
+def _require_role_for_source(user_id: str, source_id: str, min_role: str = None) -> str:
+    """Verifies the caller has a role on the project that OWNS this source,
+    and returns that project_id — callers should use the returned value
+    rather than any project id supplied by the caller."""
     res = supabase.table("data_sources").select("project_id").eq("id", source_id).maybe_single().execute()
     source = res.data if res else None
     if not source:
         raise HTTPException(status_code=404, detail="Not found")
-    require_project_role(user_id, source["project_id"])
+    require_project_access(user_id, source["project_id"], tab="documents", min_role=min_role)
+    return source["project_id"]
 
 @router.delete("/sources/{source_id}")
 def delete_source(source_id: str, user=Depends(verify_token)):
-    _require_role_for_source(user.id, source_id)
-    qdrant.delete(
-        collection_name=QDRANT_COLLECTION,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
+    _require_role_for_source(user.id, source_id, min_role="admin")
+    _purge_source_points(source_id)
     supabase.table("data_sources").delete().eq("id", source_id).execute()
     return {"status": "deleted"}
 
@@ -126,16 +168,11 @@ def resync_source(source_id: str, user=Depends(verify_token)):
     res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
     s = res.data
 
-    qdrant.delete(
-        collection_name=QDRANT_COLLECTION,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
+    # No pre-emptive purge here: every sync_* function already deletes this
+    # source's points itself as part of its own run. Deleting here too meant
+    # a resync that failed BEFORE reaching the sync call (bad config, failed
+    # validation) destroyed the existing index for nothing, leaving the
+    # source "connected" but genuinely empty.
     try:
         if s["type"] == "gsheets":
             cfg = s["config"]
@@ -169,6 +206,14 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             sync_shopify_products(
                 s["project_id"], source_id, qdrant, embeddings, QDRANT_COLLECTION
             )
+
+        elif s["type"] == "postgres":
+            # Re-verify the connection is still reachable; also refreshes
+            # allowed_schema's validity implicitly (introspect_schema will
+            # fail if the DB is gone/credentials rotated).
+            cfg = s["config"]
+            validate_url(cfg["url"])
+            introspect_schema(cfg["url"])
     except Exception as e:
         sentry_sdk.capture_exception(e)
         # The old points for this source were already deleted above before
@@ -186,6 +231,14 @@ def resync_source(source_id: str, user=Depends(verify_token)):
 
 @router.post("/sources/introspect")
 def introspect(data: dict, user=Depends(verify_token)):
+    # Was the only endpoint in this file with no project check — any logged-in
+    # user could make this worker open a connection to a host of their
+    # choosing and read the driver's response, i.e. a network probe oracle.
+    project_id = data.get("projectId") or data.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="projectId is required")
+    require_project_access(user.id, project_id, tab="documents")
+
     db_url = data.get("db_url", "")
     try:
         validate_url(db_url)
@@ -210,11 +263,18 @@ async def upload_excel(
     source_id: str = Form(""),
     user=Depends(verify_token)
 ):
-    require_project_role(user.id, projectId)
+    require_project_access(user.id, projectId, tab="documents")
     file_bytes = await file.read()
 
     if source_id:
-        sync_excel_bytes(file_bytes, projectId, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+        # source_id is caller-supplied and was previously trusted on the
+        # strength of the projectId check above — but that only proves the
+        # caller has a role on the project THEY named, not that source_id
+        # belongs to it. Without this, passing another tenant's source_id
+        # wiped their vectors and overwrote their row via the service-role
+        # client below.
+        owning_project_id = _require_role_for_source(user.id, source_id)
+        sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
         supabase.table("data_sources").update({
             "config": {"filename": file.filename},
             "label": label or file.filename,
