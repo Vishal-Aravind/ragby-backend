@@ -383,6 +383,112 @@ async def whatsapp_verify(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+def _process_single_message(value, message, project_id, phone_number_id, token):
+    """Handle ONE inbound message.
+
+    Meta batches messages into a single webhook, but only messages[0] was
+    ever read. The rest were dropped with no dedup row and no retry, and
+    we returned 200 so Meta never resent them — a customer sending three
+    quick messages got exactly one answer.
+
+    Returns a per-message status; raises to let the caller release the
+    dedup row and ask Meta to redeliver.
+    """
+    msg_type = message.get("type")
+    from_number = message["from"]
+
+    # Meta redelivers a webhook at-least-once if we don't ack fast enough
+    # or error transiently — without this, a redelivery re-triggers the
+    # whole flow below and sends a duplicate reply. Confirmed live: the
+    # same bot reply fired 6 extra times over ~2.5 hours with no new
+    # customer message in between. First writer wins; a duplicate-key
+    # violation here means we've already processed this exact message.
+    wa_message_id = message.get("id")
+    if wa_message_id:
+        try:
+            supabase.table("whatsapp_webhook_dedup").insert({"wa_message_id": wa_message_id}).execute()
+        except Exception as e:
+            if "duplicate key" in str(e).lower():
+                return {"status": "duplicate_ignored"}
+            raise
+
+    # Dedup stops REPEATS of one message; it does nothing about a flood
+    # of distinct ones. Signature verification means this needs real
+    # WhatsApp traffic, but a single hostile sender could still burn a
+    # project's whole monthly quota (and the matching OpenAI + Meta send
+    # cost) in minutes. Per-sender first, then a project-wide ceiling.
+    if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
+        print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
+        return {"status": "rate_limited"}
+    if is_rate_limited(f"wa-in:{project_id}", limit=120, window_seconds=60):
+        print(f"WhatsApp inbound rate limited (project-wide): {project_id}")
+        return {"status": "rate_limited"}
+
+    # WhatsApp includes the sender's real profile name on every message —
+    # previously never captured anywhere, so bookings/orders had no real
+    # name to fall back on and leads showed no name either.
+    contacts = value.get("contacts", [])
+    profile_name = contacts[0].get("profile", {}).get("name") if contacts else None
+
+    # Get or create chat record
+    chat_id = _get_or_create_chat(project_id, from_number)
+
+    # Best-effort suppression for WhatsApp Coexistence — if the business
+    # owner just replied to this conversation manually from their own
+    # phone (signaled by a smb_message_echoes webhook, handled above),
+    # skip the automatic bot reply so it doesn't talk over them. Not a
+    # hard guarantee: the echo webhook arrives after the fact, not
+    # synchronously with the owner's reply, so a narrow race is possible.
+    chat_row = supabase.table("chats").select("last_human_reply_at").eq("id", chat_id).maybe_single().execute()
+    last_human_reply_at = (chat_row.data or {}).get("last_human_reply_at") if chat_row else None
+    if last_human_reply_at:
+        from datetime import datetime, timezone, timedelta
+        reply_time = datetime.fromisoformat(last_human_reply_at.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) - reply_time < timedelta(minutes=5):
+            # Record it before bailing out. The inbound message is otherwise
+            # only saved inside handle_text, further down — so suppressing
+            # the bot ALSO meant the customer's message never appeared in
+            # the inbox, and the owner it was deferring to never saw the
+            # thing they were supposed to answer.
+            try:
+                from chat import save_message
+                if msg_type == "text":
+                    save_message(chat_id, "user", message["text"]["body"].strip())
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+            return {"status": "suppressed_human_active"}
+
+    from flows import get_session, handle_interactive, handle_text
+    from leads import upsert_contact
+
+    # Auto-save contact
+    upsert_contact(project_id, from_number, name=profile_name, channel="whatsapp")
+
+    # ── Interactive (button/list click) ──────────────
+    if msg_type == "interactive":
+        interactive = message.get("interactive", {})
+        if interactive.get("type") == "button_reply":
+            trigger = interactive["button_reply"]["id"]
+        elif interactive.get("type") == "list_reply":
+            trigger = interactive["list_reply"]["id"]
+        else:
+            return {"status": "ignored"}
+
+        session = get_session(project_id, from_number)
+        if session:
+            handle_interactive(session, trigger, from_number, phone_number_id, token, project_id, chat_id)
+        return {"status": "ok"}
+
+    # ── Text message ──────────────────────────────────
+    if msg_type == "text":
+        text = message["text"]["body"].strip()
+        session = get_session(project_id, from_number)
+        handle_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
+        return {"status": "ok"}
+
+    return {"status": "ignored"}
+
+
 # -------------------------------------------------
 # WEBHOOK HANDLER
 # -------------------------------------------------
@@ -457,90 +563,14 @@ def _process_webhook(body: dict):
         if not messages:
             return {"status": "ignored"}
 
-        message = messages[0]
-        msg_type = message.get("type")
-        from_number = message["from"]
-
-        # Meta redelivers a webhook at-least-once if we don't ack fast enough
-        # or error transiently — without this, a redelivery re-triggers the
-        # whole flow below and sends a duplicate reply. Confirmed live: the
-        # same bot reply fired 6 extra times over ~2.5 hours with no new
-        # customer message in between. First writer wins; a duplicate-key
-        # violation here means we've already processed this exact message.
-        wa_message_id = message.get("id")
-        if wa_message_id:
-            try:
-                supabase.table("whatsapp_webhook_dedup").insert({"wa_message_id": wa_message_id}).execute()
-            except Exception as e:
-                if "duplicate key" in str(e).lower():
-                    return {"status": "duplicate_ignored"}
-                raise
-
-        # Dedup stops REPEATS of one message; it does nothing about a flood
-        # of distinct ones. Signature verification means this needs real
-        # WhatsApp traffic, but a single hostile sender could still burn a
-        # project's whole monthly quota (and the matching OpenAI + Meta send
-        # cost) in minutes. Per-sender first, then a project-wide ceiling.
-        if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
-            print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
-            return {"status": "rate_limited"}
-        if is_rate_limited(f"wa-in:{project_id}", limit=120, window_seconds=60):
-            print(f"WhatsApp inbound rate limited (project-wide): {project_id}")
-            return {"status": "rate_limited"}
-
-        # WhatsApp includes the sender's real profile name on every message —
-        # previously never captured anywhere, so bookings/orders had no real
-        # name to fall back on and leads showed no name either.
-        contacts = value.get("contacts", [])
-        profile_name = contacts[0].get("profile", {}).get("name") if contacts else None
-
-        # Get or create chat record
-        chat_id = _get_or_create_chat(project_id, from_number)
-
-        # Best-effort suppression for WhatsApp Coexistence — if the business
-        # owner just replied to this conversation manually from their own
-        # phone (signaled by a smb_message_echoes webhook, handled above),
-        # skip the automatic bot reply so it doesn't talk over them. Not a
-        # hard guarantee: the echo webhook arrives after the fact, not
-        # synchronously with the owner's reply, so a narrow race is possible.
-        chat_row = supabase.table("chats").select("last_human_reply_at").eq("id", chat_id).maybe_single().execute()
-        last_human_reply_at = (chat_row.data or {}).get("last_human_reply_at") if chat_row else None
-        if last_human_reply_at:
-            from datetime import datetime, timezone, timedelta
-            reply_time = datetime.fromisoformat(last_human_reply_at.replace("Z", "+00:00"))
-            if datetime.now(timezone.utc) - reply_time < timedelta(minutes=5):
-                return {"status": "suppressed_human_active"}
-
-        from flows import get_session, handle_interactive, handle_text
-        from leads import upsert_contact
-
-        # Auto-save contact
-        upsert_contact(project_id, from_number, name=profile_name, channel="whatsapp")
-
-        # ── Interactive (button/list click) ──────────────
-        if msg_type == "interactive":
-            interactive = message.get("interactive", {})
-            if interactive.get("type") == "button_reply":
-                trigger = interactive["button_reply"]["id"]
-            elif interactive.get("type") == "list_reply":
-                trigger = interactive["list_reply"]["id"]
-            else:
-                return {"status": "ignored"}
-
-            session = get_session(project_id, from_number)
-            if session:
-                handle_interactive(session, trigger, from_number, phone_number_id, token, project_id, chat_id)
-            return {"status": "ok"}
-
-        # ── Text message ──────────────────────────────────
-        if msg_type == "text":
-            text = message["text"]["body"].strip()
-            session = get_session(project_id, from_number)
-            handle_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
-            return {"status": "ok"}
-
-        return {"status": "ignored"}
-
+        # Process EVERY message in the batch, not just the first.
+        results = []
+        for message in messages:
+            wa_message_id = message.get("id")
+            results.append(
+                _process_single_message(value, message, project_id, phone_number_id, token)
+            )
+        return {"status": "ok", "processed": len(results)}
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"WHATSAPP WEBHOOK ERROR: {e}")
@@ -601,7 +631,7 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
     # confirmed. Logged explicitly either way so a repeat is diagnosable
     # from Render logs instead of another guessing round.
     existing = supabase.table("whatsapp_integrations") \
-        .select("coexistence_enabled, history_sync_status, phone_number_id") \
+        .select("coexistence_enabled, history_sync_status, phone_number_id, waba_id") \
         .eq("project_id", project_id).maybe_single().execute()
     row = (existing.data if existing else None) or {}
     print(f"WhatsApp disconnect check: project={project_id}, coexistence_enabled={row.get('coexistence_enabled')}, history_sync_status={row.get('history_sync_status')}")
@@ -658,6 +688,25 @@ def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
                 detail="This number is connected via WhatsApp Coexistence. Disconnect it from the WhatsApp Business App on your phone instead — Zavo can't safely disconnect a coexistence number without risking your chat history.",
             )
         print(f"WhatsApp disconnect ALLOWED: project={project_id} confirmed no longer on Business App")
+
+    # Unsubscribe our app from the merchant's WABA. Without this, "disconnect"
+    # only removed OUR row: Meta carried on pushing that merchant's customer
+    # messages (and coexistence history) to this app indefinitely. They were
+    # dropped on arrival, but they were still being transmitted to us after
+    # the merchant believed they had disconnected.
+    waba_id = row.get("waba_id")
+    if waba_id:
+        try:
+            unsub = http.delete(
+                f"https://graph.facebook.com/v25.0/{waba_id}/subscribed_apps",
+                params={"access_token": WHATSAPP_TOKEN},
+            )
+            if not unsub.ok:
+                print(f"WhatsApp unsubscribe failed for waba {waba_id}: {unsub.status_code} {unsub.text[:200]}")
+        except Exception as e:
+            # Never block the merchant's disconnect on Meta being reachable.
+            sentry_sdk.capture_exception(e)
+            print(f"WhatsApp unsubscribe error for waba {waba_id}: {e}")
 
     supabase.table("whatsapp_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
