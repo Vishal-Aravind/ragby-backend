@@ -8,7 +8,7 @@ from starlette.responses import PlainTextResponse
 from clients import supabase
 from ratelimit import is_rate_limited
 from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, META_APP_ID, META_APP_SECRET
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 
 router = APIRouter()
 
@@ -536,7 +536,7 @@ async def whatsapp_webhook(request: Request):
 # -------------------------------------------------
 @router.get("/whatsapp/status/{project_id}")
 def whatsapp_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("whatsapp_integrations") \
         .select("phone_number_id, display_phone_number, waba_id") \
         .eq("project_id", project_id) \
@@ -559,7 +559,7 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/whatsapp/disconnect/{project_id}")
 def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
 
     # Meta's normal Deregister API does not work on a coexistence-enabled
     # number, and its docs don't fully specify the alternative — rather
@@ -645,7 +645,7 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
     app for that WABA, regardless of the app-level webhook field toggles.
     New connections don't need this; it's for repairing ones made before
     the fix landed."""
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     res = supabase.table("whatsapp_integrations").select("waba_id").eq("project_id", project_id).maybe_single().execute()
     waba_id = (res.data or {}).get("waba_id") if res else None
     if not waba_id:
@@ -672,7 +672,7 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
     burned through that quota after a few repair attempts. This must stay
     a deliberate, standalone action — never auto-triggered — so it's not
     accidentally called more than genuinely needed."""
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     res = supabase.table("whatsapp_integrations").select("phone_number_id, coexistence_enabled").eq("project_id", project_id).maybe_single().execute()
     row = res.data if res else None
     if not row or not row.get("coexistence_enabled") or not row.get("phone_number_id"):
@@ -696,7 +696,7 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
 
 @router.get("/whatsapp/coexistence-status/{project_id}")
 def whatsapp_coexistence_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("whatsapp_integrations") \
         .select("coexistence_enabled, history_sync_status, history_sync_requested_at, history_sync_completed_at, last_sync_error, phone_number_id") \
         .eq("project_id", project_id).maybe_single().execute()
@@ -739,7 +739,7 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     # linked WABAs aren't guaranteed to show up in that generic listing, or
     # there's a propagation delay after the phone's "tap Confirm" step).
     waba_id_hint = data.get("wabaIdHint")
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
 
     token_res = http.get(
         "https://graph.facebook.com/v25.0/oauth/access_token",
@@ -848,7 +848,7 @@ async def whatsapp_reply(data: dict, user=Depends(verify_token)):
     project_id  = data["project_id"]
     phone_number = data["phone_number"]
     message     = data["message"]
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
 
     # Had no rate limit and no usage accounting at all, unlike the template
     # send path - a stolen dashboard session could loop this endpoint and

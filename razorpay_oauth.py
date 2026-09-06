@@ -33,7 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from clients import supabase
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from config import (
     RAZORPAY_PARTNER_CLIENT_ID, RAZORPAY_PARTNER_CLIENT_SECRET,
     RAZORPAY_PARTNER_REDIRECT_URI, RAZORPAY_PARTNER_MODE,
@@ -189,7 +189,7 @@ def _razorpay_api_request(method: str, path: str, project_id: str, **kwargs) -> 
 
 @router.get("/razorpay/oauth/start")
 def razorpay_oauth_start(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
 
     if not RAZORPAY_PARTNER_CLIENT_ID or not RAZORPAY_PARTNER_CLIENT_SECRET:
         raise HTTPException(status_code=400, detail="Razorpay Partner OAuth not configured. Add RAZORPAY_PARTNER_CLIENT_ID and RAZORPAY_PARTNER_CLIENT_SECRET to env vars.")
@@ -239,7 +239,7 @@ def razorpay_oauth_callback(request: Request):
 
 @router.get("/razorpay/status/{project_id}")
 def razorpay_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("razorpay_connections").select("razorpay_account_id, connected_at").eq("project_id", project_id).maybe_single().execute()
     data = res.data if res else None
     if not data:
@@ -249,7 +249,7 @@ def razorpay_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/razorpay/disconnect/{project_id}")
 def razorpay_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     supabase.table("razorpay_connections").delete().eq("project_id", project_id).execute()
     return {"success": True}
 

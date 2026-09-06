@@ -10,7 +10,7 @@ from clients import supabase
 from ratelimit import is_rate_limited
 from webhook_dedup import already_processed
 from config import SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, FRONTEND_URL
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
 
@@ -91,7 +91,7 @@ def send_slack_message(access_token: str, channel: str, text: str) -> bool:
 # -------------------------------------------------
 @router.get("/slack/auth-url")
 def slack_auth_url(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
     scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
     state = _issue_state(project_id)
@@ -111,7 +111,7 @@ def slack_callback(data: dict, user=Depends(verify_token)):
     project_id = _consume_state(data["state"])
     if not project_id:
         raise HTTPException(status_code=400, detail="This connection link expired or was already used — please try connecting again.")
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
 
     res = requests.post("https://slack.com/api/oauth.v2.access", timeout=15, data={
@@ -138,7 +138,7 @@ def slack_callback(data: dict, user=Depends(verify_token)):
 
 @router.get("/slack/status/{project_id}")
 def slack_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("slack_integrations") \
         .select("team_name, team_id") \
         .eq("project_id", project_id) \
@@ -150,7 +150,7 @@ def slack_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/slack/disconnect/{project_id}")
 def slack_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     supabase.table("slack_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
 

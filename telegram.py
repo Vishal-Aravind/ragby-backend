@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from clients import supabase
 from ratelimit import is_rate_limited
 from webhook_dedup import already_processed
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from config import TELEGRAM_WEBHOOK_SECRET
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
@@ -78,7 +78,7 @@ def get_bot_info(bot_token: str):
 def telegram_connect(data: dict, user=Depends(verify_token)):
     bot_token = data["bot_token"]
     project_id = data["projectId"]
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
 
     bot_info = get_bot_info(bot_token)
     if not bot_info.get("ok"):
@@ -107,7 +107,7 @@ def telegram_connect(data: dict, user=Depends(verify_token)):
 
 @router.delete("/telegram/disconnect/{project_id}")
 def telegram_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     res = supabase.table("telegram_integrations") \
         .select("bot_token") \
         .eq("project_id", project_id) \
@@ -123,7 +123,7 @@ def telegram_disconnect(project_id: str, user=Depends(verify_token)):
 
 @router.get("/telegram/status/{project_id}")
 def telegram_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("telegram_integrations") \
         .select("bot_username, created_at") \
         .eq("project_id", project_id) \

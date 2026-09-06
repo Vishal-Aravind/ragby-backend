@@ -36,7 +36,7 @@ from fastapi.responses import HTMLResponse
 
 from clients import supabase
 from webhook_dedup import already_processed, qdrant, embeddings
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from shopify_client import graphql as _graphql
 from config import (
     SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SHOPIFY_APP_SCOPES,
@@ -191,7 +191,7 @@ def _sync_shop_currency(project_id: str, shop_domain: str, access_token: str):
 
 @router.get("/shopify/oauth/start")
 def shopify_oauth_start(project_id: str, shop: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     if not SHOPIFY_API_KEY or not SHOPIFY_API_SECRET:
         raise HTTPException(status_code=400, detail="Shopify integration not configured. Add SHOPIFY_API_KEY and SHOPIFY_API_SECRET to env vars.")
 
@@ -282,7 +282,7 @@ def shopify_oauth_callback(request: Request):
 
 @router.get("/shopify/status/{project_id}")
 def shopify_status(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("shopify_integrations").select("shop_domain, last_synced_at, last_sync_error").eq("project_id", project_id).maybe_single().execute()
     data = res.data if res else None
     if not data:
@@ -296,7 +296,7 @@ def shopify_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/shopify/disconnect/{project_id}")
 def shopify_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     # Leaves products/catalogs rows in place — deleting them would break
     # historical orders.items display. The source='shopify' catalog just
     # stops receiving updates.
