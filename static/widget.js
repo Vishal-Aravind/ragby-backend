@@ -47,16 +47,33 @@
 
   const history = [];
 
-  const URL_RE = /(https?:\/\/[^\s<]+)/g;
+  // Quotes matter as much as angle brackets here: the linkifier below puts
+  // the matched text inside href="...", so a URL containing a double quote
+  // used to break out of the attribute and inject an event handler running
+  // on the MERCHANT'S own origin. Reachable through poisoned knowledge-base
+  // content, a scraped website source, or plain prompt injection.
+  function esc(text) {
+    return (text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  // Stops at quotes as well as whitespace/angle brackets, so a trailing
+  // quote can never land inside the attribute in the first place.
+  const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
 
   function render(text) {
-    const escaped = (text || "")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+    const escaped = esc(text);
     // Auto-linkify so a checkout/shop link the bot relays is actually
     // tappable — this widget only ever renders plain escaped text, unlike
     // WhatsApp, which auto-links URLs on its own.
-    const linked = escaped.replace(URL_RE, url => `<a href="${url}" target="_blank" rel="noopener" style="color:#2563eb;text-decoration:underline">${url}</a>`);
+    const linked = escaped.replace(URL_RE, url => {
+      if (!/^https?:\/\//i.test(url)) return url;
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:underline">${url}</a>`;
+    });
     return linked.replace(/\n/g, "<br/>");
   }
 
@@ -188,8 +205,11 @@
     awaitingLead = true;
     blockInput();
 
-    const title = leadConfig?.form_title || "Before we continue...";
-    const subtitle = leadConfig?.form_subtitle || "Please share your details to keep chatting.";
+    // Set by an authenticated user but never sanitized on write, and
+    // interpolated into innerHTML below - so any project member could plant
+    // script that runs on every site the merchant embeds this widget on.
+    const title = esc(leadConfig?.form_title || "Before we continue...");
+    const subtitle = esc(leadConfig?.form_subtitle || "Please share your details to keep chatting.");
 
     // Overlay sits inside msgs container
     const overlay = document.createElement("div");

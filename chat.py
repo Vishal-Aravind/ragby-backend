@@ -1,12 +1,16 @@
+import hashlib
+import hmac
+import re
+import time
 import uuid
 import sentry_sdk
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clients import supabase, openai_client, embeddings, qdrant
-from config import QDRANT_COLLECTION, FRONTEND_URL
+from config import QDRANT_COLLECTION, FRONTEND_URL, SUPABASE_SERVICE_ROLE_KEY
 from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
 from ratelimit import is_rate_limited, client_ip
@@ -21,9 +25,83 @@ router = APIRouter()
 # abusive visitor can't affect other merchants' bots.
 _PUBLIC_CHAT_LIMIT_PER_MIN = 15
 
+# sessionId arrives from an anonymous caller and is used in a uuid column
+# lookup; a non-uuid string would otherwise reach Postgres and 500.
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
 
 def _public_chat_rate_limited(project_id: str, ip: str) -> bool:
     return is_rate_limited(f"chat:{project_id}:{ip}", _PUBLIC_CHAT_LIMIT_PER_MIN)
+
+
+
+
+# Only WhatsApp gives us a phone number we actually verified — it comes from
+# the network, as the sender of the message. On every other channel the
+# "customer_phone" a tool receives was typed by whoever is chatting, so
+# identity-scoped tools (look up MY bookings, cancel MY registration) become
+# an enumeration oracle over the merchant's customers: an anonymous visitor
+# on the public widget could read, and cancel, a stranger's appointments
+# just by guessing phone numbers. Those tools are refused off-WhatsApp.
+_VERIFIED_PHONE_CHANNELS = {"whatsapp"}
+
+
+def _resolve_verified_phone(channel: str, external_id: str):
+    """(phone, refusal_message). A refusal means: do not run this tool."""
+    if channel in _VERIFIED_PHONE_CHANNELS and external_id:
+        return external_id, None
+    return None, (
+        "For your privacy I can only look up bookings and orders when you "
+        "message us on WhatsApp, where we can confirm it's really you. "
+        "Please contact the business directly and they'll help you right away."
+    )
+
+
+# -------------------------------------------------
+# PASSWORD-PROTECTED PUBLIC CHAT
+# -------------------------------------------------
+# The password gate used to be decorative: verify-password returned
+# {"success": true} and the client simply set a React state flag, while
+# /public/chat checked nothing at all. Anyone could POST straight to
+# /public/chat, or flip the flag in devtools, and use a protected bot at
+# the merchant's expense. Verification now mints a short-lived signed
+# token that /public/chat requires.
+_CHAT_ACCESS_TTL_SECONDS = 12 * 60 * 60
+
+
+def _chat_access_secret() -> bytes:
+    # Server-side only; never shipped anywhere near the browser.
+    return (SUPABASE_SERVICE_ROLE_KEY or "").encode()
+
+
+def _issue_chat_access_token(project_id: str) -> str:
+    expires = int(time.time()) + _CHAT_ACCESS_TTL_SECONDS
+    payload = f"{project_id}:{expires}"
+    sig = hmac.new(_chat_access_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{sig}"
+
+
+def _chat_access_token_valid(project_id: str, token: str) -> bool:
+    if not token or "." not in token:
+        return False
+    expires_str, _, sig = token.partition(".")
+    try:
+        expires = int(expires_str)
+    except ValueError:
+        return False
+    if expires < time.time():
+        return False
+    expected = hmac.new(
+        _chat_access_secret(), f"{project_id}:{expires}".encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _project_public_settings(project_id: str) -> dict:
+    res = supabase.table("projects").select(
+        "chat_enabled, chat_password"
+    ).eq("id", project_id).maybe_single().execute()
+    return (res.data if res else None) or {}
 
 
 # -------------------------------------------------
@@ -36,7 +114,9 @@ class ChatRequest(BaseModel):
 
 class PublicChatRequest(BaseModel):
     projectId: str
-    message: str
+    # Unbounded before: a 1MB "message" was embedded, stored and pushed into
+    # the prompt, costing far more than the one usage unit it was charged.
+    message: str = Field(max_length=4000)
     sessionId: Optional[str] = None
     # Only ever "shopify" (the storefront widget extension) today — anything
     # else falls back to the generic "public" channel. Whitelisted rather
@@ -44,6 +124,7 @@ class PublicChatRequest(BaseModel):
     # this string directly controls which paid tools (e.g. SHOPIFY_CART_TOOLS)
     # get offered to the model for this conversation.
     channel: Optional[str] = None
+    accessToken: Optional[str] = None
 
 class VerifyPasswordRequest(BaseModel):
     projectId: str
@@ -542,7 +623,9 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             )
 
         if name == "cancel_appointment":
-            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            phone, _refusal = _resolve_verified_phone(channel, external_id)
+            if _refusal:
+                return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to find their appointment."}
 
@@ -594,7 +677,9 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             }
 
         if name == "check_my_appointments":
-            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            phone, _refusal = _resolve_verified_phone(channel, external_id)
+            if _refusal:
+                return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to look up their appointments."}
 
@@ -617,7 +702,9 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
 
     try:
         if name == "check_order_status":
-            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            phone, _refusal = _resolve_verified_phone(channel, external_id)
+            if _refusal:
+                return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to look up their order."}
             orders = get_recent_orders_for_phone(project_id, phone)
@@ -685,7 +772,9 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
             }
 
         if name == "check_my_event_registrations":
-            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            phone, _refusal = _resolve_verified_phone(channel, external_id)
+            if _refusal:
+                return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to look up their registrations."}
             regs = get_registrations_for_phone(project_id, phone)
@@ -694,7 +783,9 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
             return {"registrations": [_shape_registration_for_ai(r) for r in regs]}
 
         if name == "cancel_event_registration":
-            phone = external_id if channel == "whatsapp" else args.get("customer_phone")
+            phone, _refusal = _resolve_verified_phone(channel, external_id)
+            if _refusal:
+                return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to find their registration."}
 
@@ -1263,10 +1354,11 @@ def verify_chat_password(req: VerifyPasswordRequest, request: Request):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if project.get("chat_password") != req.password:
+    stored = project.get("chat_password") or ""
+    if not stored or not hmac.compare_digest(stored, req.password or ""):
         raise HTTPException(status_code=401, detail="Incorrect password")
 
-    return {"success": True}
+    return {"success": True, "accessToken": _issue_chat_access_token(req.projectId)}
 
 
 @router.get("/public/chat/history/{session_id}")
@@ -1291,35 +1383,87 @@ def public_chat_history(session_id: str):
 @router.post("/public/chat")
 def public_chat(req: PublicChatRequest, request: Request):
     visitor_ip = client_ip(request)
+
+    # Per-session and project-wide caps as well as per-IP. The shareable-link
+    # path proxies through Vercel, so every visitor of a project arrives from
+    # the same egress IP and shared ONE bucket — a single chatty visitor
+    # locked out everyone else. Session is per-browser (rotatable by an
+    # attacker, which is what the project ceiling is for).
+    if req.sessionId and is_rate_limited(f"chat-sess:{req.projectId}:{req.sessionId}", limit=15, window_seconds=60):
+        return {"answer": "You're sending messages very quickly. Please wait a moment.", "sessionId": req.sessionId, "sources": []}
+    if is_rate_limited(f"chat-proj:{req.projectId}", limit=120, window_seconds=60):
+        return {"answer": "This assistant is very busy right now. Please try again shortly.", "sessionId": req.sessionId, "sources": []}
+
     if _public_chat_rate_limited(req.projectId, visitor_ip):
         return {
             "answer": "You're sending messages a bit too fast — please wait a moment and try again.",
             "sessionId": req.sessionId or str(uuid.uuid4()),
         }
 
+    # chat_enabled and the password were both enforced only in the Next.js
+    # page, so turning a link "off" merely hid the UI while /public/chat
+    # (and the embeddable widget) kept answering and kept billing.
+    settings = _project_public_settings(req.projectId)
+    if settings.get("chat_enabled") is False:
+        raise HTTPException(status_code=403, detail="This chat is not available.")
+
+    if settings.get("chat_password"):
+        if not _chat_access_token_valid(req.projectId, req.accessToken or ""):
+            raise HTTPException(status_code=401, detail="This chat is password protected.")
+
     session_id = req.sessionId or str(uuid.uuid4())
 
-    existing = supabase.table("chats").select("id").eq("id", session_id).execute()
-    if not existing.data:
-        supabase.table("chats").insert({
-            "id": session_id,
-            "project_id": req.projectId,
-            "title": "Public Chat",
-            "channel": "shopify" if req.channel == "shopify" else "public",
-        }).execute()
+    # sessionId is supplied by an anonymous caller. Looking it up by id
+    # alone meant ANY existing chat row could be adopted — including a real
+    # WhatsApp customer's. run_chat resolves channel and external_id from
+    # that row, so the public widget would then act AS that customer, and
+    # the appointment/order tools key off external_id: an attacker could
+    # cancel a stranger's booking. Scope the lookup to this project AND to
+    # the public channels, so only a public session can ever be resumed.
+    # (The authenticated /chat endpoint already got this fix; this one was
+    # missed.)
+    if not _UUID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session")
 
+    # Quota first. The chats row used to be inserted BEFORE this, so a
+    # script could flood a merchant's Conversations inbox with rows for a
+    # project that was over quota, suspended, or deleted.
     rate_check = check_rate_limit(req.projectId)
     if not rate_check["allowed"]:
-        # FIX: previously always showed the "monthly limit reached" message
-        # even when the real reason was "Project not found" (e.g. a stale
-        # widget embed left on a merchant's site after they delete the
-        # project) — genuinely confusing for whoever's staring at the chat.
+        # Previously always showed the "monthly limit reached" message even
+        # when the real reason was "Project not found" (e.g. a stale widget
+        # embed left on a merchant's site after they delete the project) —
+        # genuinely confusing for whoever's staring at the chat.
         answer = (
             "Sorry, this assistant has reached its monthly limit. Please try again next month."
             if rate_check.get("reason") != "Project not found"
             else "This assistant isn't available right now."
         )
         return {"answer": answer, "sessionId": session_id}
+
+    allowed_channels = ("public", "shopify")
+    existing = (
+        supabase.table("chats")
+        .select("id, channel")
+        .eq("id", session_id)
+        .eq("project_id", req.projectId)
+        .in_("channel", list(allowed_channels))
+        .execute()
+    )
+
+    if not existing.data:
+        # Refuse to reuse an id that exists but isn't ours, rather than
+        # colliding on the primary key.
+        clash = supabase.table("chats").select("id").eq("id", session_id).execute()
+        if clash.data:
+            raise HTTPException(status_code=400, detail="Invalid session")
+
+        supabase.table("chats").insert({
+            "id": session_id,
+            "project_id": req.projectId,
+            "title": "Public Chat",
+            "channel": "shopify" if req.channel == "shopify" else "public",
+        }).execute()
 
     history = get_history(session_id, limit=7) if req.sessionId else []
     result = run_chat(req.projectId, session_id, req.message, history)
