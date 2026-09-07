@@ -272,6 +272,13 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
     tok = token or WHATSAPP_TOKEN
     url = f"https://graph.facebook.com/v25.0/{pid}/messages"
     headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    # WhatsApp rejects a text message over 4096 chars outright, so an
+    # over-long merchant-authored node body (or a long AI answer) would send
+    # NOTHING rather than something. Same safety net as the 1024-char cap in
+    # send_whatsapp_buttons below.
+    text = text or ""
+    if len(text) > 4096:
+        text = text[:4093] + "..."
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -310,6 +317,30 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: st
     res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp button send error: {res.text}")
+    return res
+
+
+def send_whatsapp_media(to: str, media_type: str, media: dict, phone_number_id: str, token: str):
+    """Send an image/video/document/audio/location/contacts message.
+
+    flows.py used to build seven of these inline with a bare
+    `import requests as req; req.post(...)`. That bypassed _TimeoutSession
+    (so a slow Meta pinned a worker thread forever — the exact failure that
+    wrapper exists to prevent) AND hardcoded the global WHATSAPP_TOKEN,
+    ignoring the per-project token every other send path is given. A
+    merchant on their own WABA had their media silently sent from ours.
+    """
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": media_type,
+        media_type: media,
+    }
+    res = http.post(url, headers=headers, json=payload)
+    if not res.ok:
+        print(f"WhatsApp {media_type} send error: {res.text}")
     return res
 
 

@@ -122,6 +122,12 @@ _AUTH_RATE_LIMITS = {
                                 # invite endpoint's "no account found for
                                 # that email" response is an email-existence
                                 # oracle; this caps how fast it can be probed.
+    "storage_upload": (60, 3600),  # 60 uploads / hour per IP. /api/storage/
+                                # upload accepts documents up to 100 MB and
+                                # checked only that SOMEONE was logged in —
+                                # no project scoping and no volume cap, so
+                                # any signed-up account could fill our
+                                # storage bill at will.
 }
 
 class AuthRateLimitCheck(BaseModel):

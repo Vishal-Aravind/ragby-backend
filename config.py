@@ -119,4 +119,11 @@ MAX_SHEET_ROWS = 5000
 # template to every row with a phone number.
 MAX_LEADS_PER_PROJECT = 50000
 
+# A flow's "time delay" node parks a customer and resumes them later, held
+# open by a sleeping thread for up to 22 hours. One per customer per delay
+# node, previously unbounded — a slow memory leak that a busy flow turns
+# into a fast one. Past this ceiling flows.py advances immediately instead
+# of sleeping, so customers still progress; they just progress early.
+MAX_FLOW_DELAY_THREADS = 200
+
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION

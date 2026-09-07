@@ -31,7 +31,6 @@ from telegram import router as telegram_router
 from slack import router as slack_router
 from whatsapp import router as whatsapp_router
 from billing import router as billing_router
-from flows import router as flows_router
 from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
 from template_library import router as template_library_router
@@ -252,7 +251,10 @@ app.include_router(telegram_router)
 app.include_router(slack_router)
 app.include_router(whatsapp_router)
 app.include_router(billing_router)
-app.include_router(flows_router)
+# flows exposes no HTTP routes any more — its CRUD endpoints were an
+# unused duplicate of the Next.js routes under src/app/api/flows/, with
+# weaker authorization. The module is still imported by whatsapp.py for
+# the WhatsApp flow runtime.
 app.include_router(api_keys_router)
 app.include_router(campaigns_router)
 app.include_router(template_library_router)

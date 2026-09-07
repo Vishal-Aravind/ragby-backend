@@ -7,20 +7,18 @@ Interactive Message Flows for WhatsApp
 - Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
 import sentry_sdk
+import threading
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
 from clients import supabase
-from auth import verify_token, require_project_role
-from config import WHATSAPP_TOKEN, FRONTEND_URL
+from config import FRONTEND_URL, MAX_FLOW_DELAY_THREADS
 from whatsapp import (
     send_whatsapp_message,
     send_whatsapp_buttons,
     send_whatsapp_list,
     send_whatsapp_cta_url,
+    send_whatsapp_media,
 )
-
-router = APIRouter()
 
 RESERVED_ASK_AI   = "ask_a_question"
 RESERVED_BACK     = "back_to_menu"
@@ -36,6 +34,7 @@ def get_session(project_id: str, phone_number: str) -> Optional[dict]:
             .select("*") \
             .eq("project_id", project_id) \
             .eq("phone_number", phone_number) \
+            .limit(1) \
             .execute()
 
         if not res.data:
@@ -103,10 +102,26 @@ def get_start_node(flow_id: str) -> Optional[dict]:
     return res.data[0] if res.data else None
 
 
-def get_node(node_id: str) -> Optional[dict]:
+def get_node(node_id: str, flow_id: str) -> Optional[dict]:
+    """Fetch a node, always scoped to the flow it must belong to.
+
+    CROSS-TENANT FIX: this used to select by id alone. Nothing validated
+    that an edge's to_node_id was a node in the same flow, so an edge
+    pointing at ANOTHER project's node id would fetch that node here and
+    send_node would deliver its content to the caller's own WhatsApp
+    number. The edge routes now reject such an edge on write; this is the
+    read-side backstop that closes any future variant of the same mistake,
+    including edges already stored from before the fix.
+
+    flow_id is REQUIRED rather than optional on purpose — an optional scope
+    is one forgotten argument away from reopening the same hole.
+    """
+    if not node_id or not flow_id:
+        return None
     res = supabase.table("flow_nodes") \
         .select("*") \
         .eq("id", node_id) \
+        .eq("flow_id", flow_id) \
         .limit(1) \
         .execute()
     return res.data[0] if res.data else None
@@ -122,7 +137,7 @@ def get_next_node(flow_id: str, from_node_id: str, trigger: str) -> Optional[dic
         .execute()
     if not edge.data:
         return None
-    return get_node(edge.data[0]["to_node_id"])
+    return get_node(edge.data[0]["to_node_id"], flow_id=flow_id)
 
 
 # -------------------------------------------------
@@ -130,130 +145,124 @@ def get_next_node(flow_id: str, from_node_id: str, trigger: str) -> Optional[dic
 # -------------------------------------------------
 def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id: str = None):
     """Send the right WhatsApp message type for a node."""
-    t = node["type"]
-    c = node["content"]
+    t = node.get("type") or ""
+    # `content` is a free-form jsonb column, so nothing guarantees any key is
+    # present. This used to index c["body"] directly in several branches: a
+    # node saved without a body raised KeyError INSIDE the webhook handler,
+    # which killed that customer's conversation mid-flow with no way back.
+    c = node.get("content") or {}
+    body = c.get("body") or ""
 
     if t in ("text", "message"):
-        send_whatsapp_message(to, c["body"], phone_number_id, token)
+        if body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t in ("buttons", "message_buttons"):
         btns = []
-        for btn in c.get("buttons", []):
+        for btn in c.get("buttons", []) or []:
             label = btn.get("title") or btn.get("label", "")
             btn_id = btn.get("id") or label.strip().lower().replace(" ", "_")
             if label:
                 btns.append({"id": btn_id, "title": label})
-        send_whatsapp_buttons(to, c["body"], btns, phone_number_id, token)
+        # WhatsApp rejects an interactive message with no buttons and one
+        # with an empty body, so fall back to plain text rather than
+        # sending a request we know will fail.
+        if btns and body:
+            send_whatsapp_buttons(to, body, btns, phone_number_id, token)
+        elif body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t in ("list", "message_list"):
         sections = []
-        for section in c.get("sections", []):
+        for section in c.get("sections", []) or []:
             rows = []
-            for row in section.get("rows", []):
+            for row in section.get("rows", []) or []:
                 label = row.get("title") or row.get("label", "")
                 row_id = row.get("id") or label.strip().lower().replace(" ", "_")
                 if label:
                     rows.append({"id": row_id, "title": label})
-            sections.append({"title": section.get("title", ""), "rows": rows})
-        send_whatsapp_list(
-            to, c["body"], c.get("button_text", "View Options"),
-            sections, phone_number_id, token
-        )
+            if rows:
+                sections.append({"title": section.get("title", ""), "rows": rows})
+        if sections and body:
+            send_whatsapp_list(
+                to, body, c.get("button_text", "View Options"),
+                sections, phone_number_id, token
+            )
+        elif body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_media":
         if c.get("media_url"):
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "image", "image": {"link": c["media_url"], "caption": c.get("body", "")},
-            }
-            import requests as req
-            req.post(url, headers=headers, json=payload)
-        elif c.get("body"):
-            send_whatsapp_message(to, c["body"], phone_number_id, token)
+            send_whatsapp_media(
+                to, "image",
+                {"link": c["media_url"], "caption": body},
+                phone_number_id, token,
+            )
+        elif body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_video":
         if c.get("video_url"):
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "video", "video": {"link": c["video_url"], "caption": c.get("body", "")},
-            }
-            import requests as req
-            req.post(url, headers=headers, json=payload)
-        elif c.get("body"):
-            send_whatsapp_message(to, c["body"], phone_number_id, token)
+            send_whatsapp_media(
+                to, "video",
+                {"link": c["video_url"], "caption": body},
+                phone_number_id, token,
+            )
+        elif body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_document":
         if c.get("document_url"):
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "document",
-                "document": {
+            send_whatsapp_media(
+                to, "document",
+                {
                     "link": c["document_url"],
-                    "caption": c.get("body", ""),
-                    "filename": c.get("filename", "document"),
+                    "caption": body,
+                    "filename": c.get("filename") or "document",
                 },
-            }
-            import requests as req
-            req.post(url, headers=headers, json=payload)
-        elif c.get("body"):
-            send_whatsapp_message(to, c["body"], phone_number_id, token)
+                phone_number_id, token,
+            )
+        elif body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "cta_url":
-        send_whatsapp_cta_url(
-            to, c["body"], c.get("button_text", "Click Here"),
-            c.get("url", ""), phone_number_id, token
-        )
+        if body:
+            send_whatsapp_cta_url(
+                to, body, c.get("button_text", "Click Here"),
+                c.get("url", ""), phone_number_id, token
+            )
 
     elif t == "message_audio":
         if c.get("audio_url"):
-            import requests as req
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "audio", "audio": {"link": c["audio_url"]},
-            }
-            req.post(url, headers=headers, json=payload)
+            send_whatsapp_media(
+                to, "audio", {"link": c["audio_url"]}, phone_number_id, token,
+            )
 
     elif t == "message_location":
         if c.get("latitude") and c.get("longitude"):
-            import requests as req
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "location",
-                "location": {
+            send_whatsapp_media(
+                to, "location",
+                {
                     "latitude": c["latitude"],
                     "longitude": c["longitude"],
                     "name": c.get("name", ""),
                     "address": c.get("address", ""),
                 },
-            }
-            req.post(url, headers=headers, json=payload)
-        if c.get("body"):
-            send_whatsapp_message(to, c["body"], phone_number_id, token)
+                phone_number_id, token,
+            )
+        if body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_contact":
         if c.get("contact_name") and c.get("contact_phone"):
-            import requests as req
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "contacts",
-                "contacts": [{
+            send_whatsapp_media(
+                to, "contacts",
+                [{
                     "name": {"formatted_name": c["contact_name"], "first_name": c["contact_name"]},
                     "phones": [{"phone": c["contact_phone"], "type": "CELL"}],
                 }],
-            }
-            req.post(url, headers=headers, json=payload)
+                phone_number_id, token,
+            )
 
     elif t == "ask_a_question":
         if project_id:
@@ -288,7 +297,8 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         pass
 
     elif t == "rag":
-        send_whatsapp_message(to, c["body"], phone_number_id, token)
+        if body:
+            send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_event":
         event_id = c.get("event_id", "")
@@ -297,19 +307,15 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
 
         # Send rich card — image + body + Register button (+ optional Call button)
         if c.get("banner_url"):
-            import requests as req
-            url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            payload = {
-                "messaging_product": "whatsapp", "to": to,
-                "type": "image",
-                "image": {"link": c["banner_url"], "caption": c.get("body", "")},
-            }
-            req.post(url, headers=headers, json=payload)
+            send_whatsapp_media(
+                to, "image",
+                {"link": c["banner_url"], "caption": body},
+                phone_number_id, token,
+            )
 
         send_whatsapp_cta_url(
             to,
-            c.get("body", "Register now — limited spots available!"),
+            body or "Register now — limited spots available!",
             c.get("button_text", "Register Now"),
             reg_url,
             phone_number_id,
@@ -421,6 +427,95 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
             "current_node_id": start_node["id"],
             "mode": "human",
         })
+
+
+# -------------------------------------------------
+# TIME-DELAY NODES
+# -------------------------------------------------
+# A delay parks a customer mid-flow and resumes them later. Each one used to
+# be a bare thread doing time.sleep() for up to 22 hours, one per customer
+# per delay node, with nothing bounding how many could exist at once — a
+# slow memory leak that a busy flow turns into a fast one.
+#
+# Known limitation, stated rather than hidden: these do NOT survive a
+# restart. Render's free tier sleeps the process, so every pending thread
+# dies and those customers simply never receive the next message. Making
+# delays durable needs a scheduled-jobs table and a worker; until then the
+# ceiling below at least keeps the failure bounded and predictable.
+_delay_threads_lock = threading.Lock()
+_delay_threads_active = 0
+
+_DELAY_UNIT_MULTIPLIER = {"seconds": 1, "minutes": 60, "hours": 3600}
+_MAX_DELAY_SECONDS = 22 * 3600  # 2h buffer before WhatsApp's 24h window shuts
+
+
+def _resolve_delay_seconds(content: dict) -> int:
+    """Coerce a node's delay to a sane number of seconds.
+
+    `int(c.get("delay_seconds", 60))` raised ValueError on any non-numeric
+    value, and the editor's clamp is client-side only — so a hand-crafted
+    request could store a negative, huge, or non-numeric delay.
+    """
+    try:
+        amount = int(float(content.get("delay_seconds", 60)))
+    except (TypeError, ValueError):
+        amount = 60
+    unit = content.get("delay_unit", "seconds")
+    multiplier = _DELAY_UNIT_MULTIPLIER.get(unit, 1)
+    return max(0, min(amount * multiplier, _MAX_DELAY_SECONDS))
+
+
+def _schedule_delayed_advance(flow_id, from_node_id, project_id, phone_number,
+                              phone_number_id, token, chat_id, delay_secs):
+    from chat import save_message
+    global _delay_threads_active
+
+    def advance():
+        after_node = get_next_node(flow_id, from_node_id, "next")
+        if not after_node:
+            return
+        # The customer may have moved on during the wait — typed a trigger
+        # keyword, tapped Back to Menu, started an order. Resuming blindly
+        # yanked them back into a branch they had already left. Only advance
+        # if they are still parked on the delay node.
+        current = get_session(project_id, phone_number)
+        if not current or current.get("current_node_id") != from_node_id:
+            return
+        upsert_session(project_id, phone_number, {
+            "flow_id": flow_id,
+            "current_node_id": after_node["id"],
+            "mode": "flow",
+        })
+        send_node(after_node, phone_number, phone_number_id, token, project_id=project_id)
+        if chat_id:
+            save_message(chat_id, "assistant", (after_node.get("content") or {}).get("body", ""))
+
+    if delay_secs <= 0:
+        advance()
+        return
+
+    with _delay_threads_lock:
+        if _delay_threads_active >= MAX_FLOW_DELAY_THREADS:
+            # At the ceiling, skip the wait rather than refusing to continue
+            # — the customer gets the next message early instead of never.
+            print(f"delay thread ceiling reached ({MAX_FLOW_DELAY_THREADS}); advancing immediately")
+            advance()
+            return
+        _delay_threads_active += 1
+
+    def delayed_advance():
+        global _delay_threads_active
+        import time
+        try:
+            time.sleep(delay_secs)
+            advance()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+        finally:
+            with _delay_threads_lock:
+                _delay_threads_active -= 1
+
+    threading.Thread(target=delayed_advance, daemon=True).start()
 
 
 def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str, chat_id: str = None):
@@ -543,11 +638,11 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
 
     next_node = get_next_node(flow_id, current_node_id, trigger)
     if not next_node:
-        current_node = get_node(current_node_id)
+        current_node = get_node(current_node_id, flow_id=flow_id)
         if current_node:
             send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
             if chat_id:
-                save_message(chat_id, "assistant", current_node["content"].get("body", ""))
+                save_message(chat_id, "assistant", (current_node.get("content") or {}).get("body", ""))
         return
 
     upsert_session(project_id, phone_number, {
@@ -567,28 +662,11 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         if flow:
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
     elif next_node["type"] == "time_delay":
-        import threading
-        c = next_node["content"]
-        unit = c.get("delay_unit", "seconds")
-        amount = int(c.get("delay_seconds", 60))
-        delay_secs = amount * (60 if unit == "minutes" else 3600 if unit == "hours" else 1)
-        delay_secs = min(delay_secs, 22 * 3600)
-
-        def delayed_advance():
-            import time
-            time.sleep(delay_secs)
-            after_node = get_next_node(flow_id, next_node["id"], "next")
-            if after_node:
-                upsert_session(project_id, phone_number, {
-                    "flow_id": flow_id,
-                    "current_node_id": after_node["id"],
-                    "mode": "flow",
-                })
-                send_node(after_node, phone_number, phone_number_id, token, project_id=project_id)
-                if chat_id:
-                    save_message(chat_id, "assistant", after_node["content"].get("body", ""))
-
-        threading.Thread(target=delayed_advance, daemon=True).start()
+        delay_secs = _resolve_delay_seconds(next_node.get("content") or {})
+        _schedule_delayed_advance(
+            flow_id, next_node["id"], project_id, phone_number,
+            phone_number_id, token, chat_id, delay_secs,
+        )
     else:
         send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
         if chat_id:
@@ -882,7 +960,9 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     flow_id = session.get("flow_id")
     current_node_id = session.get("current_node_id")
-    current_node = get_node(current_node_id) if current_node_id else None
+    # Scoped to the session's own flow: a stale or tampered current_node_id
+    # must not resolve to a node in someone else's flow.
+    current_node = get_node(current_node_id, flow_id=flow_id) if current_node_id else None
 
     if not current_node:
         flow = get_active_flow(project_id)
@@ -970,184 +1050,19 @@ def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
 
 
 # -------------------------------------------------
-# FLOW CRUD API
+# FLOW CRUD
 # -------------------------------------------------
-def _require_role_for_flow(user_id: str, flow_id: str):
-    res = supabase.table("flows").select("project_id").eq("id", flow_id).maybe_single().execute()
-    flow = res.data if res else None
-    if not flow:
-        raise HTTPException(status_code=404, detail="Not found")
-    require_project_role(user_id, flow["project_id"])
-    return flow["project_id"]
-
-def _require_role_for_node(user_id: str, node_id: str):
-    res = supabase.table("flow_nodes").select("flow_id").eq("id", node_id).maybe_single().execute()
-    node = res.data if res else None
-    if not node:
-        raise HTTPException(status_code=404, detail="Not found")
-    _require_role_for_flow(user_id, node["flow_id"])
-
-def _require_role_for_edge(user_id: str, edge_id: str):
-    res = supabase.table("flow_edges").select("flow_id").eq("id", edge_id).maybe_single().execute()
-    edge = res.data if res else None
-    if not edge:
-        raise HTTPException(status_code=404, detail="Not found")
-    _require_role_for_flow(user_id, edge["flow_id"])
-
-
-@router.get("/flows")
-def list_flows(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
-    res = supabase.table("flows") \
-        .select("id, name, is_active, trigger_keywords, free_questions, created_at") \
-        .eq("project_id", project_id) \
-        .order("created_at", desc=True) \
-        .execute()
-    return res.data
-
-
-@router.post("/flows")
-def create_flow(data: dict, user=Depends(verify_token)):
-    require_project_role(user.id, data["project_id"])
-    res = supabase.table("flows").insert({
-        "project_id": data["project_id"],
-        "name": data["name"],
-        "is_active": data.get("is_active", False),
-        "trigger_keywords": data.get("trigger_keywords", ["hi", "hello", "hey", "start", "menu"]),
-        "free_questions": data.get("free_questions", False),
-    }).execute()
-    return res.data[0]
-
-
-@router.put("/flows/{flow_id}")
-def update_flow(flow_id: str, data: dict, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    update = {}
-    if "name" in data: update["name"] = data["name"]
-    if "is_active" in data: update["is_active"] = data["is_active"]
-    if "trigger_keywords" in data: update["trigger_keywords"] = data["trigger_keywords"]
-    if "free_questions" in data: update["free_questions"] = data["free_questions"]
-
-    if data.get("is_active"):
-        flow = supabase.table("flows").select("project_id").eq("id", flow_id).single().execute()
-        if flow.data:
-            supabase.table("flows") \
-                .update({"is_active": False}) \
-                .eq("project_id", flow.data["project_id"]) \
-                .neq("id", flow_id) \
-                .execute()
-
-    res = supabase.table("flows").update(update).eq("id", flow_id).execute()
-    return res.data[0]
-
-
-@router.delete("/flows/{flow_id}")
-def delete_flow(flow_id: str, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    supabase.table("flows").delete().eq("id", flow_id).execute()
-    return {"status": "deleted"}
-
-
-@router.get("/flows/{flow_id}/nodes")
-def get_flow_nodes(flow_id: str, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    nodes = supabase.table("flow_nodes").select("*").eq("flow_id", flow_id).order("created_at").execute()
-    edges = supabase.table("flow_edges").select("*").eq("flow_id", flow_id).execute()
-    return {"nodes": nodes.data, "edges": edges.data}
-
-
-@router.post("/flows/{flow_id}/nodes")
-def create_node(flow_id: str, data: dict, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    res = supabase.table("flow_nodes").insert({
-        "flow_id": flow_id,
-        "type": data["type"],
-        "content": data["content"],
-        "is_start": data.get("is_start", False),
-    }).execute()
-    return res.data[0]
-
-
-@router.put("/flows/nodes/{node_id}")
-def update_node(node_id: str, data: dict, user=Depends(verify_token)):
-    _require_role_for_node(user.id, node_id)
-    update = {}
-    if "type" in data: update["type"] = data["type"]
-    if "content" in data: update["content"] = data["content"]
-    if "is_start" in data: update["is_start"] = data["is_start"]
-    res = supabase.table("flow_nodes").update(update).eq("id", node_id).execute()
-    return res.data[0]
-
-
-@router.delete("/flows/nodes/{node_id}")
-def delete_node(node_id: str, user=Depends(verify_token)):
-    _require_role_for_node(user.id, node_id)
-    supabase.table("flow_nodes").delete().eq("id", node_id).execute()
-    return {"status": "deleted"}
-
-
-@router.post("/flows/{flow_id}/edges")
-def create_edge(flow_id: str, data: dict, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    res = supabase.table("flow_edges").insert({
-        "flow_id": flow_id,
-        "from_node_id": data["from_node_id"],
-        "trigger": data["trigger"],
-        "to_node_id": data["to_node_id"],
-    }).execute()
-    return res.data[0]
-
-
-@router.delete("/flows/edges/{edge_id}")
-def delete_edge(edge_id: str, user=Depends(verify_token)):
-    _require_role_for_edge(user.id, edge_id)
-    supabase.table("flow_edges").delete().eq("id", edge_id).execute()
-    return {"status": "deleted"}
-
-
-@router.post("/flows/{flow_id}/sync")
-def sync_flow(flow_id: str, data: dict, user=Depends(verify_token)):
-    _require_role_for_flow(user.id, flow_id)
-    import uuid as uuid_lib
-
-    nodes = data.get("nodes", [])
-    edges = data.get("edges", [])
-
-    supabase.table("flow_edges").delete().eq("flow_id", flow_id).execute()
-    supabase.table("flow_nodes").delete().eq("flow_id", flow_id).execute()
-
-    if not nodes:
-        return {"status": "synced", "nodes": 0, "edges": 0}
-
-    id_map = {}
-
-    for node in nodes:
-        old_id = node.get("id", "")
-        new_id = str(uuid_lib.uuid4())
-        id_map[old_id] = new_id
-
-        supabase.table("flow_nodes").insert({
-            "id": new_id,
-            "flow_id": flow_id,
-            "type": node["type"],
-            "content": node.get("content", {}),
-            "is_start": node.get("is_start", False),
-        }).execute()
-
-    edges_inserted = 0
-    for edge in edges:
-        from_id = id_map.get(edge["from_node_id"], edge["from_node_id"])
-        to_id   = id_map.get(edge["to_node_id"],   edge["to_node_id"])
-
-        if not from_id or not to_id:
-            continue
-
-        supabase.table("flow_edges").insert({
-            "flow_id": flow_id,
-            "from_node_id": from_id,
-            "trigger": edge["trigger"],
-            "to_node_id": to_id,
-        }).execute()
-        edges_inserted += 1
-
-    return {"status": "synced", "nodes": len(nodes), "edges": edges_inserted, "id_map": id_map}
+# Removed. This module used to expose a second, parallel implementation of
+# every flow CRUD endpoint (list/create/update/delete flows, nodes, edges,
+# and a sync handler), mounted publicly via main.py.
+#
+# Nothing called it: FlowsTab.js talks only to the Next.js routes under
+# src/app/api/flows/. What it did do was duplicate every authorization
+# decision — using require_project_role, which passes for ANY role, so an
+# agent with no flows permission could drive it — and repeat the same
+# destructive delete-then-reinsert sync that the Next.js route has now
+# replaced with the transactional sync_flow_graph database function.
+#
+# Two divergent copies of the same authorization logic is strictly worse
+# than one. The runtime above (which whatsapp.py imports) is what this
+# module is actually for.
