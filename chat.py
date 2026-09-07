@@ -1368,10 +1368,18 @@ def public_chat_history(session_id: str):
     the conversation via session_id (see get_history in run_chat below), but
     without this the widget UI showed an empty box every time, looking like
     a fresh conversation even though the bot actually remembered everything.
-    Unauthenticated by design, same trust model as the existing
-    /api/chat/public/history Next.js route — session_id is an unguessable
-    UUID held client-side, not a resource anyone can enumerate."""
+    Unauthenticated by design, but restricted to PUBLIC chats: an id alone
+    used to return any conversation, so a chat id leaked through a dashboard
+    URL, a support screenshot or a Sentry breadcrumb handed over 30 messages
+    of a real WhatsApp/Telegram/Slack customer's transcript to anyone. The
+    "unguessable UUID" argument holds against brute force but is no defence
+    once an id escapes, and there was no project binding at all."""
+    if not _UUID_RE.match(session_id or ""):
+        return {"messages": []}
     try:
+        chat = supabase.table("chats")             .select("channel")             .eq("id", session_id)             .in_("channel", ["public", "shopify"])             .execute()
+        if not chat.data:
+            return {"messages": []}
         return {"messages": get_history(session_id, limit=30)}
     except Exception:
         # A malformed session_id (not a real UUID) would otherwise 500 here
