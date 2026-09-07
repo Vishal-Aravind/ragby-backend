@@ -11,13 +11,26 @@ import requests
 from config import SHOPIFY_API_VERSION
 
 
-def graphql(shop_domain: str, access_token: str, query: str, variables: dict = None) -> dict:
+def graphql(shop_domain: str, access_token: str, query: str, variables: dict = None, _attempt: int = 0) -> dict:
     res = requests.post(
         f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
         json={"query": query, "variables": variables or {}},
         headers={"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"},
         timeout=30,
     )
+
+    # The proactive cost backoff below only helps WITHIN a run. A single 429
+    # or a transient 502 used to abort an entire catalog sync and record a
+    # last_sync_error, so one blip cost the merchant their whole refresh.
+    if res.status_code in (429, 500, 502, 503, 504) and _attempt < 3:
+        retry_after = res.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else 2 ** _attempt
+        except ValueError:
+            delay = 2 ** _attempt
+        time.sleep(min(delay, 10))
+        return graphql(shop_domain, access_token, query, variables, _attempt + 1)
+
     res.raise_for_status()
     data = res.json()
     if data.get("errors"):

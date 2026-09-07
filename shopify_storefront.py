@@ -14,6 +14,7 @@ import requests
 import sentry_sdk
 
 from clients import supabase
+from ratelimit import is_rate_limited
 from config import SHOPIFY_API_VERSION
 
 
@@ -58,6 +59,14 @@ def create_checkout_from_chat(project_id: str, chat_id: str, requested_items: li
     products) can't be checked out this way — Shopify's own checkout can
     only sell real Shopify variants, so those are called out as a distinct
     error rather than silently dropped or guessed at."""
+    # Reachable from the UNAUTHENTICATED storefront widget, and each call
+    # writes a shopify_cart_sessions row and creates a real cart on the
+    # merchant's Shopify store. There was no cap of any kind.
+    if is_rate_limited(f"shopify-cart:{project_id}:{chat_id}", limit=10, window_seconds=300):
+        raise ValueError("Too many checkout attempts. Please wait a moment and try again.")
+    if is_rate_limited(f"shopify-cart:{project_id}", limit=100, window_seconds=300):
+        raise ValueError("Checkout is busy right now. Please try again shortly.")
+
     from shop import find_product_by_name
 
     integration = _get_integration(project_id)

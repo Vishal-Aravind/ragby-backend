@@ -110,6 +110,27 @@ def _refresh_access_token(connection: dict) -> Optional[dict]:
         token_data = res.json()
     except Exception as e:
         sentry_sdk.capture_message(f"Razorpay OAuth token refresh failed for project {connection['project_id']}: {e}")
+
+        # The refresh token rotates and is single-use. Two concurrent
+        # refreshes both send the same one; the loser fails here, and if we
+        # just returned the stale row stayed in place — so every later
+        # refresh kept reusing a token Razorpay had already burned and the
+        # merchant could never take payments again, while /razorpay/status
+        # still reported connected. Re-read: the winner may have already
+        # stored a good token a moment ago.
+        latest = supabase.table("razorpay_connections")             .select("*").eq("project_id", connection["project_id"]).maybe_single().execute()
+        latest_row = latest.data if latest else None
+        if latest_row and latest_row.get("refresh_token") != refresh_token:
+            return latest_row
+
+        # Genuinely dead — mark it so status stops claiming otherwise.
+        try:
+            from datetime import datetime, timezone
+            supabase.table("razorpay_connections").update({
+                "refresh_failed_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("project_id", connection["project_id"]).execute()
+        except Exception:
+            pass
         return None
 
     _store_token_response(connection["project_id"], token_data)
@@ -222,11 +243,18 @@ def razorpay_oauth_callback(request: Request):
 @router.get("/razorpay/status/{project_id}")
 def razorpay_status(project_id: str, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="integrations")
-    res = supabase.table("razorpay_connections").select("razorpay_account_id, connected_at").eq("project_id", project_id).maybe_single().execute()
+    res = supabase.table("razorpay_connections").select(
+        "razorpay_account_id, connected_at, refresh_failed_at"
+    ).eq("project_id", project_id).maybe_single().execute()
     data = res.data if res else None
     if not data:
         return {"connected": False}
-    return {"connected": True, **data}
+
+    # A row existing was previously enough to report "connected", so a
+    # connection whose refresh token had died still looked healthy while
+    # every payment link silently failed.
+    needs_reconnect = bool(data.pop("refresh_failed_at", None))
+    return {"connected": True, "needs_reconnect": needs_reconnect, **data}
 
 
 @router.delete("/razorpay/disconnect/{project_id}")

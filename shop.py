@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
+from webhook_dedup import already_processed
 from auth import verify_token, require_project_role
 from ratelimit import is_rate_limited, client_ip
 from shopify_client import graphql as shopify_graphql
@@ -693,7 +694,17 @@ async def razorpay_webhook(request: Request):
         return {"status": "ok"}
 
     if event == "payment_link.paid":
-        payment_link_id = payload["payload"]["payment_link"]["entity"]["id"]
+        try:
+            link_entity = payload["payload"]["payment_link"]["entity"]
+            payment_link_id = link_entity["id"]
+        except (KeyError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid payload")
+
+        # Razorpay retries, and this handler sends customer + owner WhatsApp
+        # confirmations and advances the flow. Without a guard a replayed
+        # (genuinely signed) event re-sent all of it.
+        if already_processed("razorpay-payment", payment_link_id):
+            return {"status": "duplicate_ignored"}
 
         # Payment Link ids are Razorpay-global unique identifiers, so
         # checking orders then appointments carries no collision risk.
@@ -715,6 +726,24 @@ async def razorpay_webhook(request: Request):
 
         if not _verify_razorpay_signature(body_bytes, signature, order["project_id"]):
             raise HTTPException(status_code=400, detail="Invalid signature")
+
+        # Confirm the amount actually paid matches what we asked for, rather
+        # than marking the order paid purely on the event arriving. The
+        # signature proves the payload came from Razorpay; it says nothing
+        # about the link having been created for this order's total, which
+        # matters if a link is ever reused or regenerated at a stale price.
+        try:
+            paid_amount = int(link_entity.get("amount_paid") or link_entity.get("amount") or 0)
+            expected_amount = int(round(float(order["total"]) * 100))
+            if paid_amount and paid_amount < expected_amount:
+                sentry_sdk.capture_message(
+                    f"Razorpay underpayment for order {order['id']}: paid {paid_amount}, expected {expected_amount}"
+                )
+                supabase.table("orders").update({"payment_status": "underpaid"}).eq("id", order["id"]).execute()
+                return {"status": "amount_mismatch"}
+        except (TypeError, ValueError, KeyError) as e:
+            # Never block a real payment on our own parsing being fussy.
+            sentry_sdk.capture_exception(e)
 
         try:
             config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()

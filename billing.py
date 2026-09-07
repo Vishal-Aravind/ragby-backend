@@ -182,7 +182,16 @@ async def billing_webhook(request: Request):
     user_id = profile["id"]
 
     if event in ("subscription.activated", "subscription.charged", "subscription.updated", "subscription.resumed"):
-        plan = RAZORPAY_PLAN_TO_PLAN.get(plan_id, "free")
+        # Defaulting to "free" meant a renamed or rotated Razorpay plan id
+        # silently downgraded a paying customer on the next subscription
+        # event. Note config collapses to {"": "business"} when the plan env
+        # vars are unset, so an unrecognised id is a real possibility.
+        plan = RAZORPAY_PLAN_TO_PLAN.get(plan_id)
+        if not plan:
+            sentry_sdk.capture_message(
+                f"Razorpay billing webhook: unknown plan_id {plan_id!r} for user {user_id} - leaving plan unchanged"
+            )
+            return {"status": "unknown_plan_ignored"}
         # subscription.resumed specifically means a cancel-at-cycle-end got
         # reversed — not scheduled to end anymore either way here.
         update = {"plan": plan, "razorpay_subscription_id": subscription_id, "subscription_cancel_scheduled": False}

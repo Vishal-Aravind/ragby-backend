@@ -149,6 +149,13 @@ def _ensure_data_source_and_kick_off_sync(project_id: str, shop_domain: str):
             sentry_sdk.capture_exception(e)
             print(f"Shopify initial sync error for project {project_id}: {e}")
 
+    # Without a guard, a connect/disconnect/reconnect loop spawns a full
+    # catalog embedding run per iteration, all writing the same points in
+    # parallel with the 6-hourly job.
+    if is_rate_limited(f"shopify-initial-sync:{project_id}", limit=2, window_seconds=600):
+        print(f"Shopify initial sync skipped (recently run) for project {project_id}")
+        return
+
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -289,6 +296,37 @@ def shopify_disconnect(project_id: str, user=Depends(verify_token)):
     # Leaves products/catalogs rows in place — deleting them would break
     # historical orders.items display. The source='shopify' catalog just
     # stops receiving updates.
+    row = (
+        supabase.table("shopify_integrations")
+        .select("shop_domain, access_token")
+        .eq("project_id", project_id)
+        .maybe_single()
+        .execute()
+    )
+    integration = (row.data if row else None) or {}
+
+    # Disconnect used to delete our row and nothing else, so the offline
+    # access token stayed valid on Shopify indefinitely and the webhooks we
+    # registered kept firing at us for a store we no longer show as
+    # connected. Best-effort: never block the merchant on Shopify being up.
+    shop_domain = integration.get("shop_domain")
+    access_token = integration.get("access_token")
+    if shop_domain and access_token:
+        try:
+            requests.delete(
+                f"https://{shop_domain}/admin/api/2024-10/api_permissions/current.json",
+                headers={"X-Shopify-Access-Token": access_token},
+                timeout=15,
+            )
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Shopify token revoke failed for {shop_domain}: {type(e).__name__}")
+
+    # The data_sources row otherwise outlives the integration, and the
+    # 6-hourly reconciliation job then raises "No connected Shopify store"
+    # for it every cycle, forever, one Sentry event at a time.
+    supabase.table("data_sources").delete().eq("project_id", project_id).eq("type", "shopify").execute()
+
     supabase.table("shopify_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
 
