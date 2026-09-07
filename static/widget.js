@@ -205,9 +205,9 @@
     awaitingLead = true;
     blockInput();
 
-    // Set by an authenticated user but never sanitized on write, and
-    // interpolated into innerHTML below - so any project member could plant
-    // script that runs on every site the merchant embeds this widget on.
+    // Set by an authenticated project member and interpolated into innerHTML
+    // below, so it runs on every site the merchant embeds this widget on.
+    // esc() is what makes that safe; length is capped server-side too.
     const title = esc(leadConfig?.form_title || "Before we continue...");
     const subtitle = esc(leadConfig?.form_subtitle || "Please share your details to keep chatting.");
 
@@ -298,6 +298,10 @@
           body: JSON.stringify({
             project_id: projectId,
             session_id: userId,
+            // The real conversation, verified server-side against the chats
+            // table. Without it /public/leads was an unauthenticated write
+            // into any merchant's contact list.
+            chat_session_id: sessionId,
             name,
             email,
             phone,
@@ -322,7 +326,16 @@
         } else {
           submitBtn.textContent = "Continue chatting →";
           submitBtn.disabled = false;
-          errorEl.textContent = "Something went wrong. Please try again.";
+          // The server does real email/phone validation now, so show what it
+          // actually said rather than a blanket "something went wrong" the
+          // visitor can't act on. Every detail on this endpoint is written
+          // for an end user, and it's escaped on the way into the DOM.
+          let detail = "";
+          try { detail = (await res.json()).detail || ""; } catch (e) {}
+          errorEl.textContent =
+            typeof detail === "string" && detail
+              ? detail
+              : "Something went wrong. Please try again.";
           errorEl.style.display = "block";
         }
       } catch (e) {
@@ -355,12 +368,27 @@
           projectId,
           message: question,
           sessionId,
+          // Durable per-browser id. The server keys the lead-capture gate on
+          // this, not on sessionId, so a visitor who already gave their
+          // details isn't asked again when their 3-hour session rolls over.
+          visitorId: userId,
         }),
       });
 
       const data = await res.json();
       typing.remove();
       if (data.sessionId) saveSessionId(data.sessionId);
+
+      // The gate is enforced server-side now, so this can fire even when the
+      // local counter hasn't tripped — a fresh browser resuming an older
+      // conversation, or trigger_after_messages changed since page load.
+      if (data.leadRequired) {
+        if (data.leadForm) leadConfig = { ...(leadConfig || {}), ...data.leadForm };
+        pendingQuestion = question;
+        showLeadForm();
+        return;
+      }
+
       addMsg("assistant", render(data.answer || "Sorry, something went wrong. Please try again."));
     } catch (e) {
       typing.remove();
@@ -381,15 +409,12 @@
     addMsg("user", render(text));
     userMessageCount++;
 
-    const threshold = leadConfig?.trigger_after_messages ?? 2;
-
-    // Show lead form if enabled, not yet captured, and threshold reached
-    if (leadConfig && !lead && userMessageCount >= threshold) {
-      pendingQuestion = text;
-      showLeadForm();
-      return;
-    }
-
+    // The gate used to be decided here, entirely in the browser — which meant
+    // it could be skipped, and which broke outright at trigger_after_messages
+    // = 1: the form appeared before any message had been sent, so no chat
+    // session existed yet and /public/leads had nothing to verify against.
+    // askBot now always runs; the server answers with leadRequired instead of
+    // an answer, before spending anything on OpenAI.
     await askBot(text);
   };
 

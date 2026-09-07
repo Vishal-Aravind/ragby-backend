@@ -164,6 +164,11 @@ class PublicChatRequest(BaseModel):
     # get offered to the model for this conversation.
     channel: Optional[str] = None
     accessToken: Optional[str] = None
+    # Durable per-browser id (widget.js's rag_user_id). Distinct from
+    # sessionId, which rotates every 3 hours — a visitor who already gave
+    # their details must not be asked again just because their chat session
+    # expired. This is the key /public/leads dedups on.
+    visitorId: Optional[str] = Field(default=None, max_length=64)
 
 class VerifyPasswordRequest(BaseModel):
     projectId: str
@@ -1428,6 +1433,63 @@ def public_chat_history(session_id: str):
 
 
 @router.post("/public/chat")
+def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[str]):
+    """Server-side enforcement of the lead-capture gate.
+
+    The "ask for details after N messages" setting was enforced ONLY in the
+    visitor's browser (widget.js's `awaitingLead` / `blockInput`), so anyone
+    who cleared a variable — or simply called this endpoint directly — kept
+    chatting on the merchant's OpenAI budget and left no lead behind.
+
+    Returns a response dict to send instead of an answer, or None to proceed.
+    Must be called BEFORE run_chat so a blocked request costs nothing.
+    """
+    from leads import get_lead_config  # local import: leads imports auth, not chat
+
+    config = get_lead_config(project_id)
+    if not config.get("enabled"):
+        return None
+
+    # Already gave their details? Keyed on the durable visitor id, so the
+    # 3-hour session TTL doesn't re-prompt someone who already converted.
+    if visitor_id:
+        lead = supabase.table("leads") \
+            .select("id") \
+            .eq("project_id", project_id) \
+            .eq("session_id", visitor_id) \
+            .limit(1) \
+            .execute()
+        if lead.data:
+            return None
+
+    threshold = config.get("trigger_after_messages") or 2
+
+    # The current message isn't saved yet, so N-1 rows exist when the visitor
+    # sends their Nth. Blocking at `saved >= threshold - 1` makes the server
+    # fire on exactly the same message widget.js's counter fires on.
+    saved = supabase.table("chat_messages") \
+        .select("id", count="exact") \
+        .eq("chat_id", session_id) \
+        .eq("role", "user") \
+        .limit(1) \
+        .execute()
+
+    if (saved.count or 0) < max(0, threshold - 1):
+        return None
+
+    return {
+        "leadRequired": True,
+        "sessionId": session_id,
+        "answer": "",
+        "sources": [],
+        "leadForm": {
+            "form_title": config.get("form_title") or "Before we continue...",
+            "form_subtitle": config.get("form_subtitle")
+            or "Please share your details to keep chatting.",
+        },
+    }
+
+
 def public_chat(req: PublicChatRequest, request: Request):
     visitor_ip = client_ip(request)
 
@@ -1517,6 +1579,19 @@ def public_chat(req: PublicChatRequest, request: Request):
             "title": "Public Chat",
             "channel": "shopify" if req.channel == "shopify" else "public",
         }).execute()
+
+    # Before run_chat, so a gated request never reaches OpenAI.
+    #
+    # Deliberately NOT applied to the Shopify storefront widget. That surface
+    # ships as a Shopify app extension with its own release cycle and has no
+    # lead form, so gating it would block a merchant's shoppers mid-purchase
+    # with no way through. Lead capture is presented in the Integrations tab
+    # as a web-widget feature; this keeps it to the two surfaces that have the
+    # form (the embeddable widget and the shareable link).
+    if req.channel != "shopify":
+        gate = _lead_capture_blocks(req.projectId, session_id, req.visitorId)
+        if gate:
+            return gate
 
     history = get_history(session_id, limit=7) if req.sessionId else []
     result = run_chat(req.projectId, session_id, req.message, history)

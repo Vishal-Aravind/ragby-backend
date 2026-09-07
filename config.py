@@ -112,4 +112,11 @@ PLAN_LIMITS = {
 MAX_CHUNKS_PER_INGEST = 3000
 MAX_SHEET_ROWS = 5000
 
+# /public/leads is unauthenticated by design (a visitor filling the widget's
+# lead form has no account), and nothing in PLAN_LIMITS bounds the leads
+# table. Without a ceiling, a scripted submitter could grow one project's
+# contact list without limit — and campaigns.py sends a PAID WhatsApp
+# template to every row with a phone number.
+MAX_LEADS_PER_PROJECT = 50000
+
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
