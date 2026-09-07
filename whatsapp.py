@@ -764,7 +764,15 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
     result = supabase.table("whatsapp_integrations").select("history_sync_status, last_sync_error").eq("project_id", project_id).maybe_single().execute()
     row = result.data if result else {}
     if (row or {}).get("history_sync_status") == "failed":
-        raise HTTPException(status_code=502, detail=(row or {}).get("last_sync_error") or "Sync request failed")
+        # last_sync_error holds raw Graph text (fbtrace_id, WABA ids,
+        # internal messages). It is deliberately surfaced in the UI behind a
+        # "Technical details" toggle, read from the stored column — it does
+        # not belong in a plain error detail that gets toasted verbatim.
+        print(f"WhatsApp resync failed for {project_id}: {(row or {}).get('last_sync_error')}")
+        raise HTTPException(
+            status_code=502,
+            detail="WhatsApp couldn't start the sync. Please try again in a few minutes.",
+        )
 
     return {"success": True}
 
