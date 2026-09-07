@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+from urllib.parse import urlparse
 import re
 import time
 import uuid
@@ -97,9 +98,47 @@ def _chat_access_token_valid(project_id: str, token: str) -> bool:
     return hmac.compare_digest(expected, sig)
 
 
+def _origin_allowed(request, allowed_domains) -> bool:
+    """Check the browser-declared Origin against the merchant's allowlist.
+
+    Empty/unset allowlist means allow anywhere, so existing embeds are
+    unaffected until a merchant opts in.
+
+    This is a cost control, not a security boundary: Origin is set by the
+    browser and cannot be forged by a page, so it reliably stops someone
+    copying the embed snippet onto a real website — but a scripted client
+    can send whatever Origin it likes. The per-IP/session/project rate
+    limits and the monthly quota are the backstop for that case.
+    """
+    if not allowed_domains:
+        return True
+
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    if not origin:
+        # Non-browser caller (curl, server-side). Rate limits still apply.
+        return False
+
+    try:
+        host = urlparse(origin).hostname or ""
+    except Exception:
+        return False
+    host = host.lower()
+    if not host:
+        return False
+
+    for entry in allowed_domains:
+        allowed = (entry or "").strip().lower()
+        if not allowed:
+            continue
+        # Exact host, or any subdomain of it.
+        if host == allowed or host.endswith("." + allowed):
+            return True
+    return False
+
+
 def _project_public_settings(project_id: str) -> dict:
     res = supabase.table("projects").select(
-        "chat_enabled, chat_password"
+        "chat_enabled, chat_password, allowed_domains"
     ).eq("id", project_id).maybe_single().execute()
     return (res.data if res else None) or {}
 
@@ -1414,6 +1453,12 @@ def public_chat(req: PublicChatRequest, request: Request):
     settings = _project_public_settings(req.projectId)
     if settings.get("chat_enabled") is False:
         raise HTTPException(status_code=403, detail="This chat is not available.")
+
+    if not _origin_allowed(request, settings.get("allowed_domains")):
+        raise HTTPException(
+            status_code=403,
+            detail="This assistant isn't available on this site.",
+        )
 
     if settings.get("chat_password"):
         if not _chat_access_token_valid(req.projectId, req.accessToken or ""):
