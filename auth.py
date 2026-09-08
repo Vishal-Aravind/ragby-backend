@@ -122,6 +122,11 @@ _AUTH_RATE_LIMITS = {
                                 # invite endpoint's "no account found for
                                 # that email" response is an email-existence
                                 # oracle; this caps how fast it can be probed.
+    "team_manage": (60, 600),  # 60 role/permission changes and removals /
+                                # 10 min per IP. Only the invite path was
+                                # throttled; PATCH and DELETE on a member
+                                # were unlimited, and each one changes who
+                                # can read the project's conversations.
     "storage_upload": (60, 3600),  # 60 uploads / hour per IP. /api/storage/
                                 # upload accepts documents up to 100 MB and
                                 # checked only that SOMEONE was logged in —
