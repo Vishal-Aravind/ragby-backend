@@ -34,9 +34,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from ratelimit import is_rate_limited, client_ip
 from fastapi.responses import HTMLResponse
 
-from clients import supabase
+from clients import supabase, qdrant, embeddings
 from oauth_state import issue_state, consume_state
-from webhook_dedup import already_processed, qdrant, embeddings
+from webhook_dedup import already_processed
 from auth import verify_token, require_project_access
 from shopify_client import graphql as _graphql
 from config import (
