@@ -11,7 +11,7 @@ from clients import supabase
 from config import WHATSAPP_TOKEN
 from api_keys import hash_key
 from ratelimit import is_rate_limited
-import requests
+from whatsapp import http
 
 router = APIRouter()
 
@@ -133,7 +133,7 @@ def send_template(
         },
     }
 
-    res = requests.post(
+    res = http.post(
         f"https://graph.facebook.com/v19.0/{project['phone_number_id']}/messages",
         headers={
             "Authorization": f"Bearer {project['token']}",
@@ -200,7 +200,7 @@ def list_available_templates(
     if not waba_id:
         raise HTTPException(status_code=400, detail="WABA ID not found.")
 
-    res = requests.get(
+    res = http.get(
         f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
         params={
             "fields": "name,status,components,language",
@@ -273,7 +273,17 @@ def send_template_bulk(
 
     results = []
     for r in recipients:
-        phone = r.get("to", "").replace("+", "").replace(" ", "").replace("-", "")
+        # Was checked ONCE before the loop, so an account with a single
+        # message left still sent all 100.
+        if not check_rate_limit(project["project_id"])["allowed"]:
+            results.append({"to": r.get("to"), "status": "failed", "error": "Monthly message limit reached"})
+            continue
+        if not isinstance(r, dict):
+            continue
+        phone = str(r.get("to") or "").replace("+", "").replace(" ", "").replace("-", "")
+        if not phone.isdigit() or not (8 <= len(phone) <= 15):
+            results.append({"to": r.get("to"), "status": "failed", "error": "Invalid phone number"})
+            continue
         variables = r.get("variables", [])
 
         components = []
@@ -281,7 +291,7 @@ def send_template_bulk(
             params = [{"type": "text", "text": str(v)} for v in variables]
             components.append({"type": "body", "parameters": params})
 
-        res = requests.post(
+        res = http.post(
             f"https://graph.facebook.com/v19.0/{project['phone_number_id']}/messages",
             headers={
                 "Authorization": f"Bearer {project['token']}",

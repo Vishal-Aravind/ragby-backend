@@ -126,4 +126,14 @@ MAX_LEADS_PER_PROJECT = 50000
 # of sleeping, so customers still progress; they just progress early.
 MAX_FLOW_DELAY_THREADS = 200
 
+# Every campaign recipient is one WhatsApp template message billed by Meta,
+# and resolve_contacts will return every lead in the project — up to
+# MAX_LEADS_PER_PROJECT above. So one request meant up to 50,000 paid
+# messages, with no rate limit and no confirmation step. This is the hard
+# ceiling on what a single campaign (or a single stolen session) can spend.
+MAX_CAMPAIGN_RECIPIENTS = 1000
+# A campaign is a unit of work worth up to MAX_CAMPAIGN_RECIPIENTS paid
+# messages, so this is deliberately per-hour, not per-minute.
+MAX_CAMPAIGNS_PER_HOUR = 10
+
 assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION

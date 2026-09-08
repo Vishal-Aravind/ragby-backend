@@ -4,10 +4,9 @@ These are common business templates that Meta typically approves quickly.
 Businesses can add these to their WABA with one click.
 """
 from fastapi import APIRouter, Depends, HTTPException
-from clients import supabase
-from auth import verify_token, require_project_role
-from config import WHATSAPP_TOKEN
-import requests
+from auth import verify_token, require_project_access
+from campaigns import _wa_integration
+from whatsapp import http
 
 router = APIRouter()
 
@@ -207,8 +206,11 @@ TEMPLATE_LIBRARY = [
 # GET TEMPLATE LIBRARY
 # -------------------------------------------------
 @router.get("/template-library")
-def get_template_library():
-    """Return all pre-built templates."""
+def get_template_library(user=Depends(verify_token)):
+    """Return all pre-built templates.
+
+    Static content, but it was the one endpoint here with no auth at all —
+    no reason for it to be readable without an account."""
     return TEMPLATE_LIBRARY
 
 
@@ -218,25 +220,26 @@ def get_template_library():
 @router.post("/template-library/add")
 def add_template_to_waba(data: dict, user=Depends(verify_token)):
     """Submit a pre-built template to the customer's WABA."""
-    project_id  = data["project_id"]
-    template_id = data["template_id"]
-    require_project_role(user.id, project_id)
+    project_id  = data.get("project_id")
+    template_id = data.get("template_id")
+    if not project_id or not template_id:
+        raise HTTPException(status_code=400, detail="project_id and template_id are required")
+    # Submitting templates affects the merchant's WABA quality rating, so
+    # this needs the templates tab, not merely "has some role".
+    require_project_access(user.id, project_id, tab="templates")
 
     # Find template
     template = next((t for t in TEMPLATE_LIBRARY if t["id"] == template_id), None)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
 
-    # Get WABA ID
-    wa = supabase.table("whatsapp_integrations") \
-        .select("waba_id") \
-        .eq("project_id", project_id) \
-        .execute()
-
-    if not wa.data or not wa.data[0].get("waba_id"):
+    # Uses the project's OWN access token — this paired the merchant's
+    # waba_id with the PLATFORM token, which fails for any merchant on
+    # their own WABA.
+    wa = _wa_integration(project_id)
+    waba_id = wa["waba_id"]
+    if not waba_id:
         raise HTTPException(status_code=400, detail="WhatsApp not connected")
-
-    waba_id = wa.data[0]["waba_id"]
 
     # Build components with examples
     components = []
@@ -256,19 +259,16 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
         "components": components,
     }
 
-    print(f"Submitting template to Meta: {payload}")
-
-    res = requests.post(
+    res = http.post(
         f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
         headers={
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Authorization": f"Bearer {wa['token']}",
             "Content-Type": "application/json",
         },
         json=payload,
     )
 
     resp_data = res.json()
-    print(f"Meta template response: {resp_data}")
 
     if res.ok:
         return {
@@ -279,10 +279,10 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
     else:
         if "already exists" in str(resp_data).lower():
             return {"status": "exists", "message": "Template already exists in your account."}
-        raise HTTPException(
-            status_code=400,
-            detail=resp_data.get("error", {}).get("message", "Failed to submit template")
-        )
+        # Meta's raw error text can name internal ids and token state — log
+        # it, don't return it.
+        print(f"Meta template submit failed: {resp_data}")
+        raise HTTPException(status_code=400, detail="Could not submit that template to WhatsApp.")
 
 
 # -------------------------------------------------
@@ -291,29 +291,23 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
 @router.get("/template-library/sync/{project_id}")
 def sync_templates_from_meta(project_id: str, user=Depends(verify_token)):
     """Fetch all templates from the merchant's WABA and return with approval status."""
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="templates")
 
-    # Get WABA ID
-    wa = supabase.table("whatsapp_integrations") \
-        .select("waba_id") \
-        .eq("project_id", project_id) \
-        .maybe_single() \
-        .execute()
-
-    if not wa or not wa.data or not wa.data.get("waba_id"):
+    wa = _wa_integration(project_id)
+    waba_id = wa["waba_id"]
+    if not waba_id:
         raise HTTPException(status_code=400, detail="WhatsApp not connected")
 
-    waba_id = wa.data["waba_id"]
-
-    # Fetch all templates from Meta
-    res = requests.get(
+    # Fetch all templates from Meta, with the project's own token
+    res = http.get(
         f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
-        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        headers={"Authorization": f"Bearer {wa['token']}"},
         params={"fields": "name,status,category,language,components", "limit": 100},
     )
 
     if not res.ok:
-        raise HTTPException(status_code=400, detail=res.json().get("error", {}).get("message", "Failed to fetch templates"))
+        print(f"Meta template sync failed: {res.text}")
+        raise HTTPException(status_code=400, detail="Could not fetch templates from WhatsApp.")
 
     templates = res.json().get("data", [])
     return {"templates": templates, "total": len(templates)}
