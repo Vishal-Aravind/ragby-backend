@@ -5,15 +5,23 @@ Supports Google Calendar integration for availability.
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from clients import supabase
-from auth import verify_token, require_project_role
+from auth import verify_token, require_project_access
 from config import WHATSAPP_TOKEN, FRONTEND_URL
 from ratelimit import is_rate_limited, client_ip
+from oauth_state import issue_state, consume_state
+# whatsapp.py's _TimeoutSession. Every Google call in this file used bare
+# `requests` with no timeout, and get_busy_slots is reached from the PUBLIC
+# /public/appointments/{id}/slots endpoint — so a slow Google pinned a
+# worker thread per request, triggerable by anyone on the internet.
+from whatsapp import http
 import os
-import requests
-from datetime import datetime, date, timedelta, time
+import re
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+from datetime import datetime, date, timedelta
 import json
 
 router = APIRouter()
@@ -31,52 +39,77 @@ HOLD_MINUTES = 15
 # -------------------------------------------------
 # MODELS
 # -------------------------------------------------
+# Google's IANA zone for the merchant's calendar. Previously "Asia/Kolkata"
+# was a literal in three event payloads and a +5:30 shift in three more
+# places, so any merchant outside India got calendar events at the wrong
+# time with no way to correct it. Default keeps today's behaviour exactly.
+DEFAULT_TIMEZONE = "Asia/Kolkata"
+
+# Statuses the rest of this file actually branches on. `status` used to be a
+# free string written straight to the row, so any value at all could be
+# stored and then silently fail to match anywhere.
+VALID_APPOINTMENT_STATUSES = {"confirmed", "cancelled", "rescheduled", "completed", "no_show"}
+
+# Google calendar ids are "primary" or an email-shaped address.
+_CALENDAR_ID_RE = re.compile(r"^(primary|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})$")
+
+
 class AppointmentSettingsUpdate(BaseModel):
     # service_name/duration_minutes moved to appointment_services (see
     # ServiceCreate/ServiceUpdate below) — no longer editable here.
-    buffer_minutes: Optional[int] = None
-    slot_capacity: Optional[int] = None
+    #
+    # Every int here was unbounded. slot_capacity is the one that matters
+    # most: it drives the `overlap_count >= slot_capacity` gate in
+    # generate_slots, so a huge value means unlimited bookings per slot and
+    # a negative one means none at all.
+    buffer_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    slot_capacity: Optional[int] = Field(default=None, ge=1, le=100)
     working_hours: Optional[dict] = None
-    advance_booking_days: Optional[int] = None
-    reminder_hours: Optional[int] = None
-    google_calendar_id: Optional[str] = None
-    accent_color: Optional[str] = None
-    currency_code: Optional[str] = None
+    advance_booking_days: Optional[int] = Field(default=None, ge=1, le=365)
+    reminder_hours: Optional[int] = Field(default=None, ge=1, le=168)
+    google_calendar_id: Optional[str] = Field(default=None, max_length=254)
+    accent_color: Optional[str] = Field(default=None, max_length=32)
+    currency_code: Optional[str] = Field(default=None, max_length=8)
+    timezone: Optional[str] = Field(default=None, max_length=64)
     is_enabled: Optional[bool] = None
     bot_can_book: Optional[bool] = None
 
 class ServiceCreate(BaseModel):
     project_id: str
-    name: str
-    description: Optional[str] = None
-    duration_minutes: int = 30
+    name: str = Field(max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    duration_minutes: int = Field(default=30, ge=5, le=1440)
     is_active: bool = True
-    sort_order: int = 0
+    sort_order: int = Field(default=0, ge=0, le=10000)
 
 class ServiceUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    duration_minutes: Optional[int] = None
+    name: Optional[str] = Field(default=None, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
     is_active: Optional[bool] = None
-    sort_order: Optional[int] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
 
 class BookingCreate(BaseModel):
-    project_id: str
+    """Reached from /public/appointments/book, which is unauthenticated —
+    so these bounds are the only thing standing between a stranger and an
+    unbounded write. notes in particular ends up in the merchant's Google
+    Calendar description and in a WhatsApp message."""
+    project_id: str = Field(max_length=64)
     # Optional only because a reschedule always inherits the original
     # appointment's service — see create_appointment(), which resolves it
     # authoritatively server-side rather than trusting whatever (if
     # anything) the caller sends when reschedule_id is set. Required for a
     # brand-new booking.
-    service_id: Optional[str] = None
-    customer_name: str
-    customer_phone: str
-    appointment_date: str  # YYYY-MM-DD
-    start_time: str        # HH:MM
-    notes: Optional[str] = None
-    reschedule_id: Optional[str] = None  # old appointment ID being rescheduled
+    service_id: Optional[str] = Field(default=None, max_length=64)
+    customer_name: str = Field(max_length=120)
+    customer_phone: str = Field(max_length=32)
+    appointment_date: str = Field(max_length=10)  # YYYY-MM-DD
+    start_time: str = Field(max_length=5)         # HH:MM
+    notes: Optional[str] = Field(default=None, max_length=1000)
+    reschedule_id: Optional[str] = Field(default=None, max_length=64)  # old appointment ID being rescheduled
 
 class AppointmentStatusUpdate(BaseModel):
-    status: str  # confirmed, cancelled, rescheduled, completed
+    status: str = Field(max_length=32)  # confirmed, cancelled, rescheduled, completed
 
 
 # -------------------------------------------------
@@ -84,7 +117,7 @@ class AppointmentStatusUpdate(BaseModel):
 # -------------------------------------------------
 def get_google_access_token(refresh_token: str) -> Optional[str]:
     """Exchange refresh token for access token."""
-    res = requests.post("https://oauth2.googleapis.com/token", data={
+    res = http.post("https://oauth2.googleapis.com/token", data={
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
         "refresh_token": refresh_token,
@@ -92,7 +125,9 @@ def get_google_access_token(refresh_token: str) -> Optional[str]:
     })
     if res.ok:
         return res.json().get("access_token")
-    print(f"Google token refresh error: {res.text}")
+    # Body deliberately not logged — Google's error payloads echo token
+    # material and internal ids.
+    print(f"Google token refresh failed: HTTP {res.status_code}")
     return None
 
 
@@ -101,7 +136,7 @@ def get_busy_slots(access_token: str, calendar_id: str, date_str: str) -> List[d
     start = f"{date_str}T00:00:00Z"
     end   = f"{date_str}T23:59:59Z"
 
-    res = requests.post(
+    res = http.post(
         "https://www.googleapis.com/calendar/v3/freeBusy",
         headers={"Authorization": f"Bearer {access_token}"},
         json={
@@ -114,27 +149,30 @@ def get_busy_slots(access_token: str, calendar_id: str, date_str: str) -> List[d
         calendars = res.json().get("calendars", {})
         busy = calendars.get(calendar_id, {}).get("busy", [])
         return busy
-    print(f"Google freeBusy error: {res.text}")
+    print(f"Google freeBusy failed: HTTP {res.status_code}")
     return []
 
 
 def create_google_event(access_token: str, calendar_id: str, event: dict) -> Optional[str]:
     """Create a Google Calendar event and return event ID."""
-    res = requests.post(
-        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+    res = http.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='@.')}/events",
         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         json=event,
     )
     if res.ok:
         return res.json().get("id")
-    print(f"Google create event error: {res.text}")
+    print(f"Google create event failed: HTTP {res.status_code}")
     return None
 
 
 def delete_google_event(access_token: str, calendar_id: str, event_id: str):
     """Delete a Google Calendar event."""
-    requests.delete(
-        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+    # calendar_id and event_id are percent-encoded: calendar_id comes from
+    # merchant-editable settings and was interpolated into the API path raw.
+    http.delete(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(calendar_id, safe='@.')}"
+        f"/events/{quote(event_id, safe='')}",
         headers={"Authorization": f"Bearer {access_token}"},
     )
 
@@ -262,9 +300,21 @@ def generate_slots(date_str: str, settings: dict, service: dict, busy_slots: Lis
 @router.get("/appointments/google/auth/{project_id}")
 def google_auth(project_id: str, user=Depends(verify_token)):
     """Start Google OAuth flow for calendar access."""
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="appointments")
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Google OAuth not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to env vars.")
+
+    # state was the bare project_id, and the callback authenticated nothing —
+    # so anyone could run Google's consent screen themselves and then hand
+    # the callback SOMEONE ELSE'S project id, writing their own refresh
+    # token into that merchant's settings. From then on every booking landed
+    # on the attacker's calendar (customer name, phone and notes included)
+    # and the attacker's calendar decided which slots looked free.
+    #
+    # Google was the only provider missed when durable state was introduced;
+    # slack.py, shopify_oauth.py and razorpay_oauth.py have all used these
+    # two helpers since. The nonce records who minted it and is single-use.
+    state = issue_state("google", project_id, user.id)
 
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -274,7 +324,7 @@ def google_auth(project_id: str, user=Depends(verify_token)):
         "&scope=https://www.googleapis.com/auth/calendar"
         "&access_type=offline"
         "&prompt=consent"
-        f"&state={project_id}"
+        f"&state={quote(state, safe='')}"
     )
     return {"auth_url": auth_url}
 
@@ -286,19 +336,33 @@ def _popup_html(event: str, error: str = None) -> HTMLResponse:
     payload = {"type": "GOOGLE_AUTH", "event": event}
     if error:
         payload["error"] = error
+    # Targeted at FRONTEND_URL rather than '*'. The wildcard handed the auth
+    # result to whatever origin happened to own the opener.
     return HTMLResponse(
         f"<html><body><script>"
-        f"window.opener.postMessage({json.dumps(payload)}, '*'); window.close();"
+        f"window.opener.postMessage({json.dumps(payload)}, {json.dumps(FRONTEND_URL)}); window.close();"
         f"</script></body></html>"
     )
 
 
 @router.get("/appointments/google/callback")
-def google_callback(code: str, state: str):
+def google_callback(code: str, state: str, request: Request):
     """Handle Google OAuth callback — exchange code for tokens."""
-    project_id = state
+    # Unauthenticated by necessity (Google redirects the browser here), so
+    # it needs its own ceiling — it posts to Google on every call.
+    if is_rate_limited(f"google-oauth-cb:{client_ip(request)}", limit=20, window_seconds=300):
+        return _popup_html("ERROR", "Too many attempts — please wait a moment and try again.")
 
-    res = requests.post("https://oauth2.googleapis.com/token", data={
+    # project_id comes from the single-use state row, NOT from the query
+    # string. It used to be `project_id = state`, which let a caller name
+    # any project they liked and attach their own Google account to it.
+    state_row = consume_state("google", state)
+    if not state_row:
+        return _popup_html("ERROR", "This connection link expired or was already used. Please try connecting again.")
+
+    project_id = state_row["project_id"]
+
+    res = http.post("https://oauth2.googleapis.com/token", data={
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
         "code": code,
@@ -341,7 +405,7 @@ def google_callback(code: str, state: str):
 
 @router.delete("/appointments/google/disconnect/{project_id}")
 def google_disconnect(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="appointments")
     supabase.table("appointment_settings").update({
         "google_refresh_token": None,
         "google_calendar_id": "primary",
@@ -354,7 +418,7 @@ def google_disconnect(project_id: str, user=Depends(verify_token)):
 # -------------------------------------------------
 @router.get("/appointment-settings/{project_id}")
 def get_settings(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="appointments")
     res = supabase.table("appointment_settings").select("*").eq("project_id", project_id).maybe_single().execute()
     if not res or not res.data:
         return {
@@ -377,6 +441,7 @@ def get_settings(project_id: str, user=Depends(verify_token)):
             "google_refresh_token": None,
             "google_calendar_id": "primary",
             "accent_color": "#6366f1",
+            "timezone": DEFAULT_TIMEZONE,
             "is_enabled": False,
             "google_connected": False,
         }
@@ -388,8 +453,26 @@ def get_settings(project_id: str, user=Depends(verify_token)):
 
 @router.put("/appointment-settings/{project_id}")
 def update_settings(project_id: str, body: AppointmentSettingsUpdate, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="appointments")
     update = {k: v for k, v in body.dict().items() if v is not None}
+
+    # timezone reaches Google as the event's timeZone and drives slot
+    # generation, so it has to be a real IANA zone, not any 64-char string.
+    if "timezone" in update:
+        try:
+            ZoneInfo(update["timezone"])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unknown timezone")
+
+    # calendar_id is interpolated into the Google API path (it is
+    # percent-encoded there now, but a nonsense value just means every
+    # calendar call silently fails, so reject it here instead).
+    if "google_calendar_id" in update:
+        cal = update["google_calendar_id"].strip()
+        if not cal or not _CALENDAR_ID_RE.match(cal):
+            raise HTTPException(status_code=400, detail="Invalid calendar id")
+        update["google_calendar_id"] = cal
+
     existing = supabase.table("appointment_settings").select("id").eq("project_id", project_id).maybe_single().execute()
     if existing and existing.data:
         supabase.table("appointment_settings").update(update).eq("project_id", project_id).execute()
@@ -705,47 +788,9 @@ def create_appointment(
     end_dt   = start_dt + timedelta(minutes=duration)
     end_time = end_dt.strftime("%H:%M")
 
-    google_event_id = None
     refresh_token   = settings.get("google_refresh_token")
     calendar_id     = settings.get("google_calendar_id", "primary")
-
-    # Skip creating a Google event for a fresh hold — the slot is already
-    # excluded from availability via the appointments row itself (see
-    # get_available_slots' pending_payment handling), and this avoids
-    # having to clean up a tentative event for every hold that expires
-    # unpaid. The event is created when the webhook finalizes payment.
-    if refresh_token and not is_fresh_hold:
-        access_token = get_google_access_token(refresh_token)
-        if access_token:
-            event = {
-                "summary": f"{service} — {customer_name}",
-                "description": f"Customer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes or 'None'}",
-                "start": {
-                    "dateTime": f"{appointment_date}T{start_time}:00",
-                    "timeZone": "Asia/Kolkata",
-                },
-                "end": {
-                    "dateTime": f"{appointment_date}T{end_time}:00",
-                    "timeZone": "Asia/Kolkata",
-                },
-                "reminders": {
-                    "useDefault": False,
-                    "overrides": [{"method": "popup", "minutes": 30}],
-                },
-            }
-            google_event_id = create_google_event(access_token, calendar_id, event)
-
-    if reschedule_id:
-        try:
-            if old_appt_data:
-                supabase.table("appointments").update({"status": "rescheduled"}).eq("id", reschedule_id).execute()
-                if settings.get("google_refresh_token") and old_appt_data.get("google_event_id"):
-                    old_token = get_google_access_token(settings["google_refresh_token"])
-                    if old_token:
-                        delete_google_event(old_token, calendar_id, old_appt_data["google_event_id"])
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
-            print(f"Reschedule old appointment error: {e}")
+    tz              = settings.get("timezone") or DEFAULT_TIMEZONE
 
     insert_row = {
         "project_id": project_id,
@@ -757,7 +802,6 @@ def create_appointment(
         "start_time": start_time,
         "end_time": end_time,
         "status": "pending_payment" if is_fresh_hold else "confirmed",
-        "google_event_id": google_event_id,
         "notes": notes,
         "payment_status": "not_required" if payment_mode == "free" else "unpaid",
     }
@@ -767,8 +811,73 @@ def create_appointment(
     if is_fresh_hold:
         insert_row["hold_expires_at"] = (datetime.utcnow() + timedelta(minutes=HOLD_MINUTES)).isoformat()
 
-    appt_res = supabase.table("appointments").insert(insert_row).execute()
-    appointment = appt_res.data[0]
+    # The row goes in FIRST, inside a transaction that locks the project's
+    # settings and recounts overlapping bookings under that lock. Previously
+    # this was a plain insert after an unlocked availability check, so two
+    # customers taking the last slot both succeeded — and the Google event
+    # was created BEFORE the insert, so a failed insert left an orphan event
+    # on the merchant's calendar carrying the customer's name and phone.
+    #
+    # Releasing the original on a reschedule happens in this same
+    # transaction, so a failure can no longer leave the customer with
+    # neither the old booking nor a new one.
+    try:
+        booked = supabase.rpc("book_appointment_slot", {
+            "p_project_id": project_id,
+            "p_row": insert_row,
+            "p_start_time": start_time,
+            "p_end_time": end_time,
+            "p_date": appointment_date,
+            "p_reschedule_id": reschedule_id,
+        }).execute()
+    except Exception as e:
+        message = str(e)
+        if "slot_taken" in message:
+            raise ValueError(f"{start_time} on {appointment_date} is no longer available")
+        if "settings_not_found" in message:
+            raise ValueError("Appointment settings not found for this project")
+        raise
+
+    appointment = booked.data[0] if isinstance(booked.data, list) else booked.data
+    if not appointment:
+        raise ValueError(f"{start_time} on {appointment_date} is no longer available")
+
+    # Calendar work happens only after the booking is durably stored, so a
+    # failure here costs a missing event, never a lost or duplicated booking.
+    #
+    # Skip creating a Google event for a fresh hold — the slot is already
+    # excluded from availability via the appointments row itself (see
+    # get_available_slots' pending_payment handling), and this avoids
+    # having to clean up a tentative event for every hold that expires
+    # unpaid. The event is created when the webhook finalizes payment.
+    if refresh_token and not is_fresh_hold:
+        try:
+            access_token = get_google_access_token(refresh_token)
+            if access_token:
+                event = {
+                    "summary": f"{service} — {customer_name}",
+                    "description": f"Customer: {customer_name}\nPhone: {customer_phone}\nNotes: {notes or 'None'}",
+                    "start": {"dateTime": f"{appointment_date}T{start_time}:00", "timeZone": tz},
+                    "end": {"dateTime": f"{appointment_date}T{end_time}:00", "timeZone": tz},
+                    "reminders": {
+                        "useDefault": False,
+                        "overrides": [{"method": "popup", "minutes": 30}],
+                    },
+                }
+                google_event_id = create_google_event(access_token, calendar_id, event)
+                if google_event_id:
+                    supabase.table("appointments").update(
+                        {"google_event_id": google_event_id}
+                    ).eq("id", appointment["id"]).execute()
+                    appointment["google_event_id"] = google_event_id
+
+                # The replaced booking's event is removed only now that the
+                # new one exists.
+                if reschedule_id and old_appt_data and old_appt_data.get("google_event_id"):
+                    delete_google_event(access_token, calendar_id, old_appt_data["google_event_id"])
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Google Calendar sync failed for appointment {appointment.get('id')}: {e}")
 
     date_obj = datetime.strptime(appointment_date, "%Y-%m-%d")
     date_formatted = date_obj.strftime("%A, %d %B %Y")
@@ -900,14 +1009,14 @@ def book_appointment(body: BookingCreate, request: Request):
 # -------------------------------------------------
 @router.get("/appointment-services")
 def list_services(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+    require_project_access(user.id, project_id, tab="appointments")
     res = supabase.table("appointment_services").select("*").eq("project_id", project_id).order("sort_order", desc=False).execute()
     return res.data or []
 
 
 @router.post("/appointment-services")
 def create_service(body: ServiceCreate, user=Depends(verify_token)):
-    require_project_role(user.id, body.project_id)
+    require_project_access(user.id, body.project_id, tab="appointments")
     supabase.table("appointment_services").insert({
         "project_id": body.project_id,
         "name": body.name,
@@ -925,7 +1034,7 @@ def _require_role_for_service(user_id: str, service_id: str):
     service = res.data if res else None
     if not service:
         raise HTTPException(status_code=404, detail="Not found")
-    require_project_role(user_id, service["project_id"])
+    require_project_access(user_id, service["project_id"], tab="appointments")
     return service["project_id"]
 
 
@@ -958,13 +1067,20 @@ def delete_service(service_id: str, user=Depends(verify_token)):
 # APPOINTMENTS CRUD (dashboard)
 # -------------------------------------------------
 @router.get("/appointments")
-def list_appointments(project_id: str, user=Depends(verify_token)):
-    require_project_role(user.id, project_id)
+def list_appointments(project_id: str, user=Depends(verify_token), limit: int = 200, offset: int = 0):
+    require_project_access(user.id, project_id, tab="appointments")
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    # Explicit columns and a page. This returned every appointment ever —
+    # every customer name, phone and note — in one unbounded response.
     res = supabase.table("appointments") \
-        .select("*") \
+        .select("id, project_id, service_id, service_name, customer_name, "
+                "customer_phone, appointment_date, start_time, end_time, "
+                "status, payment_status, notes, google_event_id, created_at") \
         .eq("project_id", project_id) \
         .order("appointment_date", desc=False) \
         .order("start_time", desc=False) \
+        .range(offset, offset + limit - 1) \
         .execute()
     return res.data or []
 
@@ -1040,7 +1156,9 @@ def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=
     appt_data = appt_check.data if appt_check else None
     if not appt_data:
         raise HTTPException(status_code=404, detail="Not found")
-    require_project_role(user.id, appt_data["project_id"])
+    require_project_access(user.id, appt_data["project_id"], tab="appointments")
+    if body.status not in VALID_APPOINTMENT_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid status")
     if body.status == "cancelled":
         try:
             return cancel_appointment(appointment_id, notify_customer=True)
@@ -1070,7 +1188,7 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
     Returns True if sent successfully, False if template not approved or failed.
     """
     try:
-        res = requests.post(
+        res = http.post(
             f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
             headers={
                 "Authorization": f"Bearer {token}",
@@ -1281,6 +1399,7 @@ def handle_appointment_payment_paid(appointment: dict):
     google_event_id = None
     refresh_token = settings.get("google_refresh_token")
     calendar_id   = settings.get("google_calendar_id", "primary")
+    _tz           = settings.get("timezone") or DEFAULT_TIMEZONE
     if refresh_token:
         access_token = get_google_access_token(refresh_token)
         if access_token:
@@ -1289,8 +1408,8 @@ def handle_appointment_payment_paid(appointment: dict):
             event = {
                 "summary": f"{appointment['service_name']} — {appointment['customer_name']}",
                 "description": f"Customer: {appointment['customer_name']}\nPhone: {appointment['customer_phone']}\nNotes: {appointment.get('notes') or 'None'}",
-                "start": {"dateTime": f"{appointment['appointment_date']}T{start_hm}:00", "timeZone": "Asia/Kolkata"},
-                "end": {"dateTime": f"{appointment['appointment_date']}T{end_hm}:00", "timeZone": "Asia/Kolkata"},
+                "start": {"dateTime": f"{appointment['appointment_date']}T{start_hm}:00", "timeZone": _tz},
+                "end": {"dateTime": f"{appointment['appointment_date']}T{end_hm}:00", "timeZone": _tz},
                 "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]},
             }
             # A failed Google event here is logged (inside create_google_event)
