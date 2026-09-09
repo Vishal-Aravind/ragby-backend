@@ -24,6 +24,7 @@ import hmac
 import json
 
 import razorpay
+import requests
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -32,6 +33,7 @@ from typing import Optional
 from clients import supabase
 from webhook_dedup import already_processed
 from auth import verify_token
+from ratelimit import is_rate_limited
 from config import (
     RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET,
     RAZORPAY_BILLING_WEBHOOK_SECRET,
@@ -40,7 +42,29 @@ from config import (
 
 router = APIRouter()
 
-client = razorpay.Client(auth=(RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET))
+class _TimeoutSession(requests.Session):
+    """Applies a default timeout to every Razorpay call.
+
+    get_plan and list_invoices hit Razorpay synchronously while the billing
+    page loads, and the SDK creates a plain requests.Session, which waits
+    forever by default — so a slow (not even down) Razorpay pinned a worker
+    per request. Same wrapper whatsapp.py uses for the Graph API.
+    """
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 20)
+        return super().request(*args, **kwargs)
+
+
+client = razorpay.Client(
+    session=_TimeoutSession(),
+    auth=(RAZORPAY_BILLING_KEY_ID, RAZORPAY_BILLING_KEY_SECRET),
+)
+
+# Razorpay states in which a subscription is still the user's live one.
+# "cancelled"/"completed"/"expired" are terminal, so a profile still
+# pointing at one of those must not block a fresh subscribe.
+_LIVE_SUBSCRIPTION_STATES = {"created", "authenticated", "active", "pending", "halted", "paused"}
 
 # Razorpay subscriptions require SOME bound — there's no "bill until
 # cancelled" flag. Originally used end_at (a far-future timestamp), which
@@ -76,10 +100,48 @@ def _get_profile(user_id: str) -> dict:
     return (res.data if res else None) or {}
 
 
+def _live_subscription_status(subscription_id: str) -> Optional[str]:
+    """The Razorpay status of a subscription, if it is still live.
+
+    Returns None when it is terminal, unknown, or Razorpay can't be reached
+    — the caller treats that as "nothing blocking a new subscription".
+    Failing open here is deliberate: refusing to let someone subscribe
+    because Razorpay had a bad minute costs a sale, whereas the duplicate it
+    might admit is caught by the unique index on the profile column.
+    """
+    if not subscription_id:
+        return None
+    try:
+        sub = client.subscription.fetch(subscription_id)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return None
+    status = sub.get("status")
+    return status if status in _LIVE_SUBSCRIPTION_STATES else None
+
+
 @router.post("/billing/subscribe")
 def subscribe(body: SubscribeRequest, user=Depends(verify_token)):
     plan_id = _resolve_plan_id(body.plan, body.billing)
     total_count = _INDEFINITE_CYCLES.get(body.billing, 120)
+
+    # Each call creates a real Razorpay subscription object. Nothing bounded
+    # that before.
+    if is_rate_limited(f"billing-subscribe:{user.id}", limit=5, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.")
+
+    # Nothing stopped a second subscription. A double-click during checkout
+    # created a SECOND Razorpay subscription and overwrote
+    # razorpay_subscription_id with it — so the first kept billing the
+    # customer with no record of it anywhere, and its eventual
+    # subscription.cancelled webhook downgraded a still-paying customer.
+    profile = _get_profile(user.id)
+    existing_id = profile.get("razorpay_subscription_id")
+    if existing_id and _live_subscription_status(existing_id):
+        raise HTTPException(
+            status_code=409,
+            detail="You already have an active subscription. Use Change Plan to switch, or cancel it first.",
+        )
 
     try:
         subscription = client.subscription.create({
@@ -95,7 +157,6 @@ def subscribe(body: SubscribeRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        print(f"Billing subscribe error: plan_id={plan_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not start the subscription. Please try again.")
 
     # Persisted immediately — the subscription id exists before payment is
@@ -135,7 +196,15 @@ def _find_profile_by_subscription(subscription_id: str, notes: dict) -> Optional
     if not user_id:
         return None
     res = supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
-    return res.data if res else None
+    candidate = res.data if res else None
+    if not candidate:
+        return None
+    # Only accept the fallback while the profile has NO subscription on file.
+    # If it already points at a different subscription, this event belongs to
+    # a superseded one and must not be allowed to rewrite the live plan.
+    if candidate.get("razorpay_subscription_id"):
+        return None
+    return candidate
 
 
 @router.post("/webhook/razorpay-billing")
@@ -155,8 +224,12 @@ async def billing_webhook(request: Request):
     # we haven't already acted on it. Razorpay retries, and without this a
     # replayed subscription.cancelled downgrades a paying customer to free,
     # while a replayed subscription.activated resurrects a cancelled plan.
-    event_id = request.headers.get("X-Razorpay-Event-Id")
-    if event_id and already_processed("razorpay-billing", event_id):
+    # Razorpay normally sends X-Razorpay-Event-Id, but when it doesn't, the
+    # old `if event_id` guard silently skipped dedup entirely — on the one
+    # path that changes what a customer pays. A hash of the raw body is
+    # stable across retries of the same event, so it works as the key.
+    event_id = request.headers.get("X-Razorpay-Event-Id") or hashlib.sha256(body_bytes).hexdigest()
+    if already_processed("razorpay-billing", event_id):
         return {"status": "duplicate_ignored"}
 
     event = payload.get("event")
@@ -194,11 +267,21 @@ async def billing_webhook(request: Request):
             return {"status": "unknown_plan_ignored"}
         # subscription.resumed specifically means a cancel-at-cycle-end got
         # reversed — not scheduled to end anymore either way here.
+        # Scoped so an event from a superseded subscription can't take the
+        # profile over: either the profile already points at this
+        # subscription, or it points at nothing yet.
+        current_sub = profile.get("razorpay_subscription_id")
+        if current_sub and current_sub != subscription_id:
+            sentry_sdk.capture_message(
+                f"Razorpay billing webhook: {event} for superseded subscription - ignored"
+            )
+            return {"status": "superseded_ignored"}
+
         update = {"plan": plan, "razorpay_subscription_id": subscription_id, "subscription_cancel_scheduled": False}
         if customer_id:
             update["razorpay_customer_id"] = customer_id
         supabase.table("profiles").update(update).eq("id", user_id).execute()
-        print(f"Billing: {user_id} -> {plan} ({event})")
+        print(f"Billing: plan -> {plan} ({event})")
 
     elif event == "subscription.authenticated":
         # Mandate set up, no charge confirmed yet — nothing to do until an
@@ -209,14 +292,24 @@ async def billing_webhook(request: Request):
         # Payment attempt failed, Razorpay is auto-retrying — grace period:
         # leave the plan alone. Only subscription.halted (retries exhausted)
         # or a later subscription.charged (retry succeeded) change anything.
-        print(f"Billing: {user_id} payment pending/retrying, no plan change")
+        print("Billing: payment pending/retrying, no plan change")
 
     elif event in ("subscription.halted", "subscription.paused", "subscription.completed", "subscription.cancelled"):
+        # THE important guard. This downgraded on ANY subscription's
+        # cancellation, so an orphaned earlier subscription ending would
+        # drop a currently-paying customer to free. The write now only
+        # matches while the profile still points at the subscription this
+        # event is about.
         update = {"plan": "free", "subscription_cancel_scheduled": False}
         if event == "subscription.cancelled":
             update["razorpay_subscription_id"] = None
-        supabase.table("profiles").update(update).eq("id", user_id).execute()
-        print(f"Billing: {user_id} -> free ({event})")
+        res = supabase.table("profiles").update(update)             .eq("id", user_id)             .eq("razorpay_subscription_id", subscription_id)             .execute()
+        if not res.data:
+            sentry_sdk.capture_message(
+                f"Razorpay billing webhook: {event} for a subscription not on file - plan left unchanged"
+            )
+            return {"status": "superseded_ignored"}
+        print(f"Billing: plan -> free ({event})")
 
     return {"status": "ok"}
 
@@ -244,7 +337,6 @@ def get_plan(user=Depends(verify_token)):
             result["current_end"] = sub.get("current_end")
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            print(f"Billing get_plan fetch error: subscription_id={subscription_id}, user={user.id}, error={e}")
 
     return result
 
@@ -261,18 +353,28 @@ def list_invoices(user=Depends(verify_token)):
         return {"invoices": res.get("items", [])}
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        print(f"Billing list_invoices error: subscription_id={subscription_id}, user={user.id}, error={e}")
         return {"invoices": []}
 
 
 @router.post("/billing/change-plan")
 def change_plan(body: SubscribeRequest, user=Depends(verify_token)):
+    # schedule_change_at="now" PRORATES on every call — Razorpay charges or
+    # refunds the difference each time — so an unthrottled loop moves real
+    # money against a real card repeatedly.
+    if is_rate_limited(f"billing-change-plan:{user.id}", limit=5, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many plan changes. Please wait a few minutes and try again.")
+
     profile = _get_profile(user.id)
     subscription_id = profile.get("razorpay_subscription_id")
     if not subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription to change.")
 
     new_plan_id = _resolve_plan_id(body.plan, body.billing)
+
+    # Switching to the plan already active still issued a prorated edit.
+    current_plan_id = PLAN_TO_RAZORPAY_PLAN_ID.get((profile.get("plan"), body.billing))
+    if current_plan_id and current_plan_id == new_plan_id:
+        return {"status": "unchanged"}
 
     try:
         # "now" prorates (Razorpay auto charges/refunds the difference);
@@ -283,7 +385,6 @@ def change_plan(body: SubscribeRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        print(f"Billing change_plan error: subscription_id={subscription_id}, new_plan_id={new_plan_id}, user={user.id}, error={e}")
         # Real, permanent Razorpay platform limitation, not a transient
         # failure — a UPI AutoPay mandate is registered for one specific
         # plan/amount and can't be edited in place the way a card can.
@@ -304,10 +405,17 @@ def change_plan(body: SubscribeRequest, user=Depends(verify_token)):
 
 @router.post("/billing/cancel")
 def cancel_subscription(body: CancelRequest, user=Depends(verify_token)):
+    if is_rate_limited(f"billing-cancel:{user.id}", limit=5, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes and try again.")
+
     profile = _get_profile(user.id)
     subscription_id = profile.get("razorpay_subscription_id")
     if not subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription to cancel.")
+
+    # Already scheduled to end — calling Razorpay again changes nothing.
+    if body.at_cycle_end and profile.get("subscription_cancel_scheduled"):
+        return {"status": "already_scheduled"}
 
     try:
         client.subscription.cancel(subscription_id, {
@@ -315,7 +423,6 @@ def cancel_subscription(body: CancelRequest, user=Depends(verify_token)):
         })
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        print(f"Billing cancel_subscription error: subscription_id={subscription_id}, user={user.id}, error={e}")
         raise HTTPException(status_code=502, detail="Could not cancel your subscription. Please try again.")
 
     # See get_plan's comment — Razorpay's own status field won't reflect
