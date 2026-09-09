@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from clients import supabase
 from config import WHATSAPP_TOKEN
-from api_keys import hash_key
+from api_keys import resolve_api_key, touch_api_key
 from ratelimit import is_rate_limited
 from whatsapp import http
 
@@ -40,21 +40,17 @@ def get_project_from_api_key(api_key: str) -> dict:
     if not api_key:
         raise HTTPException(status_code=401, detail="API key required. Pass it as X-API-Key header.")
 
-    # Look up API key by hash — the plaintext key column is no longer
-    # populated (see api_keys.py, keys are hashed at rest and shown once).
-    key_res = supabase.table("api_keys") \
-        .select("project_id, is_active") \
-        .eq("key_hash", hash_key(api_key)) \
-        .maybe_single() \
-        .execute()
+    # One shared lookup with /public/send (api_keys.resolve_api_key). These
+    # were two separate queries that had already drifted: this one honoured
+    # is_active, the other didn't, so a key disabled in the database still
+    # worked there. It also records last_used_at, which this path never did
+    # — so "last used" on the API Keys tab was blind to template sends.
+    resolved = resolve_api_key(api_key)
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
 
-    key_data = (key_res.data if key_res else None)
-    if not key_data:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-    if not key_data.get("is_active", True):
-        raise HTTPException(status_code=401, detail="API key is inactive.")
-
-    project_id = key_data["project_id"]
+    project_id = resolved["project_id"]
+    touch_api_key(resolved["id"])
 
     # Get WhatsApp integration
     wa_res = supabase.table("whatsapp_integrations") \
@@ -169,9 +165,13 @@ def send_template(
             message=f"Template '{body.template}' sent successfully to +{phone}.",
         )
     else:
-        error_msg = resp.get("error", {}).get("message", "Failed to send template.")
-        print(f"Send template error: {resp}")
-        raise HTTPException(status_code=400, detail=error_msg)
+        # Meta's error payloads name internal ids and token state — log it,
+        # don't hand it back to the caller.
+        print(f"Send template failed: HTTP {res.status_code}")
+        raise HTTPException(
+            status_code=400,
+            detail="WhatsApp rejected that template. Check the template name, language and variable count.",
+        )
 
 
 # -------------------------------------------------
