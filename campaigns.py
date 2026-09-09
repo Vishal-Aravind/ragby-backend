@@ -33,8 +33,8 @@ def _wa_integration(project_id: str) -> dict:
     campaigns.py and template_library.py both paired the merchant's
     phone_number_id/waba_id with the PLATFORM's WHATSAPP_TOKEN, so for any
     merchant on their own WABA the call either failed outright or billed the
-    wrong account. send_template_api.py:73 already had this right; this is
-    the same lookup, shared.
+    wrong account. This is the shared lookup that reads the project's own
+    token, falling back to the platform's only when it has none.
     """
     wa = supabase.table("whatsapp_integrations") \
         .select("phone_number_id, waba_id, access_token") \

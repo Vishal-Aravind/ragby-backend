@@ -31,11 +31,9 @@ from telegram import router as telegram_router
 from slack import router as slack_router
 from whatsapp import router as whatsapp_router
 from billing import router as billing_router
-from api_keys import router as api_keys_router
 from campaigns import router as campaigns_router
 from template_library import router as template_library_router
 from shop import router as shop_router
-from send_template_api import router as send_template_router
 from appointments import router as appointments_router
 from events import router as events_router
 from content_gaps import router as content_gaps_router
@@ -210,7 +208,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # routes (not subject to browser CORS at all), so it gets a real allowlist
 # instead of "*" — pure defense-in-depth, doesn't change any real traffic.
 # allow_credentials is False on both: the backend never sets cookies (auth
-# is Bearer-token/X-API-Key only), so there's no session for CORS to guard,
+# is Bearer-token only), so there's no session for CORS to guard,
 # and dropping it avoids Starlette's spec-mandated origin-reflection that
 # kicks in when "*" is combined with allow_credentials=True.
 class PathScopedCORSMiddleware:
@@ -255,11 +253,9 @@ app.include_router(billing_router)
 # unused duplicate of the Next.js routes under src/app/api/flows/, with
 # weaker authorization. The module is still imported by whatsapp.py for
 # the WhatsApp flow runtime.
-app.include_router(api_keys_router)
 app.include_router(campaigns_router)
 app.include_router(template_library_router)
 app.include_router(shop_router)
-app.include_router(send_template_router)
 app.include_router(appointments_router)
 app.include_router(events_router)
 app.include_router(content_gaps_router)
