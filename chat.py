@@ -821,7 +821,7 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
                 return _refusal
             if not phone:
                 return {"error": "Still need the customer's phone number to look up their registrations."}
-            regs = get_registrations_for_phone(project_id, phone)
+            regs = get_registrations_for_phone(project_id, phone, bot_registrable_only=True)
             if not regs:
                 return {"message": "No event registrations found for this customer."}
             return {"registrations": [_shape_registration_for_ai(r) for r in regs]}
@@ -833,7 +833,7 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
             if not phone:
                 return {"error": "Still need the customer's phone number to find their registration."}
 
-            regs = get_registrations_for_phone(project_id, phone)
+            regs = get_registrations_for_phone(project_id, phone, bot_registrable_only=True)
             if not regs:
                 return {"message": "No event registrations found for this customer."}
 

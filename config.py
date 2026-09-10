@@ -19,6 +19,13 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 
+# Lets our own Next.js routes hand us the real visitor IP for rate-limit
+# keys. Without it every anonymous caller shares one bucket, because the
+# only forwarded hop we can trust is our frontend's egress address. See
+# client_ip() in ratelimit.py. Unset means "fall back to that old
+# behaviour", so deploying before setting it changes nothing.
+INTERNAL_PROXY_SECRET = os.getenv("INTERNAL_PROXY_SECRET", "")
+
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")

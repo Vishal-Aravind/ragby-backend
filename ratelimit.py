@@ -12,12 +12,15 @@ function (one atomic upsert per check). If that call fails for any reason,
 we fall back to the old in-memory behaviour rather than letting a Supabase
 blip take down every protected endpoint — degraded limiting beats none.
 """
+import hmac
+import ipaddress
 import time
 from collections import defaultdict
 
 import sentry_sdk
 
 from clients import supabase
+from config import INTERNAL_PROXY_SECRET
 
 _hits = defaultdict(list)
 
@@ -62,16 +65,41 @@ def is_rate_limited(key: str, limit: int, window_seconds: int = 60) -> bool:
 def client_ip(request) -> str:
     """The caller's real IP, for rate-limit keys.
 
+    Two problems stacked here, and the second hid the first.
+
     Every call site used to read the FIRST X-Forwarded-For entry, which is
     supplied by the client. Render appends the real address rather than
     replacing the header, so `-H "X-Forwarded-For: 1.2.3.4"` (rotated per
     request) handed an attacker an unlimited supply of fresh buckets and
-    defeated every IP-keyed limit, including login brute-force protection.
+    defeated every IP-keyed limit. Trusting only the rightmost hop fixed
+    that — it is the one our own proxy appended.
 
-    The rightmost entry is the one our own proxy appended, so that is the
-    only value here we can trust. Assumes a single trusted proxy in front
-    of the app, which matches how this is deployed.
+    But almost every anonymous request arrives via our own Next.js routes,
+    so that rightmost hop is the FRONTEND's egress address, identical for
+    every visitor on earth. Every IP-keyed limit therefore collapsed into a
+    single global bucket: no per-attacker login throttling, and one
+    attacker able to lock out every user at once.
+
+    So the frontend now passes the visitor's address explicitly, proved by
+    a shared secret. That header is trusted only when the secret matches
+    AND the value parses as an IP — otherwise anyone who learned the
+    secret could inject unbounded junk into rate-limit keys.
+
+    With INTERNAL_PROXY_SECRET unset on either side, this falls through to
+    the rightmost-hop behaviour above and nothing changes.
     """
+    forwarded_by_us = request.headers.get("X-Visitor-IP", "")
+    if forwarded_by_us and INTERNAL_PROXY_SECRET:
+        presented = request.headers.get("X-Internal-Proxy-Secret", "")
+        if presented and hmac.compare_digest(presented, INTERNAL_PROXY_SECRET):
+            candidate = forwarded_by_us.strip()
+            try:
+                # Normalises as a side effect, so "1.2.3.4" and
+                # "::ffff:1.2.3.4" can't hold two separate buckets.
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                pass
+
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         hops = [h.strip() for h in forwarded.split(",") if h.strip()]
