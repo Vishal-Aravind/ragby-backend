@@ -1,10 +1,13 @@
 import sentry_sdk
 import hmac
 import hashlib
+import re
 import secrets
 import time
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from clients import supabase
 from oauth_state import issue_state, consume_state
@@ -16,6 +19,24 @@ from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
 
 router = APIRouter()
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+class SlackCallbackRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=512)
+    state: str = Field(..., min_length=1, max_length=256)
+
+
+def _require_uuid(project_id: str) -> str:
+    """A non-UUID used to reach Postgres and come back as a 500 carrying
+    driver detail. Same helper shape as leads.py."""
+    if not project_id or not _UUID_RE.match(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project id.")
+    return project_id
+
 
 # Short-lived, single-use CSRF nonce for the OAuth handshake — same pattern
 # as shopify_oauth.py/razorpay_oauth.py. Previously this used a bare
@@ -33,15 +54,30 @@ router = APIRouter()
 # HELPERS
 # -------------------------------------------------
 def verify_slack_signature(body: bytes, timestamp: str, signature: str) -> bool:
-    if abs(time.time() - int(timestamp)) > 300:
+    """False for anything that isn't a genuine, in-window Slack signature.
+
+    Every step here used to raise instead of refusing, turning a malformed
+    request into a 500 rather than the intended 403 — and a 500 also makes
+    Slack retry the delivery. int(timestamp) blew up on the empty-string
+    default, body.decode() on non-UTF8 bytes, and SLACK_SIGNING_SECRET.encode()
+    on an unset env var. The last one mattered most: a missing secret must
+    fail closed deliberately, not die inside the HMAC.
+    """
+    if not SLACK_SIGNING_SECRET or not timestamp or not signature:
         return False
-    sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
-    my_sig = "v0=" + hmac.new(
-        SLACK_SIGNING_SECRET.encode(),
-        sig_basestring.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(my_sig, signature)
+
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+        sig_basestring = b"v0:" + timestamp.encode() + b":" + body
+        my_sig = "v0=" + hmac.new(
+            SLACK_SIGNING_SECRET.encode(),
+            sig_basestring,
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(my_sig, signature)
+    except Exception:
+        return False
 
 def send_slack_message(access_token: str, channel: str, text: str) -> bool:
     """Returns True if Slack actually accepted the message.
@@ -74,7 +110,14 @@ def send_slack_message(access_token: str, channel: str, text: str) -> bool:
 # -------------------------------------------------
 @router.get("/slack/auth-url")
 def slack_auth_url(project_id: str, user=Depends(verify_token)):
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
+
+    # Each call writes an oauth_states row; uncapped, that's an unbounded
+    # table write driven by an authenticated user.
+    if is_rate_limited(f"slack-auth-url:{project_id}", limit=10, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a minute.")
+
     redirect_uri = f"{FRONTEND_URL}/api/slack/callback"
     scopes = "app_mentions:read,chat:write,channels:history,im:history,im:write"
     state = issue_state("slack", project_id, user.id)
@@ -89,9 +132,14 @@ def slack_auth_url(project_id: str, user=Depends(verify_token)):
 
 
 @router.post("/slack/callback")
-def slack_callback(data: dict, user=Depends(verify_token)):
-    code = data["code"]
-    state_row = consume_state("slack", data.get("state"))
+def slack_callback(data: SlackCallbackRequest, user=Depends(verify_token)):
+    # Was `data: dict` with a raw data["code"] subscript, so a body without
+    # a code was an uncaught KeyError and a 500.
+    if is_rate_limited(f"slack-callback:{user.id}", limit=10, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a minute.")
+
+    code = data.code
+    state_row = consume_state("slack", data.state)
     if not state_row:
         raise HTTPException(status_code=400, detail="This connection link expired or was already used — please try connecting again.")
     # The nonce recorded only the project before, so any member could redeem
@@ -149,9 +197,11 @@ def slack_callback(data: dict, user=Depends(verify_token)):
 
 @router.get("/slack/status/{project_id}")
 def slack_status(project_id: str, user=Depends(verify_token)):
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations")
+    # access_token deliberately absent — the frontend renders only the name.
     res = supabase.table("slack_integrations") \
-        .select("team_name, team_id") \
+        .select("team_name") \
         .eq("project_id", project_id) \
         .execute()
     if res.data:
@@ -161,6 +211,7 @@ def slack_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/slack/disconnect/{project_id}")
 def slack_disconnect(project_id: str, user=Depends(verify_token)):
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     supabase.table("slack_integrations").delete().eq("project_id", project_id).execute()
     return {"success": True}
@@ -209,25 +260,61 @@ async def slack_webhook(req: Request):
             print(f"Slack {event_type}: removed integration for team {team_id}")
         return {"status": "ok"}
 
-    if event_type != "app_mention":
+    # Direct messages. The install asks for im:history and im:write and the
+    # Integrations tab tells users they can DM the bot, but only app_mention
+    # was ever handled, so every DM was silently dropped. message.channels
+    # is still ignored — that's the duplicate of app_mention, and answering
+    # it would make the bot reply to every unrelated message in a channel.
+    is_dm = event_type == "message" and event.get("channel_type") == "im"
+    if event_type != "app_mention" and not is_dm:
         return {"status": "ignored"}
 
+    # Without these the bot answers its own DM and loops forever: Slack
+    # delivers the bot's own reply back as a message.im event. subtype
+    # covers bot_message, message_changed and message_deleted.
     if event.get("bot_id") or event.get("subtype"):
         return {"status": "ignored"}
-
-    # Belt and braces against redelivery that arrives without a retry header.
-    event_id = body.get("event_id")
-    if event_id and already_processed("slack", event_id):
-        return {"status": "duplicate_ignored"}
 
     text = event.get("text", "").strip()
     channel = event.get("channel")
     user_id = event.get("user")
     team_id = body.get("team_id")
 
-    if not text or not channel or not user_id:
+    if not text or not channel or not user_id or not team_id:
         return {"status": "ignored"}
 
+    # Two buckets, matching whatsapp.py. There was only a per-project cap
+    # before, so one abusive sender consumed the whole workspace's budget.
+    # Keyed on team_id because the project lookup happens below — which also
+    # means an unauthenticated flood is throttled before it costs a query.
+    if is_rate_limited(f"slack-in:{team_id}:{user_id}", limit=15, window_seconds=60):
+        return {"status": "rate_limited"}
+
+    if is_rate_limited(f"slack-webhook:{team_id}", limit=120, window_seconds=60):
+        return {"status": "rate_limited"}
+
+    # Dedup runs AFTER the rate limit on purpose. It used to run before, so
+    # a throttled event was still recorded as processed and Slack's
+    # redelivery of it was discarded as a duplicate — the message was lost
+    # permanently rather than merely delayed.
+    event_id = body.get("event_id")
+    if event_id and already_processed("slack", event_id):
+        return {"status": "duplicate_ignored"}
+
+    return await run_in_threadpool(
+        _process_slack_event_safe, team_id, channel, user_id, text
+    )
+
+
+def _process_slack_event(team_id: str, channel: str, user_id: str, text: str) -> dict:
+    """The slow half: DB writes, the LLM call, and the outbound send.
+
+    Runs in a worker thread. This used to sit directly inside the async
+    handler, so every Slack message froze the single event loop for the
+    duration of an LLM round trip — the dashboard, WhatsApp and Razorpay
+    webhooks all queued behind one chat message. whatsapp.py already splits
+    its webhook this way for exactly this reason.
+    """
     res = supabase.table("slack_integrations") \
         .select("project_id, access_token, bot_user_id") \
         .eq("team_id", team_id) \
@@ -245,10 +332,25 @@ async def slack_webhook(req: Request):
     access_token = row["access_token"]
     bot_user_id = row["bot_user_id"]
 
+    # The last line of defence against a DM loop: Slack echoes the bot's own
+    # message back as a message.im event, and not every one of those carries
+    # bot_id or a subtype.
+    if bot_user_id and user_id == bot_user_id:
+        return {"status": "ignored"}
+
     text = text.replace(f"<@{bot_user_id}>", "").strip()
     if not text:
         send_slack_message(access_token, channel, "👋 Yes? Ask me anything!")
         return {"status": "ok"}
+
+    # Quota check BEFORE the chats insert. It used to run after, so a
+    # workspace that was already over its monthly limit still created a new
+    # chats row for every fresh sender — unbounded table growth for messages
+    # that were never going to be answered.
+    rate_check = check_rate_limit(project_id)
+    if not rate_check["allowed"]:
+        send_slack_message(access_token, channel, "⚠️ Monthly message limit reached. Please try again next month.")
+        return {"status": "rate_limited"}
 
     chat = supabase.table("chats") \
         .select("id") \
@@ -269,16 +371,6 @@ async def slack_webhook(req: Request):
         }).execute()
         chat_id = new_chat.data[0]["id"]
 
-    # This endpoint had no per-minute cap at all — only the monthly quota —
-    # so anyone in the workspace could drain a project's whole allowance.
-    if is_rate_limited(f"slack-webhook:{project_id}", limit=20, window_seconds=60):
-        return {"status": "rate_limited"}
-
-    rate_check = check_rate_limit(project_id)
-    if not rate_check["allowed"]:
-        send_slack_message(access_token, channel, "⚠️ Monthly message limit reached. Please try again next month.")
-        return {"status": "rate_limited"}
-
     history = get_history(chat_id, limit=5)
     result = run_chat(project_id, chat_id, text, history)
     delivered = send_slack_message(access_token, channel, result["answer"])
@@ -286,3 +378,19 @@ async def slack_webhook(req: Request):
     if delivered:
         increment_usage(project_id)
     return {"status": "ok" if delivered else "send_failed"}
+
+
+def _process_slack_event_safe(team_id: str, channel: str, user_id: str, text: str) -> dict:
+    """Never let a failure become a 500.
+
+    A 500 makes Slack retry, but the event is already recorded in
+    webhook_dedup by the time we get here, so the retry is discarded as a
+    duplicate — the delivery is burned either way. Answering 200 keeps the
+    failure to one message instead of also filling the retry queue.
+    """
+    try:
+        return _process_slack_event(team_id, channel, user_id, text)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"SLACK WEBHOOK ERROR: {type(e).__name__}")
+        return {"status": "error"}

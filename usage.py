@@ -84,35 +84,32 @@ def check_rate_limit(project_id: str) -> dict:
 
 def increment_usage(project_id: str):
     try:
+        # maybe_single, not single: a webhook arriving for a project that was
+        # just deleted raised PGRST116 here, and the caller swallowed it as a
+        # generic failure.
         proj = supabase.table("projects") \
             .select("user_id") \
             .eq("id", project_id) \
-            .single() \
+            .maybe_single() \
             .execute()
 
-        if not proj.data:
+        if not proj or not proj.data:
             return
 
         user_id = proj.data["user_id"]
         month = get_current_month()
 
-        existing = supabase.table("usage") \
-            .select("id, count") \
-            .eq("user_id", user_id) \
-            .eq("month", month) \
-            .execute()
-
-        if existing.data:
-            supabase.table("usage") \
-                .update({"count": existing.data[0]["count"] + 1}) \
-                .eq("id", existing.data[0]["id"]) \
-                .execute()
-        else:
-            supabase.table("usage").insert({
-                "user_id": user_id,
-                "month": month,
-                "count": 1,
-            }).execute()
+        # One statement, evaluated by Postgres against the locked row.
+        # This was a read-then-write: two concurrent messages both read N
+        # and both wrote N+1, so we billed for fewer replies than we served.
+        # The insert branch was worse — two concurrent first-messages of a
+        # month created two usage rows, and check_rate_limit only ever reads
+        # the first, so the second accumulated invisibly and the monthly cap
+        # was undercounted for that user from then on.
+        supabase.rpc("increment_usage_atomic", {
+            "p_user_id": user_id,
+            "p_month": month,
+        }).execute()
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -127,11 +124,11 @@ def usage_status(user=Depends(verify_token)):
     profile = supabase.table("profiles") \
         .select("plan") \
         .eq("id", user_id) \
-        .single() \
+        .maybe_single() \
         .execute()
 
     plan = "free"
-    if profile.data and profile.data.get("plan"):
+    if profile and profile.data and profile.data.get("plan"):
         plan = profile.data["plan"]
 
     limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
