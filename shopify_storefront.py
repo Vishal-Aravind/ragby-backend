@@ -18,6 +18,12 @@ from ratelimit import is_rate_limited
 from config import SHOPIFY_API_VERSION
 
 
+# A cart is built on the merchant's real Shopify store from an
+# UNAUTHENTICATED widget request, so both of these need a ceiling.
+MAX_QUANTITY_PER_LINE = 100
+MAX_CART_LINES = 50
+
+
 def _storefront_graphql(shop_domain: str, storefront_token: str, query: str, variables: dict = None) -> dict:
     res = requests.post(
         f"https://{shop_domain}/api/{SHOPIFY_API_VERSION}/graphql.json",
@@ -77,6 +83,11 @@ def create_checkout_from_chat(project_id: str, chat_id: str, requested_items: li
     item_summaries = []
     total = 0.0
 
+    if not isinstance(requested_items, list):
+        raise ValueError("No valid items to check out.")
+    if len(requested_items) > MAX_CART_LINES:
+        raise ValueError(f"That's more than {MAX_CART_LINES} different items — please split the order.")
+
     for req in requested_items:
         product = find_product_by_name(project_id, req["product_name"])
         if not product:
@@ -85,7 +96,14 @@ def create_checkout_from_chat(project_id: str, chat_id: str, requested_items: li
         if not product.get("shopify_variant_id"):
             not_on_shopify.append(product["name"])
             continue
-        qty = max(1, int(req.get("quantity", 1)))
+        # Was max(1, int(...)) with no ceiling, so 999999 built an absurd
+        # cart on the merchant's real store — and int() raised on a
+        # non-numeric value, surfacing as a confusing message.
+        try:
+            qty = int(req.get("quantity", 1))
+        except (TypeError, ValueError):
+            qty = 1
+        qty = max(1, min(qty, MAX_QUANTITY_PER_LINE))
         lines.append({"merchandiseId": product["shopify_variant_id"], "quantity": qty})
         item_summaries.append(f"{product['name']} x{qty}")
         total += product["price"] * qty
@@ -110,7 +128,9 @@ def create_checkout_from_chat(project_id: str, chat_id: str, requested_items: li
     result = data["cartCreate"]
     errors = result.get("userErrors") or []
     if errors:
-        raise ValueError(f"Could not build the checkout: {'; '.join(e['message'] for e in errors)}")
+        # Shopify's userErrors text was shown verbatim to the shopper.
+        print(f"Shopify cartCreate userErrors for {integration['shop_domain']}: {errors}")
+        raise ValueError("Could not build the checkout. Please try again, or contact the store.")
 
     cart = result["cart"]
 

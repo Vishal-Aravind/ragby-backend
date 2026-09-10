@@ -288,6 +288,36 @@ def sync_single_product(project_id: str, shopify_product_gid: str, qdrant, embed
     _reindex_product_in_qdrant(project_id, source_id, product, qdrant, embeddings, collection)
 
 
+def delete_all_for_source(project_id: str, source_id: str, qdrant, collection: str):
+    """Remove an entire Shopify catalogue from the index.
+
+    Used when a merchant uninstalls the app or Shopify sends shop/redact.
+    Previously neither did any of this: the integration row was deleted but
+    every product row and vector survived, so the bot kept confidently
+    answering questions about a store it could no longer refresh — quoting
+    prices that may already have changed.
+
+    Same split as delete_product above: products are soft-deleted so past
+    orders' item snapshots still resolve, while the Qdrant points (a pure
+    RAG index) are genuinely removed so the bot stops citing them.
+    """
+    supabase.table("products") \
+        .update({"is_available": False}) \
+        .eq("project_id", project_id) \
+        .not_.is_("shopify_product_id", "null") \
+        .execute()
+
+    qdrant.delete(
+        collection_name=collection,
+        points_selector=models.Filter(
+            must=[
+                models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
+                models.FieldCondition(key="source_id", match=models.MatchValue(value=source_id)),
+            ]
+        ),
+    )
+
+
 def delete_product(project_id: str, shopify_product_gid: str, qdrant, collection: str):
     """Soft-delete: mark rows unavailable rather than hard-deleting, so past
     orders' frozen item snapshots and any in-flight cart reference still

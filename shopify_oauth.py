@@ -23,9 +23,7 @@ import hashlib
 import hmac
 import json
 import re
-import secrets
 import threading
-import time
 from urllib.parse import urlencode
 
 import requests
@@ -41,22 +39,20 @@ from auth import verify_token, require_project_access
 from shopify_client import graphql as _graphql
 from config import (
     SHOPIFY_API_KEY, SHOPIFY_API_SECRET, SHOPIFY_APP_SCOPES,
-    SHOPIFY_REDIRECT_URI, BACKEND_PUBLIC_URL,
+    SHOPIFY_REDIRECT_URI, BACKEND_PUBLIC_URL, FRONTEND_URL,
     QDRANT_COLLECTION,
 )
 
 router = APIRouter()
 
 SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*\.myshopify\.com$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
-# Short-lived CSRF nonce store for the OAuth handshake — in-memory,
-# single-process, same convention as ratelimit.py. Shopify's authorize page
-# is reachable by anyone who knows a shop domain, so (unlike Google/Slack's
-# simple state=project_id) a forged callback must not be able to attach a
-# stranger's Shopify store to the wrong project.
-
-
-
+# CSRF for the handshake lives in oauth_state.py (durable, single-use, and
+# shared with Slack/Razorpay/Google). Shopify's authorize page is reachable
+# by anyone who knows a shop domain, so a forged callback must not be able
+# to attach a stranger's store to the wrong project — hence the nonce, plus
+# the target-shop check in the callback and Shopify's own HMAC below.
 
 
 
@@ -81,7 +77,9 @@ def _popup_html(event: str, error: str = None) -> HTMLResponse:
         payload["error"] = error
     return HTMLResponse(
         f"<html><body><script>"
-        f"window.opener.postMessage({json.dumps(payload)}, '*');"
+        # Targeted rather than '*': the wildcard handed the auth result to
+        # whatever origin happened to own the opener.
+        f"window.opener.postMessage({json.dumps(payload)}, {json.dumps(FRONTEND_URL)});"
         f"window.close();"
         f"</script></body></html>"
     )
@@ -89,11 +87,13 @@ def _popup_html(event: str, error: str = None) -> HTMLResponse:
 
 def register_webhooks(shop_domain: str, access_token: str):
     """Registers the per-shop webhooks this integration relies on, plus the
-    three mandatory compliance topics — Piece 1 holds no customer PII so
-    those are a log-and-200 no-op today, but Shopify's Protected Customer
-    Data approval (needed later for Piece 2's read_orders/write_orders
-    scopes) has real calendar-time lead, so registering them now starts
-    that clock early instead of blocking Piece 2's start."""
+    three mandatory privacy topics.
+
+    Those topics are no longer a no-op: the orders/paid branch stores the
+    shopper's phone on reconciled orders, so customers/redact and shop/redact
+    genuinely delete data now (see shopify_webhooks). Shopify tests them
+    during Protected Customer Data review, which the read_orders/write_orders
+    scopes need."""
     callback_url = f"{BACKEND_PUBLIC_URL}/shopify/webhooks"
     topics = [
         "PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE", "APP_UNINSTALLED",
@@ -123,6 +123,44 @@ def register_webhooks(shop_domain: str, access_token: str):
             # surfaced to Sentry, not silently swallowed.
             sentry_sdk.capture_exception(e)
             print(f"Shopify webhook registration failed for topic={topic}, shop={shop_domain}: {e}")
+
+
+def _normalise_phone(raw) -> str:
+    """Match the shape orders.phone_number is stored in (see the orders/paid
+    branch, which strips '+' and spaces before inserting)."""
+    if not isinstance(raw, str):
+        return ""
+    return raw.replace("+", "").replace(" ", "").replace("-", "")
+
+
+def _purge_shopify_catalogue(project_id: str):
+    """Remove a project's synced Shopify catalogue and its search index.
+
+    Shared by app/uninstalled and shop/redact. Each step is independent —
+    one failing must not leave the others undone, and the caller is a
+    webhook that has to return 200 regardless or Shopify disables the
+    subscription.
+    """
+    source_res = supabase.table("data_sources") \
+        .select("id").eq("project_id", project_id).eq("type", "shopify") \
+        .limit(1).execute()
+    source_id = (source_res.data or [{}])[0].get("id")
+
+    if source_id:
+        try:
+            from sources.shopify import delete_all_for_source
+            delete_all_for_source(project_id, source_id, qdrant, QDRANT_COLLECTION)
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Shopify catalogue purge (index) failed for project {project_id}: {e}")
+
+        try:
+            # Removed so the Documents tab stops offering a source that can
+            # never sync again.
+            supabase.table("data_sources").delete().eq("id", source_id).execute()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Shopify catalogue purge (data_source) failed for project {project_id}: {e}")
 
 
 def _ensure_data_source_and_kick_off_sync(project_id: str, shop_domain: str):
@@ -238,12 +276,31 @@ def shopify_oauth_callback(request: Request):
         sentry_sdk.capture_exception(e)
         return _popup_html("ERROR", "Could not complete the Shopify connection. Please try again.")
 
-    supabase.table("shopify_integrations").upsert({
-        "project_id": project_id,
-        "shop_domain": shop_domain,
-        "access_token": access_token,
-        "scope": scope,
-    }, on_conflict="project_id").execute()
+    # shop_domain is unique (20260730120000), but this upsert arbitrates on
+    # project_id — so connecting a store already linked to ANOTHER project
+    # raised a duplicate-key error that nothing caught, and the popup
+    # rendered a 500 JSON page instead of closing. Telegram and Slack got
+    # this treatment in 892174f7; Shopify was missed.
+    try:
+        supabase.table("shopify_integrations").upsert({
+            "project_id": project_id,
+            "shop_domain": shop_domain,
+            "access_token": access_token,
+            "scope": scope,
+        }, on_conflict="project_id").execute()
+    except Exception as e:
+        message = str(e).lower()
+        if "duplicate key" in message or "23505" in message:
+            sentry_sdk.capture_message(
+                f"Shopify connect refused: {shop_domain} is already linked to another project"
+            )
+            return _popup_html(
+                "ERROR",
+                "That Shopify store is already connected to a different project. "
+                "Disconnect it there first, then try again.",
+            )
+        sentry_sdk.capture_exception(e)
+        return _popup_html("ERROR", "Could not save the Shopify connection. Please try again.")
 
     try:
         register_webhooks(shop_domain, access_token)
@@ -364,8 +421,11 @@ async def shopify_webhooks(request: Request):
     # auto-disables the webhook subscription entirely, silently breaking
     # future syncs. Only a bad signature (above) is worth a non-200.
     try:
-        integration_res = supabase.table("shopify_integrations").select("project_id").eq("shop_domain", shop_domain).maybe_single().execute()
-        integration = integration_res.data if integration_res else None
+        # limit(1) rather than maybe_single(): this sits inside the broad
+        # try below that swallows everything into a 200, so a lookup that
+        # raised would silently discard every webhook for this shop.
+        integration_res = supabase.table("shopify_integrations").select("project_id").eq("shop_domain", shop_domain).limit(1).execute()
+        integration = (integration_res.data or [None])[0]
         if not integration:
             # Shop already disconnected on our side — nothing to do.
             return {"status": "ok"}
@@ -388,6 +448,12 @@ async def shopify_webhooks(request: Request):
             delete_product(project_id, product_gid, qdrant, QDRANT_COLLECTION)
 
         elif topic == "app/uninstalled":
+            # Deleting only the integration row left every product and every
+            # Qdrant vector behind, so the bot kept answering questions about
+            # a catalogue it could no longer refresh. Purge first — the
+            # integration row is what resolved project_id above, so it goes
+            # last.
+            _purge_shopify_catalogue(project_id)
             supabase.table("shopify_integrations").delete().eq("project_id", project_id).execute()
 
         elif topic == "orders/paid":
@@ -445,10 +511,66 @@ async def shopify_webhooks(request: Request):
             # from our widget (a regular storefront sale, or the merchant's
             # own POS/admin order) — nothing for us to reconcile.
 
-        elif topic in ("customers/data_request", "customers/redact", "shop/redact"):
-            # Mandatory compliance topics — Piece 1 holds no customer PII,
-            # nothing to act on.
-            pass
+        # ---- Shopify's three mandatory privacy topics ----
+        #
+        # These used to be a single `pass`, justified by a comment saying
+        # this app holds no customer PII. That stopped being true when the
+        # orders/paid branch above started writing the shopper's phone
+        # number into orders.phone_number. Shopify tests these topics during
+        # Protected Customer Data review, which the read_orders/write_orders
+        # scopes need — a no-op would not survive it.
+
+        elif topic == "customers/redact":
+            payload = json.loads(body_bytes)
+            customer = payload.get("customer") or {}
+            phone = _normalise_phone(customer.get("phone"))
+            order_ids = [str(o) for o in (payload.get("orders_to_redact") or [])]
+
+            # Blanked rather than deleted: the merchant keeps their revenue
+            # history, the customer's contact details do not survive.
+            redacted = 0
+            if order_ids:
+                res = supabase.table("orders") \
+                    .update({"phone_number": ""}) \
+                    .eq("project_id", project_id) \
+                    .in_("shopify_order_id", order_ids) \
+                    .execute()
+                redacted = len(res.data or [])
+            elif phone:
+                # No explicit order list — fall back to matching the phone,
+                # scoped to this shop's project.
+                res = supabase.table("orders") \
+                    .update({"phone_number": ""}) \
+                    .eq("project_id", project_id) \
+                    .eq("phone_number", phone) \
+                    .not_.is_("shopify_order_id", "null") \
+                    .execute()
+                redacted = len(res.data or [])
+
+            print(f"Shopify customers/redact: cleared contact details on {redacted} order(s)")
+
+        elif topic == "shop/redact":
+            # Fires ~48h after uninstall. The durable counterpart to the
+            # app/uninstalled purge above, in case that webhook was missed.
+            _purge_shopify_catalogue(project_id)
+            supabase.table("orders") \
+                .update({"phone_number": ""}) \
+                .eq("project_id", project_id) \
+                .not_.is_("shopify_order_id", "null") \
+                .execute()
+            supabase.table("shopify_integrations").delete().eq("project_id", project_id).execute()
+            print(f"Shopify shop/redact: purged catalogue and contact details for {shop_domain}")
+
+        elif topic == "customers/data_request":
+            # No automated delivery obligation, only a response one — so
+            # this records the request where it will actually be seen rather
+            # than silently dropping it.
+            payload = json.loads(body_bytes)
+            customer = payload.get("customer") or {}
+            sentry_sdk.capture_message(
+                "Shopify customers/data_request received — respond within 30 days. "
+                f"shop={shop_domain} customer_id={customer.get('id')} project={project_id}"
+            )
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -464,11 +586,22 @@ def shopify_cart_status(chat_id: str, request: Request):
     the /public/* surface. Looks up the most recent cart this conversation
     built (there could be more than one if the shopper abandoned an earlier
     one) rather than assuming exactly one ever exists per chat."""
+    # chat_id goes straight into a uuid column, so a non-UUID was a 500
+    # rather than a miss.
+    if not _UUID_RE.match(chat_id or ""):
+        raise HTTPException(status_code=404, detail="Not found")
+
     ip = client_ip(request)
     if is_rate_limited(f"shopify-cart-status:{chat_id}:{ip}", limit=60, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many requests — please wait a moment.")
+
+    # checkout_url is deliberately NOT selected. It is a live Shopify cart
+    # link, and this endpoint is unauthenticated — anyone presenting a
+    # chat_id could read it. The widget already holds its own checkout URL
+    # from the response that created the cart; all it needs back here is
+    # whether the purchase completed.
     res = supabase.table("shopify_cart_sessions") \
-        .select("status, checkout_url, shopify_order_id") \
+        .select("status, shopify_order_id") \
         .eq("chat_id", chat_id) \
         .order("created_at", desc=True).limit(1).execute()
     row = (res.data or [None])[0]
