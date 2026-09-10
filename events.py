@@ -40,6 +40,30 @@ def _require_uuid(value: str, label: str = "id") -> str:
     return value
 
 
+def _deadline_passed(deadline) -> bool:
+    """True if this event's registration deadline is in the past.
+
+    registration_deadline is a timestamptz, so PostgREST hands it back in
+    UTC. Stripping the tzinfo makes it a naive UTC value, and it was then
+    compared against datetime.now() — the server's LOCAL clock. That is
+    only correct because the host happens to run UTC; anywhere else every
+    deadline was wrong by the UTC offset, in the direction of accepting
+    registrations after they should have closed.
+
+    An unparseable deadline is treated as "not passed": refusing every
+    registration because of one malformed field is the worse failure.
+    """
+    if not deadline:
+        return False
+    try:
+        dl = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if dl.tzinfo is not None:
+        dl = dl.replace(tzinfo=None) - dl.utcoffset()
+    return datetime.utcnow() > dl
+
+
 def _valid_phone(raw) -> Optional[str]:
     """Normalise a registration phone, or None if it can't be one.
 
@@ -281,13 +305,8 @@ def get_upcoming_events_for_ai(project_id: str) -> list:
                 pass
 
         deadline = event.get("registration_deadline")
-        if deadline:
-            try:
-                dl = datetime.fromisoformat(deadline.replace("Z", "+00:00")).replace(tzinfo=None)
-            except Exception:
-                dl = None
-            if dl and datetime.now() > dl:
-                continue
+        if _deadline_passed(deadline):
+            continue
 
         spots_left = None
         if event.get("capacity"):
@@ -425,14 +444,8 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
     if not event.get("is_active"):
         raise ValueError("Registration is closed for this event")
 
-    deadline = event.get("registration_deadline")
-    if deadline:
-        try:
-            dl = datetime.fromisoformat(deadline.replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            dl = None
-        if dl and datetime.now() > dl:
-            raise ValueError("The registration deadline for this event has passed")
+    if _deadline_passed(event.get("registration_deadline")):
+        raise ValueError("The registration deadline for this event has passed")
 
     name = data.get("name", "")
     if not isinstance(name, str) or not name.strip():
@@ -649,18 +662,7 @@ def public_event_details(event_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Registration closed")
 
     # Check registration deadline
-    deadline = event.get("registration_deadline")
-    if deadline:
-        try:
-            dl = datetime.fromisoformat(deadline.replace("Z", "+00:00")).replace(tzinfo=None)
-            if datetime.now() > dl:
-                event["registration_open"] = False
-            else:
-                event["registration_open"] = True
-        except Exception:
-            event["registration_open"] = True
-    else:
-        event["registration_open"] = True
+    event["registration_open"] = not _deadline_passed(event.get("registration_deadline"))
 
     # Check capacity
     if event.get("capacity"):
