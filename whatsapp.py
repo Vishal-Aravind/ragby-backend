@@ -62,6 +62,18 @@ def _valid_phone(raw) -> Optional[str]:
     return cleaned if _PHONE_RE.match(cleaned) else None
 
 
+def _utc_now_iso() -> str:
+    """Current time as an ISO string PostgREST will accept.
+
+    Was the literal string "now()", which Postgres cannot cast to a
+    timestamp — 'now' is valid input, 'now()' is not. Both call sites sit
+    inside try/except blocks, so the write would have failed silently and
+    the delivery failure would never have been recorded at all.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _is_duplicate_key(e: Exception) -> bool:
     """True for a unique-violation.
 
@@ -361,7 +373,7 @@ def _handle_statuses(project_id: str, statuses: list) -> None:
 
         try:
             supabase.table("chats") \
-                .update({"last_send_error": reason, "last_send_error_at": "now()"}) \
+                .update({"last_send_error": reason, "last_send_error_at": _utc_now_iso()}) \
                 .eq("project_id", project_id) \
                 .eq("external_id", recipient) \
                 .eq("channel", "whatsapp") \
@@ -1268,7 +1280,7 @@ def _send_manual_reply(project_id: str, phone_number: str, message: str) -> dict
         try:
             supabase.table("chats") \
                 .update({"last_send_error": detail[:MAX_SYNC_ERROR_LEN],
-                         "last_send_error_at": "now()"}) \
+                         "last_send_error_at": _utc_now_iso()}) \
                 .eq("id", chat_id) \
                 .execute()
         except Exception as e:
