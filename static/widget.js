@@ -45,6 +45,23 @@
   // Lead capture config (fetched from backend)
   let leadConfig = null;
 
+  // Password-protected projects mint a short-lived access token on
+  // verification. The widget had no password flow at all: it never sent a
+  // token, so a protected project answered 401 to every message and the
+  // visitor saw a generic error forever with no way to unlock. The
+  // shareable-link page has had this flow all along.
+  const ACCESS_KEY = `chat_access_${projectId}`;
+  let accessToken = null;
+  try { accessToken = localStorage.getItem(ACCESS_KEY); } catch (e) {}
+
+  function saveAccessToken(token) {
+    accessToken = token || null;
+    try {
+      if (token) localStorage.setItem(ACCESS_KEY, token);
+      else localStorage.removeItem(ACCESS_KEY);
+    } catch (e) {}
+  }
+
   const history = [];
 
   // Quotes matter as much as angle brackets here: the linkifier below puts
@@ -96,7 +113,7 @@
   async function restoreHistory() {
     if (!sessionId) return;
     try {
-      const res = await fetch(`${apiBase}/public/chat/history/${sessionId}`);
+      const res = await fetch(`${apiBase}/public/chat/history/${sessionId}?project_id=${encodeURIComponent(projectId)}`);
       const data = await res.json();
       for (const m of (data.messages || [])) {
         addMsg(m.role === "user" ? "user" : "assistant", render(m.content || ""));
@@ -201,6 +218,99 @@
   }
 
   // ---------------- LEAD FORM ----------------
+  // Password unlock. Mirrors the shareable-link page's flow: verify once,
+  // keep the returned short-lived token, replay it on every message.
+  function showPasswordForm() {
+    blockInput();
+
+    const existing = document.getElementById("pw-overlay");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "pw-overlay";
+    overlay.style.cssText = `
+      position:absolute;inset:0;
+      background:rgba(255,255,255,0.97);
+      display:flex;flex-direction:column;
+      align-items:center;justify-content:center;
+      padding:24px;z-index:10;
+    `;
+
+    overlay.innerHTML = `
+      <div style="width:100%;max-width:280px;text-align:center;">
+        <div style="font-size:22px;margin-bottom:8px;">&#128274;</div>
+        <h3 style="font-size:15px;font-weight:600;margin:0 0 6px;">This chat is protected</h3>
+        <p style="font-size:12px;color:#666;margin:0 0 18px;">Enter the password to continue.</p>
+        <div style="display:flex;flex-direction:column;gap:8px;text-align:left;">
+          <input id="pw-input" type="password" placeholder="Password" style="
+            border:1px solid #ddd;border-radius:8px;
+            padding:9px 11px;font-size:13px;outline:none;width:100%;box-sizing:border-box;
+          "/>
+          <div id="pw-error" style="display:none;color:#dc2626;font-size:11px;"></div>
+          <button id="pw-submit" style="
+            background:#111;color:#fff;border:none;border-radius:8px;
+            padding:10px;font-size:13px;font-weight:600;cursor:pointer;width:100%;
+          ">Unlock</button>
+        </div>
+      </div>
+    `;
+
+    msgs.style.position = "relative";
+    msgs.appendChild(overlay);
+
+    const input = overlay.querySelector("#pw-input");
+    const errorEl = overlay.querySelector("#pw-error");
+    const submitBtn = overlay.querySelector("#pw-submit");
+
+    input.focus();
+
+    async function submit() {
+      const password = input.value;
+      if (!password) return;
+
+      errorEl.style.display = "none";
+      submitBtn.textContent = "Checking...";
+      submitBtn.disabled = true;
+
+      try {
+        const res = await fetch(`${apiBase}/public/chat/verify-password`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId, password }),
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok || !data.accessToken) {
+          // One message for a wrong password and for a rate limit, so this
+          // is not an oracle for whether a password is set.
+          errorEl.textContent = res.status === 429
+            ? "Too many attempts. Please wait a moment."
+            : "Incorrect password.";
+          errorEl.style.display = "block";
+          submitBtn.textContent = "Unlock";
+          submitBtn.disabled = false;
+          return;
+        }
+
+        saveAccessToken(data.accessToken);
+        overlay.remove();
+        unblockInput();
+
+        const q = pendingQuestion;
+        pendingQuestion = null;
+        if (q) askBot(q);
+      } catch (e) {
+        errorEl.textContent = "Could not reach the server. Please try again.";
+        errorEl.style.display = "block";
+        submitBtn.textContent = "Unlock";
+        submitBtn.disabled = false;
+      }
+    }
+
+    submitBtn.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  }
+
   function showLeadForm() {
     awaitingLead = true;
     blockInput();
@@ -372,8 +482,19 @@
           // this, not on sessionId, so a visitor who already gave their
           // details isn't asked again when their 3-hour session rolls over.
           visitorId: userId,
+          accessToken,
         }),
       });
+
+      if (res.status === 401) {
+        // Either this project just turned on a password, or our token
+        // expired. Ask for it and retry the same question once unlocked.
+        typing.remove();
+        saveAccessToken(null);
+        pendingQuestion = question;
+        showPasswordForm();
+        return;
+      }
 
       const data = await res.json();
       typing.remove();
