@@ -1,6 +1,9 @@
+import hashlib
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clients import supabase
 from ratelimit import is_rate_limited, client_ip
@@ -127,6 +130,9 @@ _AUTH_RATE_LIMITS = {
                                 # throttled; PATCH and DELETE on a member
                                 # were unlimited, and each one changes who
                                 # can read the project's conversations.
+    "password_reset": (10, 3600),  # 10 reset requests / hour per IP. There
+                                # was no reset flow at all before, so this
+                                # limit is new alongside it.
     "storage_upload": (60, 3600),  # 60 uploads / hour per IP. /api/storage/
                                 # upload accepts documents up to 100 MB and
                                 # checked only that SOMEONE was logged in —
@@ -135,15 +141,49 @@ _AUTH_RATE_LIMITS = {
                                 # storage bill at will.
 }
 
+# Per-identifier ceilings, applied alongside the per-IP ones above. The
+# IP key alone caps one attacker hammering from one address; it does
+# nothing about many addresses converging on a single account, or about
+# using password reset to flood one person's inbox.
+_IDENTIFIER_RATE_LIMITS = {
+    "login": (10, 900),           # 10 attempts / 15 min against one account
+    "signup": (3, 3600),          # 3 signups / hour for one address
+    "password_reset": (3, 3600),  # 3 reset emails / hour to one address
+}
+
+
 class AuthRateLimitCheck(BaseModel):
     action: str
+    # The email the attempt targets. Optional so an older frontend that
+    # doesn't send it still works — it just gets IP-only limiting.
+    identifier: Optional[str] = Field(default=None, max_length=254)
+
+
+def _identifier_key(action: str, identifier: str) -> str:
+    """Hashed, so the rate_limits table never holds raw email addresses.
+
+    That table is readable by anyone with service-role access and shows up
+    in query output during debugging; there is no reason for it to be a
+    list of who has been trying to sign in.
+    """
+    digest = hashlib.sha256(identifier.strip().lower().encode()).hexdigest()[:32]
+    return f"{action}-id:{digest}"
+
 
 @router.post("/auth/rate-limit-check")
 def auth_rate_limit_check(body: AuthRateLimitCheck, request: Request):
     if body.action not in _AUTH_RATE_LIMITS:
         raise HTTPException(status_code=400, detail="Unknown action")
+
     limit, window = _AUTH_RATE_LIMITS[body.action]
     ip = client_ip(request)
     if is_rate_limited(f"{body.action}:{ip}", limit=limit, window_seconds=window):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait and try again.")
+
+    identifier = (body.identifier or "").strip()
+    if identifier and body.action in _IDENTIFIER_RATE_LIMITS:
+        id_limit, id_window = _IDENTIFIER_RATE_LIMITS[body.action]
+        if is_rate_limited(_identifier_key(body.action, identifier), limit=id_limit, window_seconds=id_window):
+            raise HTTPException(status_code=429, detail="Too many attempts — please wait and try again.")
+
     return {"allowed": True}
