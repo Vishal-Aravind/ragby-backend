@@ -1,10 +1,15 @@
 import hmac
 import hashlib
+import random
+import re
 import sentry_sdk
 import requests
 import json
+from typing import Optional
+
 from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from starlette.responses import PlainTextResponse
 
 from clients import supabase
@@ -13,6 +18,76 @@ from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOK
 from auth import verify_token, require_project_access
 
 router = APIRouter()
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+# Digits only, 8-15, matching campaigns.py. WhatsApp stores numbers without
+# a leading '+', and every write in this module normalises to that shape.
+_PHONE_RE = re.compile(r"^\d{8,15}$")
+
+# Meta's limit on a single text body. Also the bound we apply to anything
+# a merchant types, so an oversized body fails here rather than at Meta.
+MAX_TEXT_LEN = 4096
+
+# The coexistence history sync replays a merchant's existing WhatsApp
+# conversations. It is signed, so it is genuine Meta traffic, but it is
+# also unbounded: one payload can carry an arbitrary number of threads and
+# messages, each becoming a chat_messages row in a synchronous request.
+MAX_SYNC_THREADS = 200
+MAX_SYNC_MESSAGES_PER_THREAD = 500
+MAX_SYNC_CONTENT_LEN = 8000
+MAX_SYNC_ERROR_LEN = 500
+
+
+def _require_uuid(project_id: str) -> str:
+    """A non-UUID used to reach Postgres and come back as a 500 carrying
+    driver detail. Same helper shape as leads.py."""
+    if not project_id or not _UUID_RE.match(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project id.")
+    return project_id
+
+
+def _valid_phone(raw) -> Optional[str]:
+    """Normalised digits, or None if this isn't a usable WhatsApp number.
+
+    Every send path took `to` as a bare string and handed it straight to
+    Meta, so an unvalidated value became an outbound message to whatever
+    number the caller named.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = re.sub(r"[\s\-()+]", "", raw)
+    return cleaned if _PHONE_RE.match(cleaned) else None
+
+
+def _is_duplicate_key(e: Exception) -> bool:
+    """True for a unique-violation.
+
+    Was a bare `"duplicate key" in str(e).lower()`. That phrasing comes
+    from the driver, not from us — a driver upgrade or a non-English
+    locale would silently turn every redelivery back into a duplicate
+    customer reply. Check the SQLSTATE too, which is stable.
+    """
+    text = str(e).lower()
+    return "duplicate key" in text or "23505" in text
+
+
+def _maybe_prune_wa_dedup() -> None:
+    """Bound the dedup table.
+
+    It holds one row per WhatsApp message ever received and nothing has
+    ever deleted from it. Pruned opportunistically on a small fraction of
+    inserts, the same approach webhook_dedup.py uses.
+    """
+    if random.random() >= 0.01:
+        return
+    try:
+        supabase.rpc("prune_whatsapp_webhook_dedup", {}).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"whatsapp dedup prune failed: {type(e).__name__}")
 
 
 class _TimeoutSession(requests.Session):
@@ -118,6 +193,29 @@ def _save_synced_message(chat_id: str, wa_message_id, from_number: str, business
         print(f"WhatsApp synced-message save error: {e}")
 
 
+def _sync_timestamp(ts) -> Optional[str]:
+    """A synced message's created_at, or None to let the DB default.
+
+    The timestamp comes from the webhook body and was only type-checked,
+    so a synced row could be dated to 1970 or to the year 5000 — enough to
+    sit permanently at the top or bottom of every conversation view. Clamp
+    it to a sane window instead of trusting it.
+    """
+    from datetime import datetime, timezone
+    if ts is None:
+        return None
+    try:
+        parsed = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    now = datetime.now(timezone.utc)
+    # WhatsApp launched in 2009; nothing legitimate predates it, and
+    # nothing synced can be from the future.
+    if parsed.year < 2009 or parsed > now:
+        return None
+    return parsed.isoformat()
+
+
 def _handle_history_sync(project_id: str, business_phone_number: str, history_items: list):
     """One-time backfill of a client's pre-existing chat history, delivered
     in phases/chunks after initiate_coexistence_sync() requests it.
@@ -133,7 +231,9 @@ def _handle_history_sync(project_id: str, business_phone_number: str, history_it
             status = "declined" if "turned off" in title.lower() or "declined" in title.lower() else "failed"
             update = {"history_sync_status": status}
             if status == "failed":
-                update["last_sync_error"] = title or "Unknown error"
+                # Bounded. The other two writers of this column truncate to
+                # 500; this one took webhook-supplied text at any length.
+                update["last_sync_error"] = (title or "Unknown error")[:MAX_SYNC_ERROR_LEN]
             supabase.table("whatsapp_integrations").update(update).eq("project_id", project_id).execute()
             continue
 
@@ -141,25 +241,31 @@ def _handle_history_sync(project_id: str, business_phone_number: str, history_it
             .update({"history_sync_status": "in_progress"}) \
             .eq("project_id", project_id).eq("history_sync_status", "pending").execute()
 
-        for thread in item.get("threads", []):
-            contact_id = thread.get("id")
+        # Capped. This loop inserts one chat_messages row per message in a
+        # synchronous request, with no ceiling on threads or messages and
+        # every error swallowed by _save_synced_message — so a single
+        # signed payload could write an unbounded number of rows with no
+        # backpressure. The caps are generous enough for a real backfill.
+        threads = item.get("threads") or []
+        if len(threads) > MAX_SYNC_THREADS:
+            print(f"History sync for {project_id}: {len(threads)} threads, capping at {MAX_SYNC_THREADS}")
+        for thread in threads[:MAX_SYNC_THREADS]:
+            contact_id = _valid_phone(thread.get("id"))
             if not contact_id:
                 continue
             chat_id = _get_or_create_chat(project_id, contact_id)
-            for msg in thread.get("messages", []):
+            for msg in (thread.get("messages") or [])[:MAX_SYNC_MESSAGES_PER_THREAD]:
+                if not isinstance(msg, dict):
+                    continue
                 msg_type = msg.get("type", "text")
-                ts = msg.get("timestamp")
-                try:
-                    created_at = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat() if ts else None
-                except (TypeError, ValueError):
-                    created_at = None
+                created_at = _sync_timestamp(msg.get("timestamp"))
                 _save_synced_message(
                     chat_id=chat_id,
                     wa_message_id=msg.get("id"),
                     from_number=msg.get("from"),
                     business_phone_number=business_phone_number,
                     msg_type=msg_type,
-                    content=_extract_message_content(msg_type, msg),
+                    content=_extract_message_content(msg_type, msg)[:MAX_SYNC_CONTENT_LEN],
                     created_at=created_at,
                 )
 
@@ -222,6 +328,50 @@ def _handle_message_echoes(project_id: str, echoes: list, business_phone_number:
             }).eq("id", chat_id).execute()
 
 
+def _handle_statuses(project_id: str, statuses: list) -> None:
+    """Record delivery FAILURES against the conversation.
+
+    sent/delivered/read are still ignored — tracking those would mean
+    threading Meta's message id through every outbound path in campaigns,
+    flows, appointments and events. Failures are the ones that matter,
+    because nothing else in the product ever learns about them: the send
+    helpers only print the error and their callers discard the response,
+    so a message Meta refused showed in the dashboard as delivered.
+
+    The common causes are all invisible today: the number isn't on
+    WhatsApp, the template was rejected, the 24-hour customer service
+    window has closed, or Meta has flagged the number for spam.
+    """
+    for status in statuses[:50]:
+        if not isinstance(status, dict) or status.get("status") != "failed":
+            continue
+
+        recipient = _valid_phone(status.get("recipient_id"))
+        if not recipient:
+            continue
+
+        errors = status.get("errors") or []
+        first = errors[0] if errors and isinstance(errors[0], dict) else {}
+        # Meta's own wording, bounded. It is shown to the merchant, so it
+        # must not be able to grow without limit from a webhook body.
+        reason = str(first.get("title") or first.get("message") or "Delivery failed")[:MAX_SYNC_ERROR_LEN]
+        code = first.get("code")
+        if code:
+            reason = f"{reason} (Meta code {code})"
+
+        try:
+            supabase.table("chats") \
+                .update({"last_send_error": reason, "last_send_error_at": "now()"}) \
+                .eq("project_id", project_id) \
+                .eq("external_id", recipient) \
+                .eq("channel", "whatsapp") \
+                .execute()
+            print(f"WhatsApp send failed to {recipient} on {project_id}: {reason}")
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Could not record WhatsApp failure: {type(e).__name__}")
+
+
 def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_token: str):
     """Called synchronously from whatsapp_onboard right after a coexistence
     completion — Meta gives a hard 24-hour window to request both syncs or
@@ -267,6 +417,31 @@ def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_toke
 # -------------------------------------------------
 # SEND HELPERS
 # -------------------------------------------------
+def _integration_for_project(project_id: str) -> Optional[dict]:
+    """The project's own phone_number_id and access token.
+
+    access_token is preferred over the global WHATSAPP_TOKEN wherever it is
+    present. Onboarding always obtained a real per-merchant token and then
+    threw it away, so every send for every tenant went out on one shared
+    system token: a single leaked env var meant send-as-any-merchant, and a
+    merchant revoking our access had no effect at all.
+
+    Rows written before the access_token column exists fall back to the
+    global token, so a connection made earlier keeps working untouched and
+    upgrades the next time it is reconnected.
+    """
+    res = supabase.table("whatsapp_integrations") \
+        .select("phone_number_id, access_token") \
+        .eq("project_id", project_id) \
+        .limit(1) \
+        .execute()
+    return res.data[0] if res.data else None
+
+
+def _token_for(row: Optional[dict]) -> str:
+    return ((row or {}).get("access_token")) or WHATSAPP_TOKEN
+
+
 def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None):
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
@@ -426,7 +601,33 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
     dedup row and ask Meta to redeliver.
     """
     msg_type = message.get("type")
-    from_number = message["from"]
+    # Was message["from"] — an unguarded subscript on attacker-shaped (but
+    # correctly signed) data. It raised, the caller caught it, RELEASED the
+    # dedup row and returned 500, so Meta redelivered the same malformed
+    # message forever. One bad payload became a permanent retry storm.
+    from_number = message.get("from")
+    if not from_number:
+        print("WhatsApp webhook: message with no 'from', ignoring")
+        return {"status": "ignored"}
+
+    # Dedup stops REPEATS of one message; it does nothing about a flood
+    # of distinct ones. Signature verification means this needs real
+    # WhatsApp traffic, but a single hostile sender could still burn a
+    # project's whole monthly quota (and the matching OpenAI + Meta send
+    # cost) in minutes. Per-sender first, then a project-wide ceiling.
+    #
+    # These run BEFORE the dedup insert on purpose. They used to run after,
+    # and because a rate-limited message returns normally rather than
+    # raising, the dedup row survived and Meta got a 200 — so the message
+    # was never answered, never redelivered, and never even written to
+    # chat_messages. A burst did not delay messages, it deleted them.
+    # Same ordering bug telegram.py and slack.py had.
+    if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
+        print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
+        return {"status": "rate_limited"}
+    if is_rate_limited(f"wa-in:{project_id}", limit=120, window_seconds=60):
+        print(f"WhatsApp inbound rate limited (project-wide): {project_id}")
+        return {"status": "rate_limited"}
 
     # Meta redelivers a webhook at-least-once if we don't ack fast enough
     # or error transiently — without this, a redelivery re-triggers the
@@ -438,22 +639,11 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
     if wa_message_id:
         try:
             supabase.table("whatsapp_webhook_dedup").insert({"wa_message_id": wa_message_id}).execute()
+            _maybe_prune_wa_dedup()
         except Exception as e:
-            if "duplicate key" in str(e).lower():
+            if _is_duplicate_key(e):
                 return {"status": "duplicate_ignored"}
             raise
-
-    # Dedup stops REPEATS of one message; it does nothing about a flood
-    # of distinct ones. Signature verification means this needs real
-    # WhatsApp traffic, but a single hostile sender could still burn a
-    # project's whole monthly quota (and the matching OpenAI + Meta send
-    # cost) in minutes. Per-sender first, then a project-wide ceiling.
-    if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
-        print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
-        return {"status": "rate_limited"}
-    if is_rate_limited(f"wa-in:{project_id}", limit=120, window_seconds=60):
-        print(f"WhatsApp inbound rate limited (project-wide): {project_id}")
-        return {"status": "rate_limited"}
 
     # WhatsApp includes the sender's real profile name on every message —
     # previously never captured anywhere, so bookings/orders had no real
@@ -551,9 +741,6 @@ def _process_webhook(body: dict):
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
 
-        if "statuses" in value:
-            return {"status": "ignored"}
-
         # Coexistence fields (history/smb_app_state_sync/smb_message_echoes)
         # and normal inbound messages all need the same project lookup —
         # resolved once here, before branching.
@@ -564,9 +751,18 @@ def _process_webhook(body: dict):
         if not webhook_phone_number_id:
             print("WhatsApp webhook: no phone_number_id in metadata, ignoring")
             return {"status": "ignored"}
+        # Explicitly ordered and limited. This lookup decides which tenant
+        # a customer conversation belongs to, and it used to take an
+        # arbitrary res.data[0] from an unordered query — so if two rows
+        # ever shared a phone_number_id (see the onboarding race), a share
+        # of one merchant's real conversations would land in another's.
+        # The migration adds the unique index that makes this unambiguous;
+        # the ordering makes the behaviour deterministic regardless.
         res = supabase.table("whatsapp_integrations") \
-            .select("project_id, phone_number_id") \
+            .select("project_id, phone_number_id, access_token") \
             .eq("phone_number_id", webhook_phone_number_id) \
+            .order("created_at", desc=False) \
+            .limit(1) \
             .execute()
 
         if not res.data:
@@ -575,8 +771,24 @@ def _process_webhook(body: dict):
 
         project_id = res.data[0]["project_id"]
         phone_number_id = res.data[0]["phone_number_id"]
-        token = WHATSAPP_TOKEN
+        token = _token_for(res.data[0])
         business_phone_number = value.get("metadata", {}).get("display_phone_number")
+
+        # Delivery statuses used to return before this point, so a failed
+        # send — wrong number, template rejected, 24h window violation,
+        # spam block — was discarded before we even knew whose it was.
+        if "statuses" in value:
+            _handle_statuses(project_id, value.get("statuses") or [])
+            return {"status": "ok"}
+
+        # The three coexistence branches below each write rows and none of
+        # them passed through dedup or any rate limit — they bypass
+        # _process_single_message entirely. A generous per-project ceiling,
+        # since a real backfill legitimately arrives in many chunks.
+        if "history" in value or "state_sync" in value or "message_echoes" in value:
+            if is_rate_limited(f"wa-coex:{project_id}", limit=60, window_seconds=60):
+                print(f"WhatsApp coexistence sync rate limited: {project_id}")
+                return {"status": "rate_limited"}
 
         if "history" in value:
             _handle_history_sync(project_id, business_phone_number, value["history"])
@@ -623,6 +835,7 @@ def _process_webhook(body: dict):
 # -------------------------------------------------
 @router.get("/whatsapp/status/{project_id}")
 def whatsapp_status(project_id: str, user=Depends(verify_token)):
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations")
     res = supabase.table("whatsapp_integrations") \
         .select("phone_number_id, display_phone_number, waba_id") \
@@ -646,6 +859,7 @@ def whatsapp_status(project_id: str, user=Depends(verify_token)):
 
 @router.delete("/whatsapp/disconnect/{project_id}")
 def whatsapp_disconnect(project_id: str, user=Depends(verify_token)):
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
 
     # Meta's normal Deregister API does not work on a coexistence-enabled
@@ -751,7 +965,10 @@ def whatsapp_resubscribe(project_id: str, user=Depends(verify_token)):
     app for that WABA, regardless of the app-level webhook field toggles.
     New connections don't need this; it's for repairing ones made before
     the fix landed."""
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
+    if is_rate_limited(f"wa-resubscribe:{project_id}", limit=5, window_seconds=300):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes.")
     res = supabase.table("whatsapp_integrations").select("waba_id").eq("project_id", project_id).maybe_single().execute()
     waba_id = (res.data or {}).get("waba_id") if res else None
     if not waba_id:
@@ -778,13 +995,24 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
     burned through that quota after a few repair attempts. This must stay
     a deliberate, standalone action — never auto-triggered — so it's not
     accidentally called more than genuinely needed."""
+    _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
-    res = supabase.table("whatsapp_integrations").select("phone_number_id, coexistence_enabled").eq("project_id", project_id).maybe_single().execute()
+
+    # The docstring above describes a hard Meta quota per phone number that
+    # a few repeat attempts exhaust permanently, and yet nothing stopped an
+    # admin from looping this endpoint. Deliberately strict.
+    if is_rate_limited(f"wa-resync:{project_id}", limit=3, window_seconds=3600):
+        raise HTTPException(
+            status_code=429,
+            detail="Meta limits how often a number can be resynced. Please wait an hour before trying again.",
+        )
+
+    res = supabase.table("whatsapp_integrations").select("phone_number_id, coexistence_enabled, access_token").eq("project_id", project_id).maybe_single().execute()
     row = res.data if res else None
     if not row or not row.get("coexistence_enabled") or not row.get("phone_number_id"):
         raise HTTPException(status_code=400, detail="This project has no active WhatsApp Coexistence connection to resync")
 
-    initiate_coexistence_sync(project_id, row["phone_number_id"], WHATSAPP_TOKEN)
+    initiate_coexistence_sync(project_id, row["phone_number_id"], _token_for(row))
 
     # FIX: initiate_coexistence_sync() catches Meta API failures internally
     # (writes them to last_sync_error, doesn't raise) so it can always
@@ -810,7 +1038,8 @@ def whatsapp_resync(project_id: str, user=Depends(verify_token)):
 
 @router.get("/whatsapp/coexistence-status/{project_id}")
 def whatsapp_coexistence_status(project_id: str, user=Depends(verify_token)):
-    require_project_access(user.id, project_id, tab="integrations")
+    _require_uuid(project_id)
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
     res = supabase.table("whatsapp_integrations") \
         .select("coexistence_enabled, history_sync_status, history_sync_requested_at, history_sync_completed_at, last_sync_error, phone_number_id") \
         .eq("project_id", project_id).maybe_single().execute()
@@ -853,7 +1082,12 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
     # linked WABAs aren't guaranteed to show up in that generic listing, or
     # there's a propagation delay after the phone's "tap Confirm" step).
     waba_id_hint = data.get("wabaIdHint")
+    project_id = _require_uuid(project_id)
     require_project_access(user.id, project_id, tab="integrations", min_role="admin")
+
+    # Each onboard drives several outbound Meta calls and a retry loop.
+    if is_rate_limited(f"wa-onboard:{project_id}", limit=5, window_seconds=300):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a few minutes.")
 
     token_res = http.get(
         "https://graph.facebook.com/v25.0/oauth/access_token",
@@ -931,12 +1165,31 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
                 detail="This WhatsApp number is already connected to a different Zavo project. Disconnect it there first before connecting it here."
             )
 
-    supabase.table("whatsapp_integrations").upsert({
-        "project_id": project_id,
-        "phone_number_id": phone_number_id,
-        "waba_id": waba_id,
-        "display_phone_number": display_phone,
-    }, on_conflict="project_id").execute()
+    # access_token is persisted now. It was obtained above, used for the
+    # onboarding calls, and then discarded — so every runtime send for
+    # every tenant went out on the single global WHATSAPP_TOKEN. One
+    # leaked env var meant send-as-any-merchant, and a merchant revoking
+    # our access changed nothing.
+    #
+    # The conflict check above is a read-then-write and two concurrent
+    # onboards of one number both pass it. The unique index on
+    # phone_number_id added by the migration is what actually stops it;
+    # this catch turns that violation into the same 409 the check gives.
+    try:
+        supabase.table("whatsapp_integrations").upsert({
+            "project_id": project_id,
+            "phone_number_id": phone_number_id,
+            "waba_id": waba_id,
+            "display_phone_number": display_phone,
+            "access_token": access_token,
+        }, on_conflict="project_id").execute()
+    except Exception as e:
+        if _is_duplicate_key(e):
+            raise HTTPException(
+                status_code=409,
+                detail="This WhatsApp number is already connected to a different Zavo project. Disconnect it there first before connecting it here."
+            )
+        raise
 
     # Coexistence completion — request both syncs now, synchronously, not
     # via a queued job. Meta's 24-hour window to do this starts the moment
@@ -956,51 +1209,113 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
 # -------------------------------------------------
 # HUMAN REPLY ENDPOINT
 # -------------------------------------------------
-@router.post("/whatsapp/reply")
-async def whatsapp_reply(data: dict, user=Depends(verify_token)):
-    """Send a manual reply from the dashboard to a WhatsApp user."""
-    project_id  = data["project_id"]
-    phone_number = data["phone_number"]
-    message     = data["message"]
-    require_project_access(user.id, project_id, tab="integrations")
+class WhatsAppReplyRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=64)
+    phone_number: str = Field(..., min_length=1, max_length=32)
+    message: str = Field(..., min_length=1, max_length=MAX_TEXT_LEN)
 
-    # Had no rate limit and no usage accounting at all, unlike the template
-    # send path - a stolen dashboard session could loop this endpoint and
-    # send unbounded WhatsApp messages billed to us, counted against nobody.
-    if is_rate_limited(f"wa-reply:{project_id}", limit=30, window_seconds=60):
-        raise HTTPException(
-            status_code=429,
-            detail="You're sending messages too quickly. Please wait a moment.",
-        )
 
-    # Get WhatsApp integration for this project
-    res = supabase.table("whatsapp_integrations") \
-        .select("phone_number_id") \
-        .eq("project_id", project_id) \
-        .execute()
+def _send_manual_reply(project_id: str, phone_number: str, message: str) -> dict:
+    """The blocking half of a manual reply.
 
-    if not res.data:
+    Runs in a worker thread. All of this used to sit inside an async
+    handler — two Supabase round trips and a 20-second Meta POST directly
+    on the event loop — which is the exact failure the webhook was split
+    to avoid, never applied here.
+    """
+    row = _integration_for_project(project_id)
+    if not row or not row.get("phone_number_id"):
         raise HTTPException(status_code=404, detail="WhatsApp not connected")
 
-    phone_number_id = res.data[0]["phone_number_id"]
-
-    # Send message
-    send_whatsapp_message(phone_number, message, phone_number_id, WHATSAPP_TOKEN)
-
-    # Save to chat_messages so it appears in conversation
+    # The destination must already be a conversation on THIS project.
+    # Without it, any member who could reach this endpoint could send a
+    # WhatsApp message to any number in the world on the business's
+    # account — the chat was looked up only afterwards, and only to decide
+    # whether to file a transcript line.
     chat = supabase.table("chats") \
-        .select("id") \
+        .select("id, last_human_reply_at") \
         .eq("project_id", project_id) \
         .eq("external_id", phone_number) \
         .eq("channel", "whatsapp") \
         .limit(1) \
         .execute()
 
-    if chat.data:
-        supabase.table("chat_messages").insert({
-            "chat_id": chat.data[0]["id"],
-            "role": "assistant",
-            "content": f"[Human] {message}",
-        }).execute()
+    if not chat.data:
+        raise HTTPException(
+            status_code=404,
+            detail="No WhatsApp conversation with that number on this project.",
+        )
+
+    chat_id = chat.data[0]["id"]
+
+    res = send_whatsapp_message(
+        phone_number, message, row["phone_number_id"], _token_for(row)
+    )
+
+    # The result used to be discarded and the transcript written
+    # regardless, so a message Meta refused — most often because the
+    # 24-hour customer service window had closed — appeared in the
+    # dashboard as delivered, with no way for the operator to find out.
+    if res is None or not getattr(res, "ok", False):
+        detail = "WhatsApp refused the message."
+        try:
+            body = res.json() if res is not None else {}
+            meta_msg = ((body.get("error") or {}).get("message") or "")[:200]
+            if meta_msg:
+                detail = f"WhatsApp refused the message: {meta_msg}"
+        except Exception:
+            pass
+        try:
+            supabase.table("chats") \
+                .update({"last_send_error": detail[:MAX_SYNC_ERROR_LEN],
+                         "last_send_error_at": "now()"}) \
+                .eq("id", chat_id) \
+                .execute()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=502, detail=detail)
+
+    supabase.table("chat_messages").insert({
+        "chat_id": chat_id,
+        "role": "assistant",
+        "content": f"[Human] {message}",
+    }).execute()
 
     return {"status": "sent"}
+
+
+@router.post("/whatsapp/reply")
+async def whatsapp_reply(body: WhatsAppReplyRequest, user=Depends(verify_token)):
+    """Send a manual reply from the dashboard to a WhatsApp user."""
+    # Was `data: dict` with raw data["project_id"] / ["phone_number"] /
+    # ["message"] subscripts read BEFORE the auth check, so a body missing
+    # any key was a 500 reached without authorization.
+    project_id = _require_uuid(body.project_id)
+
+    # min_role="admin", matching every sibling endpoint in this file.
+    # Without it an agent who merely has the Integrations tab could send
+    # WhatsApp messages as the business.
+    require_project_access(user.id, project_id, tab="integrations", min_role="admin")
+
+    phone_number = _valid_phone(body.phone_number)
+    if not phone_number:
+        raise HTTPException(status_code=400, detail="That is not a valid WhatsApp number.")
+
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    # Keyed per user as well as per project, so one member cannot consume
+    # the whole project's reply budget and lock out their colleagues.
+    if is_rate_limited(f"wa-reply:{project_id}:{user.id}", limit=30, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="You're sending messages too quickly. Please wait a moment.",
+        )
+    if is_rate_limited(f"wa-reply:{project_id}", limit=120, window_seconds=60):
+        raise HTTPException(
+            status_code=429,
+            detail="This project is sending too many messages. Please wait a moment.",
+        )
+
+    return await run_in_threadpool(_send_manual_reply, project_id, phone_number, message)
