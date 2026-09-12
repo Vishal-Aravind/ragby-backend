@@ -354,6 +354,12 @@ def _handle_statuses(project_id: str, statuses: list) -> None:
     WhatsApp, the template was rejected, the 24-hour customer service
     window has closed, or Meta has flagged the number for spam.
     """
+    # NOT captured per status below — one webhook call can carry up to 50 of
+    # these, and a systemic cause (the chats table unreachable) fails every
+    # one of them identically. Counted instead, with a single capture_message
+    # after the loop if any failed.
+    write_failures = 0
+
     for status in statuses[:50]:
         if not isinstance(status, dict) or status.get("status") != "failed":
             continue
@@ -380,8 +386,14 @@ def _handle_statuses(project_id: str, statuses: list) -> None:
                 .execute()
             print(f"WhatsApp send failed to {recipient} on {project_id}: {reason}")
         except Exception as e:
-            sentry_sdk.capture_exception(e)
             print(f"Could not record WhatsApp failure: {type(e).__name__}")
+            write_failures += 1
+
+    if write_failures:
+        sentry_sdk.capture_message(
+            f"_handle_statuses: failed to record {write_failures} delivery failure(s) for project {project_id}",
+            level="warning",
+        )
 
 
 def initiate_coexistence_sync(project_id: str, phone_number_id: str, access_token: str):
@@ -837,8 +849,13 @@ def _process_webhook(body: dict):
         if wa_message_id:
             try:
                 supabase.table("whatsapp_webhook_dedup").delete().eq("wa_message_id", wa_message_id).execute()
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                # A DISTINCT failure from the one just captured above — if
+                # this delete itself fails, the dedup row stays stuck, so
+                # Meta's retry is wrongly treated as a duplicate and the
+                # message is dropped for good this time, with nothing
+                # telling anyone why.
+                sentry_sdk.capture_exception(cleanup_error)
         raise HTTPException(status_code=500, detail="Processing failed")
 
 
@@ -1201,6 +1218,10 @@ def whatsapp_onboard(data: dict, user=Depends(verify_token)):
                 status_code=409,
                 detail="This WhatsApp number is already connected to a different Zavo project. Disconnect it there first before connecting it here."
             )
+        # Anything else here is unrecognized, and this route has no outer
+        # handler — it propagated as an unhandled 500 on the connect flow
+        # with nothing telling Sentry.
+        sentry_sdk.capture_exception(e)
         raise
 
     # Coexistence completion — request both syncs now, synchronously, not
