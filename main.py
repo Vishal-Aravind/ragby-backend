@@ -55,6 +55,27 @@ JOB_RUN_RETENTION_DAYS = 14
 # webhook_dedup.py.
 _JOB_RUN_PRUNE_PROBABILITY = 0.02
 
+# _record_job_run is called from every scheduler tick across five jobs —
+# as often as every 30 seconds from campaign dispatch, so up to ~3,650
+# times a day. A capture_exception on every failed write here (or every
+# failed prune, gated at 2% of those same calls) could still mean dozens
+# to low hundreds of events a day if the underlying cause is persistent —
+# not a single-call loop like the others in this sweep, but a background
+# job ticking over the LIFETIME of the process. This cools each distinct
+# failure down to at most one Sentry event per hour, however often the
+# scheduler itself ticks in that window.
+_JOB_RUN_FAILURE_COOLDOWN_SECONDS = 3600
+_last_reported = {"insert": None, "prune": None}
+
+
+def _capture_with_cooldown(kind: str, e: Exception):
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    last = _last_reported.get(kind)
+    if last is None or (now - last) > timedelta(seconds=_JOB_RUN_FAILURE_COOLDOWN_SECONDS):
+        sentry_sdk.capture_exception(e)
+        _last_reported[kind] = now
+
 
 def _maybe_prune_job_runs():
     """Deletes job_runs rows past the retention window.
@@ -71,8 +92,10 @@ def _maybe_prune_job_runs():
         from clients import supabase
         cutoff = (datetime.now(timezone.utc) - timedelta(days=JOB_RUN_RETENTION_DAYS)).isoformat()
         supabase.table("job_runs").delete().lt("created_at", cutoff).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        # Silently losing this means job_runs quietly starts growing
+        # unbounded again with nothing telling anyone the prune broke.
+        _capture_with_cooldown("prune", e)
 
 
 def _record_job_run(job_name: str, started_at, status: str, detail: dict = None):
@@ -89,8 +112,12 @@ def _record_job_run(job_name: str, started_at, status: str, detail: dict = None)
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "detail": detail or {},
         }).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        # If writes here are broken, System Health silently goes blank for
+        # every job at once — worth knowing, but this function is called on
+        # every scheduler tick, so a persistent cause must not spend a
+        # Sentry event per tick.
+        _capture_with_cooldown("insert", e)
     _maybe_prune_job_runs()
 
 
@@ -161,9 +188,22 @@ def run_shopify_reconciliation():
                 if source_id:
                     sync_products(project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
             except Exception as e:
+                # NOT captured per merchant — this loop runs once every 6
+                # hours per Shopify-connected project, and a systemic cause
+                # (a Shopify API version bump, a rate limit) fails every
+                # merchant identically. Missed when this function was first
+                # hardened: only the run-level status (below) was fixed to
+                # stop reporting failure for one broken store, while this
+                # per-iteration capture kept the same quota exposure the
+                # rest of this sweep has been removing elsewhere. One
+                # capture_message after the loop reports the count instead.
                 failed_count += 1
-                sentry_sdk.capture_exception(e)
                 print(f"Scheduler: Shopify reconciliation error for project {project_id}: {e}")
+        if failed_count:
+            sentry_sdk.capture_message(
+                f"run_shopify_reconciliation: {failed_count} of {total_count} project(s) failed in one run",
+                level="warning",
+            )
         # One merchant's broken integration is not this job failing — it did
         # its work and recorded the outcome. Reporting run-level failure for
         # that meant a single permanently-broken store painted System Health
@@ -238,8 +278,10 @@ async def lifespan(app: FastAPI):
     # Shutdown scheduler on app stop
     try:
         scheduler.shutdown()
-    except Exception:
-        pass
+    except Exception as e:
+        # Fires at most once per process lifetime (on shutdown/redeploy),
+        # so there is no quota concern here — captured for completeness.
+        sentry_sdk.capture_exception(e)
 
 
 # -------------------------------------------------
