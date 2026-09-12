@@ -28,6 +28,26 @@ _hits = defaultdict(list)
 # the original unbounded version could.
 _MAX_FALLBACK_KEYS = 10000
 
+# is_rate_limited runs on nearly every request to every protected endpoint
+# in the backend — its own docstring says "call once per attempt." If the
+# check_rate_limit RPC breaks (a migration issue, a Supabase outage), a
+# direct capture_exception on every call would fire on every single
+# request across the whole app simultaneously — the highest-frequency
+# capture site of anything audited in this series, well beyond any
+# per-batch loop elsewhere. Cooled down the same way main.py's scheduler
+# infrastructure failures are: at most one Sentry event per window,
+# however often requests keep arriving in that window.
+_RATE_LIMIT_FAILURE_COOLDOWN_SECONDS = 3600
+_last_reported_at = None
+
+
+def _capture_with_cooldown(e: Exception):
+    global _last_reported_at
+    now = time.time()
+    if _last_reported_at is None or (now - _last_reported_at) > _RATE_LIMIT_FAILURE_COOLDOWN_SECONDS:
+        sentry_sdk.capture_exception(e)
+        _last_reported_at = now
+
 
 def _in_memory_is_rate_limited(key: str, limit: int, window_seconds: int) -> bool:
     now = time.time()
@@ -56,7 +76,7 @@ def is_rate_limited(key: str, limit: int, window_seconds: int = 60) -> bool:
         if res.data is not None:
             return bool(res.data)
     except Exception as e:
-        sentry_sdk.capture_exception(e)
+        _capture_with_cooldown(e)
         print(f"rate limit check failed for {key}, falling back to memory: {e}")
 
     return _in_memory_is_rate_limited(key, limit, window_seconds)
