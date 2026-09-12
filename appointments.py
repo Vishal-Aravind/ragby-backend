@@ -836,6 +836,11 @@ def create_appointment(
             raise ValueError(f"{start_time} on {appointment_date} is no longer available")
         if "settings_not_found" in message:
             raise ValueError("Appointment settings not found for this project")
+        # Neither expected case — an unrecognized failure from the core
+        # atomic-booking RPC. Both callers (the public booking route and
+        # the in-chat booking tool) only catch ValueError, so this
+        # propagated as an unhandled 500 with nothing telling Sentry.
+        sentry_sdk.capture_exception(e)
         raise
 
     appointment = booked.data[0] if isinstance(booked.data, list) else booked.data
@@ -1186,44 +1191,46 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
     Template body: Hi {{1}}! Your appointment is confirmed for {{2}} at {{3}}.
                    Reply CONFIRM to confirm or CANCEL to cancel.
     Returns True if sent successfully, False if template not approved or failed.
+
+    A request-level exception (network error, timeout) is NOT caught here —
+    it propagates to send_reminders_job's own per-appointment try/except,
+    which batches and reports once per run. This used to catch and capture
+    here too, called from inside that same per-appointment loop — up to
+    MAX_REMINDERS_PER_RUN times an hour, and worst-case ALL of them at once
+    if the cause is systemic (an expired WhatsApp token fails identically
+    for every appointment in the run).
     """
-    try:
-        res = http.post(
-            f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "messaging_product": "whatsapp",
-                "to": to,
-                "type": "template",
-                "template": {
-                    "name": "appointment_reminder",
-                    "language": {"code": "en_US"},
-                    "components": [
-                        {
-                            "type": "body",
-                            "parameters": [
-                                {"type": "text", "text": customer_name},
-                                {"type": "text", "text": date},
-                                {"type": "text", "text": time},
-                            ]
-                        }
-                    ]
-                }
+    res = http.post(
+        f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": "appointment_reminder",
+                "language": {"code": "en_US"},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": customer_name},
+                            {"type": "text", "text": date},
+                            {"type": "text", "text": time},
+                        ]
+                    }
+                ]
             }
-        )
-        if res.ok:
-            print(f"Reminder template sent to {to}")
-            return True
-        else:
-            print(f"Reminder template failed for {to}: {res.text}")
-            return False
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        print(f"Reminder template error: {e}")
-        return False
+        }
+    )
+    if res.ok:
+        print(f"Reminder template sent to {to}")
+        return True
+    print(f"Reminder template failed for {to}: {res.text}")
+    return False
 
 
 # -------------------------------------------------
@@ -1237,7 +1244,7 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
 MAX_REMINDERS_PER_RUN = 500
 
 
-def _reminder_now(tz_name: str) -> datetime:
+def _reminder_now(tz_name: str, on_invalid=None) -> datetime:
     """Local wall-clock time for a project, for deciding whether an
     appointment has entered its reminder window.
 
@@ -1246,10 +1253,18 @@ def _reminder_now(tz_name: str) -> datetime:
     utcnow() + 5:30 — hardcoded IST — even after the booking path started
     honouring appointment_settings.timezone (see create_appointment), so a
     merchant outside India got their reminders at the wrong hour.
+
+    on_invalid, if given, is called with the bad tz_name before falling
+    back. This is called once per appointment in the reminder job's loop —
+    up to MAX_REMINDERS_PER_RUN times — so the caller uses on_invalid to
+    dedupe by project and report once per run instead of capturing an
+    exception here on every single appointment a broken project has.
     """
     try:
         return datetime.now(ZoneInfo(tz_name or DEFAULT_TIMEZONE)).replace(tzinfo=None)
     except Exception:
+        if on_invalid:
+            on_invalid(tz_name)
         return datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).replace(tzinfo=None)
 
 
@@ -1261,6 +1276,11 @@ def send_reminders_job():
     """
     sent = 0
     failed = 0
+    # Deduped by project, not appended per-appointment — a project with a
+    # broken timezone setting has every one of its appointments hit this on
+    # every run, and a set means that only ever costs one entry regardless
+    # of how many appointments it has.
+    bad_timezones = set()
 
     try:
         # From yesterday onwards only. A past appointment can never enter the
@@ -1287,7 +1307,7 @@ def send_reminders_job():
                     .execute()
                 settings = (settings_res.data if settings_res else None) or {}
                 reminder_hours = settings.get("reminder_hours", 24)
-                now = _reminder_now(settings.get("timezone"))
+                now = _reminder_now(settings.get("timezone"), on_invalid=bad_timezones.add)
 
                 start_time_str = str(appt["start_time"])[:5]
                 appt_dt = datetime.strptime(f"{appt['appointment_date']} {start_time_str}", "%Y-%m-%d %H:%M")
@@ -1358,9 +1378,25 @@ def send_reminders_job():
                         sent += 1
 
             except Exception as e:
-                sentry_sdk.capture_exception(e)
+                # NOT captured per appointment — this loop runs up to
+                # MAX_REMINDERS_PER_RUN times an hour, and a systemic cause
+                # (e.g. a dead WhatsApp integration) fails identically for
+                # every appointment in the run. One capture_message below,
+                # after the loop, reports the count instead of spending one
+                # Sentry event per failure.
                 print(f"Reminder job error for appointment {appt.get('id')}: {e}")
                 failed += 1
+
+        if failed:
+            sentry_sdk.capture_message(
+                f"send_reminders_job: {failed} of {sent + failed} appointment(s) failed in one run",
+                level="warning",
+            )
+        if bad_timezones:
+            sentry_sdk.capture_message(
+                f"send_reminders_job: invalid timezone(s) fell back to default: {sorted(bad_timezones)[:10]}",
+                level="warning",
+            )
 
         print(f"Reminder job done — sent: {sent}, failed: {failed}")
 
@@ -1541,9 +1577,19 @@ def release_expired_holds():
                 supabase.table("appointments").update({"status": "expired"}).eq("id", row["id"]).eq("status", "pending_payment").execute()
                 released += 1
             except Exception as e:
-                sentry_sdk.capture_exception(e)
+                # NOT captured per row — this runs every 2 minutes (the
+                # tightest interval of any job here), so a systemic cause
+                # (e.g. the update RPC itself misbehaving) could spend up to
+                # MAX_REMINDERS_PER_RUN Sentry events every 2 minutes. One
+                # capture_message below reports the count instead.
                 print(f"Hold release error for appointment {row.get('id')}: {e}")
                 failed += 1
+
+        if failed:
+            sentry_sdk.capture_message(
+                f"release_expired_holds: {failed} of {released + failed} hold(s) failed to release in one run",
+                level="warning",
+            )
 
         print(f"Hold-expiry sweep done — released: {released}, failed: {failed}")
 
