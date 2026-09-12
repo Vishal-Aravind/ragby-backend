@@ -207,7 +207,13 @@ def _verify_chat_password(password: str, stored: str) -> bool:
             maxmem=64 * 1024 * 1024,
         )
         return hmac.compare_digest(actual, expected)
-    except Exception:
+    except Exception as e:
+        # Only reaches here on a malformed stored hash (bad base64, an
+        # unexpected scrypt parameter) — never on a simple wrong-password
+        # guess, which returns False earlier without raising. That makes
+        # this a data-integrity signal (a corrupted chat_password_hash
+        # column) rather than routine traffic, and it was silently lost.
+        sentry_sdk.capture_exception(e)
         return False
 
 
@@ -1010,11 +1016,23 @@ def run_completion(messages: list, tools: list, project_id: str, channel: str, e
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
 
+    # Counts malformed tool-call JSON across this whole completion (up to 3
+    # rounds x MAX_TOOL_CALLS_PER_ROUND each — every chat turn on every
+    # channel runs this). Reported once per call, not once per occurrence:
+    # a capture_exception inside the loop below would let one bad turn spend
+    # up to 15 events of the Sentry free-tier's monthly quota.
+    _malformed_args_count = 0
+
     for _ in range(3):
         completion = openai_client.chat.completions.create(messages=messages, **kwargs)
         msg = completion.choices[0].message
 
         if not msg.tool_calls:
+            if _malformed_args_count:
+                sentry_sdk.capture_message(
+                    f"run_completion: {_malformed_args_count} malformed tool-call argument(s) in one turn",
+                    level="warning",
+                )
             return (msg.content or "").strip()
 
         messages.append({
@@ -1035,6 +1053,7 @@ def run_completion(messages: list, tools: list, project_id: str, channel: str, e
                 # Malformed arguments used to raise here, 500ing a request
                 # the model had already been paid for. Tell the model
                 # instead, so it can correct itself within its rounds.
+                _malformed_args_count += 1
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -1047,6 +1066,12 @@ def run_completion(messages: list, tools: list, project_id: str, channel: str, e
                 "tool_call_id": tc.id,
                 "content": _truncate(_json.dumps(result), MAX_TOOL_RESULT_CHARS),
             })
+
+    if _malformed_args_count:
+        sentry_sdk.capture_message(
+            f"run_completion: {_malformed_args_count} malformed tool-call argument(s) in one turn",
+            level="warning",
+        )
 
     # Ran out of rounds — ask the model for a final plain answer, no more tools.
     completion = openai_client.chat.completions.create(
@@ -1516,8 +1541,17 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     try:
         result = run_chat(req.projectId, req.chatId, req.message, history)
     except HTTPException:
+        # Already handled and reported at its own raise site (run_chat's own
+        # try/except captures before converting to this) — capturing again
+        # here would double-count the same failure against the Sentry
+        # free-tier quota.
         raise
-    except Exception:
+    except Exception as e:
+        # Reachable only if something outside run_chat's own guarded body
+        # breaks — e.g. increment_usage itself, or a bug in this wrapper.
+        # run_chat's internal handler only captures failures that originate
+        # inside it, so this is a distinct, currently-uncaptured path.
+        sentry_sdk.capture_exception(e)
         increment_usage(req.projectId)
         raise
     increment_usage(req.projectId)
@@ -1583,10 +1617,14 @@ def public_chat_history(session_id: str, request: Request, project_id: Optional[
         if not chat.data:
             return {"messages": []}
         return {"messages": get_history(session_id, limit=30)}
-    except Exception:
-        # A malformed session_id (not a real UUID) would otherwise 500 here
-        # — fail soft into "no history" instead, since this only ever
-        # affects how much gets redrawn on screen, not anything functional.
+    except Exception as e:
+        # The UUID regex above already rejects a malformed session_id before
+        # this runs, so reaching here means something else broke — a DB
+        # timeout, a bad row — currently invisible. Still fails soft into
+        # "no history" either way, since this only ever affects how much
+        # gets redrawn on screen, not anything functional. Rate-limited to
+        # 60/min/IP just above, so this is bounded per caller.
+        sentry_sdk.capture_exception(e)
         return {"messages": []}
 
 
@@ -1772,8 +1810,14 @@ def public_chat(req: PublicChatRequest, request: Request):
     try:
         result = run_chat(req.projectId, session_id, req.message, history)
     except HTTPException:
+        # Already reported at its own raise site inside run_chat — capturing
+        # again here would double-count the same failure against quota.
         raise
-    except Exception:
+    except Exception as e:
+        # Distinct from run_chat's own internal failures, which it already
+        # captures itself before converting to HTTPException. Reachable only
+        # if something outside that guarded body breaks.
+        sentry_sdk.capture_exception(e)
         increment_usage(req.projectId)
         raise
     result["sessionId"] = session_id
