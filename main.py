@@ -45,6 +45,36 @@ from razorpay_oauth import router as razorpay_oauth_router
 # -------------------------------------------------
 # BACKGROUND SCHEDULER — appointment reminders + scheduled campaigns
 # -------------------------------------------------
+# How long a job_runs row is kept. The only reader is the admin System
+# Health tab, which shows recent runs — nothing looks further back.
+JOB_RUN_RETENTION_DAYS = 14
+
+# Chance, per write, of also running the retention delete. Campaign dispatch
+# alone writes every 30 seconds, so at 2% the sweep runs roughly hourly
+# without needing a scheduled job of its own. Same shape as the prune in
+# webhook_dedup.py.
+_JOB_RUN_PRUNE_PROBABILITY = 0.02
+
+
+def _maybe_prune_job_runs():
+    """Deletes job_runs rows past the retention window.
+
+    Nothing pruned this table. Campaign dispatch alone writes 2,880 rows a
+    day and the five jobs together about 3,650 — roughly 1.3 million rows a
+    year, kept for a tab that only ever shows the last few.
+    """
+    import random
+    if random.random() >= _JOB_RUN_PRUNE_PROBABILITY:
+        return
+    try:
+        from datetime import datetime, timezone, timedelta
+        from clients import supabase
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=JOB_RUN_RETENTION_DAYS)).isoformat()
+        supabase.table("job_runs").delete().lt("created_at", cutoff).execute()
+    except Exception:
+        pass
+
+
 def _record_job_run(job_name: str, started_at, status: str, detail: dict = None):
     """Best-effort write to job_runs, powering the admin System Health tab's
     last-run/success view. Never allowed to break the job itself — a failed
@@ -61,6 +91,7 @@ def _record_job_run(job_name: str, started_at, status: str, detail: dict = None)
         }).execute()
     except Exception:
         pass
+    _maybe_prune_job_runs()
 
 
 def run_appointment_reminders():
@@ -133,7 +164,11 @@ def run_shopify_reconciliation():
                 failed_count += 1
                 sentry_sdk.capture_exception(e)
                 print(f"Scheduler: Shopify reconciliation error for project {project_id}: {e}")
-        _record_job_run("shopify_reconciliation", started_at, "success" if failed_count == 0 else "failure",
+        # One merchant's broken integration is not this job failing — it did
+        # its work and recorded the outcome. Reporting run-level failure for
+        # that meant a single permanently-broken store painted System Health
+        # red for ever, so a real failure of the job itself became invisible.
+        _record_job_run("shopify_reconciliation", started_at, "success",
                          {"total": total_count, "failed": failed_count})
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -159,7 +194,11 @@ def run_whatsapp_sync_monitor():
             .lt("history_sync_requested_at", cutoff) \
             .execute()
         count = len(stalled.data or [])
-        _record_job_run("whatsapp_sync_monitor", started_at, "success" if count == 0 else "failure",
+        # Finding a stalled sync means the detector WORKED. Recording that as
+        # a job failure made a healthy detector indistinguishable from a
+        # broken one — the count is the signal, and the System Health tab
+        # reads it from detail.
+        _record_job_run("whatsapp_sync_monitor", started_at, "success",
                          {"stalled_count": count})
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -183,6 +222,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Scheduler failed to start: {e}")
+        # Otherwise every timed job is dead and the only trace is a line in a
+        # log nobody is reading. System Health shows a row per job, so write
+        # the failure against each one: the tab is where someone would look.
+        from datetime import datetime, timezone
+        _failed_at = datetime.now(timezone.utc)
+        for _job in ("appointment_reminders", "scheduled_campaigns",
+                     "shopify_reconciliation", "appointment_hold_release",
+                     "whatsapp_sync_monitor"):
+            _record_job_run(_job, _failed_at, "failure",
+                            {"error": f"scheduler failed to start: {e}"})
 
     yield  # app runs here
 
