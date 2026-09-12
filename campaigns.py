@@ -368,6 +368,10 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
                     "id": prior["id"], "total": prior.get("total_count", 0),
                     "status": prior.get("status"), "duplicate": True,
                 }
+        # Unrecognized — this route has no outer handler, so anything else
+        # here propagated as an unhandled 500 on campaign creation with
+        # nothing telling Sentry.
+        sentry_sdk.capture_exception(e)
         raise
 
     campaign_id = campaign_res.data[0]["id"]
@@ -473,6 +477,11 @@ def send_campaign_messages(
 
     sent = 0
     failed = 0
+    # Distinct from `failed`, which also counts routine per-recipient
+    # rejections (bad number, WhatsApp declining the send) already visible
+    # via the campaign's own failed_count column. This counts only raw
+    # exceptions, purely to size the single Sentry report below.
+    send_exceptions = 0
     token = token or WHATSAPP_TOKEN
 
     # Built once — it's identical for every recipient.
@@ -539,12 +548,26 @@ def send_campaign_messages(
                 print(f"Campaign send error to {phone}: {res.text}")
 
         except Exception as e:
-            sentry_sdk.capture_exception(e)
+            # NOT captured per recipient. A campaign can carry up to
+            # MAX_CAMPAIGN_RECIPIENTS (1,000), and a systemic cause — a
+            # revoked WhatsApp token, Meta rate-limiting the whole account —
+            # fails every one of them identically. Capturing here directly
+            # could spend a fifth of the Sentry free tier's ENTIRE monthly
+            # quota sending ONE campaign. One capture_message below, after
+            # the loop, reports the count instead.
             failed += 1
+            send_exceptions += 1
             print(f"Campaign send exception to {phone}: {e}")
 
         # Rate limiting — WhatsApp allows ~80 messages/sec on low tier
         time.sleep(0.05)
+
+    if send_exceptions:
+        sentry_sdk.capture_message(
+            f"send_campaign_messages: {send_exceptions} of {len(contacts)} send(s) raised an "
+            f"exception for campaign {campaign_id}",
+            level="warning",
+        )
 
     write_progress(status="cancelled" if stopped else "sent")
     # Tells dispatch_scheduled_campaigns whether a recurring series should
@@ -623,7 +646,20 @@ def dispatch_scheduled_campaigns():
                 wa_token = None
                 try:
                     wa_token = _wa_integration(camp["project_id"])["token"]
-                except Exception:
+                except HTTPException:
+                    # Genuinely no WhatsApp integration for this project —
+                    # _wa_integration's own documented, expected outcome.
+                    wa_token = WHATSAPP_TOKEN
+                except Exception as e:
+                    # Anything else (a DB error on the lookup itself) used to
+                    # be swallowed identically to "not connected" and fall
+                    # back to the platform's global token — silently
+                    # reintroducing the exact cross-tenant bug this
+                    # function's own docstring warns about: the campaign
+                    # would send from the wrong WhatsApp account. Single
+                    # call per campaign per tick (capped at 20 campaigns),
+                    # not a high-volume loop.
+                    sentry_sdk.capture_exception(e)
                     wa_token = WHATSAPP_TOKEN
 
                 # Direct call, not asyncio.run(). This runs on the
