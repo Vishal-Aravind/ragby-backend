@@ -128,8 +128,14 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
         supabase.table("files").delete().eq("id", file_id).execute()
         try:
             supabase.storage.from_("documents").remove([req.filePath])
-        except Exception:
-            pass
+        except Exception as e:
+            # The files row is already deleted above, so a failure here
+            # leaves the actual uploaded object orphaned in storage forever
+            # — counting against the merchant's storage usage for a
+            # document that was never processed and no longer appears
+            # anywhere in the product. Single call per over-limit attempt,
+            # not a loop.
+            sentry_sdk.capture_exception(e)
         raise HTTPException(
             status_code=403,
             detail=f"You've reached your plan's limit of {limits['documents']} documents. Delete one, or upgrade your plan, to add more.",
