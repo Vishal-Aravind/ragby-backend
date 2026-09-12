@@ -1,9 +1,11 @@
 import hashlib
 from typing import Optional
 
+import sentry_sdk
 from fastapi import APIRouter, HTTPException, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from supabase import AuthApiError
 
 from clients import supabase
 from ratelimit import is_rate_limited, client_ip
@@ -11,13 +13,36 @@ from ratelimit import is_rate_limited, client_ip
 bearer_scheme = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)):
+    """Runs on essentially every authenticated request in the backend —
+    the single highest-frequency call in the app, alongside is_rate_limited.
+
+    That frequency is exactly why the two failure modes here must be told
+    apart. AuthApiError is what Supabase's own auth API raises for a
+    token that is simply invalid, expired, or revoked — the overwhelming
+    majority of what reaches this function, since every logged-out tab,
+    every stale session, every JWT past its expiry takes this path as
+    routine, expected behaviour. Capturing that directly would spend the
+    Sentry free-tier quota on ordinary session expiry happening at the
+    highest-frequency call site in the app.
+
+    Anything else — a network failure, Supabase Auth itself down, an
+    unrecognized SDK exception — means OUR OWN auth check is broken, not
+    that the caller's token is bad. That was indistinguishable from
+    routine expiry before: every authenticated request in the product
+    would silently 401 during an outage with nothing telling anyone why.
+    """
     token = credentials.credentials
     try:
         user_response = supabase.auth.get_user(token)
         if not user_response or not user_response.user:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         return user_response.user
-    except Exception:
+    except HTTPException:
+        raise
+    except AuthApiError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
