@@ -1,4 +1,4 @@
-"""Durable, single-use OAuth state nonces shared by Slack/Shopify/Razorpay.
+"""Durable, single-use OAuth state nonces shared by Shopify/Razorpay/Google.
 
 Each provider previously kept these in a module-level dict, which broke on
 every restart (fatal on Render's free tier, which sleeps after ~15 minutes)

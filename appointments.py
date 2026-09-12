@@ -312,8 +312,8 @@ def google_auth(project_id: str, user=Depends(verify_token)):
     # and the attacker's calendar decided which slots looked free.
     #
     # Google was the only provider missed when durable state was introduced;
-    # slack.py, shopify_oauth.py and razorpay_oauth.py have all used these
-    # two helpers since. The nonce records who minted it and is single-use.
+    # shopify_oauth.py and razorpay_oauth.py have both used these two
+    # helpers since. The nonce records who minted it and is single-use.
     state = issue_state("google", project_id, user.id)
 
     auth_url = (

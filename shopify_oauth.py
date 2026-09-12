@@ -4,8 +4,7 @@
 # app (custom distribution), OAuth'd per-merchant shop domain — the same
 # shape as the Google Calendar integration in appointments.py, with one
 # difference: Shopify issues long-lived OFFLINE tokens (no refresh-token
-# dance needed), so tokens are stored directly, matching slack.py's
-# slack_integrations pattern instead.
+# dance needed), so tokens are stored directly rather than refreshed.
 #
 # The OAuth callback lands directly on this backend (not relayed through a
 # Next.js route, matching appointments.py's Google callback) and closes its
@@ -49,7 +48,7 @@ SHOP_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*\.myshopify\.com$")
 _UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 # CSRF for the handshake lives in oauth_state.py (durable, single-use, and
-# shared with Slack/Razorpay/Google). Shopify's authorize page is reachable
+# shared with Razorpay/Google). Shopify's authorize page is reachable
 # by anyone who knows a shop domain, so a forged callback must not be able
 # to attach a stranger's store to the wrong project — hence the nonce, plus
 # the target-shop check in the callback and Shopify's own HMAC below.

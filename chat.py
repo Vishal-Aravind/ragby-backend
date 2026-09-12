@@ -1160,7 +1160,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         history = history or []
 
         # Admin kill switch — every channel (public widget, WhatsApp,
-        # Telegram, Slack, in-app test chat) funnels through this function
+        # Telegram, in-app test chat) funnels through this function
         # before generating a reply, so this is the one place a suspension
         # needs to be enforced to actually stop the bot everywhere.
         project_row = supabase.table("projects").select("suspended").eq("id", project_id).maybe_single().execute()

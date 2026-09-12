@@ -46,7 +46,7 @@ def check_rate_limit(project_id: str) -> dict:
     # public_chat has already inserted the `chats` row — so a suspended
     # project's inbox could still be filled with conversations. Checked here
     # instead, which puts it ahead of every caller's own writes and covers
-    # WhatsApp, Telegram and Slack at the same time, not just the widget.
+    # WhatsApp and Telegram at the same time, not just the widget.
     if proj.data.get("suspended"):
         return {"allowed": False, "reason": "Project suspended"}
 

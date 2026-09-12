@@ -124,8 +124,7 @@ def verify_meta_signature(raw_body: bytes, signature_header: str) -> bool:
     (sha256=<hex>, HMAC-SHA256 of the raw body using the app secret).
     Without this check, anyone who learns a project's phone_number_id could
     POST a fully spoofed message that still triggers a real OpenAI-costing
-    chat reply — unlike Slack's webhook (see slack.py's
-    verify_slack_signature) and Stripe's, this one had no verification at
+    chat reply — unlike Stripe's webhook, this one had no verification at
     all. Fails closed: a missing/misconfigured secret rejects the request
     rather than silently accepting everything."""
     if not signature_header or not META_APP_SECRET:
@@ -665,7 +664,7 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
     # raising, the dedup row survived and Meta got a 200 — so the message
     # was never answered, never redelivered, and never even written to
     # chat_messages. A burst did not delay messages, it deleted them.
-    # Same ordering bug telegram.py and slack.py had.
+    # Same ordering bug telegram.py had.
     if is_rate_limited(f"wa-in:{project_id}:{from_number}", limit=15, window_seconds=60):
         print(f"WhatsApp inbound rate limited: {project_id} / {from_number}")
         return {"status": "rate_limited"}

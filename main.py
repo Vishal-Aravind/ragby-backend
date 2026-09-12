@@ -28,7 +28,6 @@ from ingest import router as ingest_router
 from source_routes import router as source_router
 from leads import router as leads_router
 from telegram import router as telegram_router
-from slack import router as slack_router
 from whatsapp import router as whatsapp_router
 from billing import router as billing_router
 from campaigns import router as campaigns_router
@@ -337,7 +336,6 @@ app.include_router(ingest_router)
 app.include_router(source_router)
 app.include_router(leads_router)
 app.include_router(telegram_router)
-app.include_router(slack_router)
 app.include_router(whatsapp_router)
 app.include_router(billing_router)
 # flows exposes no HTTP routes any more — its CRUD endpoints were an
