@@ -109,7 +109,15 @@ def _refresh_access_token(connection: dict) -> Optional[dict]:
         res.raise_for_status()
         token_data = res.json()
     except Exception as e:
-        sentry_sdk.capture_message(f"Razorpay OAuth token refresh failed for project {connection['project_id']}: {e}")
+        # capture_exception, not just capture_message: the sibling OAuth
+        # callback below does the identical requests.post + raise_for_status
+        # to the same TOKEN_URL and captures the full exception — this path
+        # was losing the stack trace and exception type for no documented
+        # reason (unlike telegram.py's send functions, which deliberately
+        # use capture_message because the bot token lives in the request
+        # URL; nothing secret is in this exception's string form).
+        sentry_sdk.capture_exception(e)
+        print(f"Razorpay OAuth token refresh failed for project {connection['project_id']}: {e}")
 
         # The refresh token rotates and is single-use. Two concurrent
         # refreshes both send the same one; the loser fails here, and if we
@@ -129,8 +137,13 @@ def _refresh_access_token(connection: dict) -> Optional[dict]:
             supabase.table("razorpay_connections").update({
                 "refresh_failed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("project_id", connection["project_id"]).execute()
-        except Exception:
-            pass
+        except Exception as e:
+            # A distinct failure from the refresh itself, just captured
+            # above. If THIS write fails, the connection is genuinely dead
+            # but nothing ever records that — /razorpay/status keeps
+            # reporting "connected" indefinitely, and the merchant has no
+            # way to find out their payment collection is silently broken.
+            sentry_sdk.capture_exception(e)
         return None
 
     _store_token_response(connection["project_id"], token_data)
