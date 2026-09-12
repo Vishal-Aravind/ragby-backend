@@ -791,7 +791,13 @@ def _candidate_webhook_secrets(project_id: str) -> list:
     try:
         config_res = supabase.table("shop_config").select("razorpay_key_secret").eq("project_id", project_id).maybe_single().execute()
         legacy_secret = ((config_res.data if config_res else None) or {}).get("razorpay_key_secret")
-    except Exception:
+    except Exception as e:
+        # A DB hiccup here silently narrows the candidate list, which can
+        # make a genuine Razorpay payment webhook fail signature
+        # verification and get rejected as unauthorized — with nothing
+        # distinguishing that from an actually-forged request. Single call
+        # per webhook delivery, not a loop.
+        sentry_sdk.capture_exception(e)
         legacy_secret = None
     # Deliberately NOT falling back to the global RAZORPAY_KEY_SECRET here.
     # As a candidate for every project it meant one shared secret could sign
@@ -918,7 +924,13 @@ async def razorpay_webhook(request: Request):
         try:
             config_res = supabase.table("shop_config").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             config = (config_res.data if config_res else None) or {}
-        except:
+        except Exception as e:
+            # Falls back to currency/store_phone defaults, so the paid
+            # confirmation below still sends — but silently, with no record
+            # that the merchant's own currency/contact settings were lost
+            # for this specific confirmation. Single call per webhook, real
+            # money already confirmed at this point.
+            sentry_sdk.capture_exception(e)
             config = {}
 
         currency = config.get("currency", "₹")
@@ -938,7 +950,12 @@ async def razorpay_webhook(request: Request):
         try:
             wa_res = supabase.table("whatsapp_integrations").select("*").eq("project_id", order["project_id"]).maybe_single().execute()
             wa_data = (wa_res.data if wa_res else None)
-        except:
+        except Exception as e:
+            # wa_data=None below skips both the customer's payment
+            # confirmation and the merchant's new-order notification — a
+            # customer who just paid gets silent nothing, and nothing here
+            # said why. Single call per webhook, not a loop.
+            sentry_sdk.capture_exception(e)
             wa_data = None
 
         if not wa_data:
