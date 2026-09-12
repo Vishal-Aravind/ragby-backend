@@ -1508,7 +1508,18 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
         raise HTTPException(status_code=429, detail=rate_check["reason"])
 
     history = get_history(req.chatId, limit=7)
-    result = run_chat(req.projectId, req.chatId, req.message, history)
+    # Billed even when the turn fails. run_chat raises HTTPException BEFORE
+    # spending anything (quota, suspension), so those stay free — but a
+    # generic failure happens after the OpenAI calls are already paid for,
+    # and skipping the increment there let a caller burn the key for free by
+    # forcing errors. See the same pattern on the public endpoint.
+    try:
+        result = run_chat(req.projectId, req.chatId, req.message, history)
+    except HTTPException:
+        raise
+    except Exception:
+        increment_usage(req.projectId)
+        raise
     increment_usage(req.projectId)
     return result
 
@@ -1698,17 +1709,22 @@ def public_chat(req: PublicChatRequest, request: Request):
     # Quota first. The chats row used to be inserted BEFORE this, so a
     # script could flood a merchant's Conversations inbox with rows for a
     # project that was over quota, suspended, or deleted.
+    #
+    # "suspended" only became part of that guarantee once check_rate_limit
+    # started reading the column: until then this comment was true of quota
+    # and deletion but not of suspension, which was checked later, inside
+    # run_chat, well after the insert below.
     rate_check = check_rate_limit(req.projectId)
     if not rate_check["allowed"]:
         # Previously always showed the "monthly limit reached" message even
         # when the real reason was "Project not found" (e.g. a stale widget
         # embed left on a merchant's site after they delete the project) —
         # genuinely confusing for whoever's staring at the chat.
-        answer = (
-            "Sorry, this assistant has reached its monthly limit. Please try again next month."
-            if rate_check.get("reason") != "Project not found"
-            else "This assistant isn't available right now."
-        )
+        reason = rate_check.get("reason")
+        if reason in ("Project not found", "Project suspended"):
+            answer = "This assistant isn't available right now."
+        else:
+            answer = "Sorry, this assistant has reached its monthly limit. Please try again next month."
         return {"answer": answer, "sessionId": session_id}
 
     allowed_channels = ("public", "shopify")
@@ -1749,7 +1765,17 @@ def public_chat(req: PublicChatRequest, request: Request):
             return gate
 
     history = get_history(session_id, limit=7) if req.sessionId else []
-    result = run_chat(req.projectId, session_id, req.message, history)
+    # Billed even when the turn fails — a generic failure inside run_chat
+    # happens after the OpenAI calls are already paid for, so not counting it
+    # let an anonymous visitor spend the key for free by forcing errors.
+    # HTTPException is raised before any spend, so those stay uncounted.
+    try:
+        result = run_chat(req.projectId, session_id, req.message, history)
+    except HTTPException:
+        raise
+    except Exception:
+        increment_usage(req.projectId)
+        raise
     result["sessionId"] = session_id
     increment_usage(req.projectId)
     return result

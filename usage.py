@@ -34,13 +34,21 @@ def check_rate_limit(project_id: str) -> dict:
     # after they delete the project) threw an unhandled 500 here, leaving
     # the widget's "..." typing indicator stuck forever with no error shown.
     proj = supabase.table("projects") \
-        .select("user_id") \
+        .select("user_id, suspended") \
         .eq("id", project_id) \
         .maybe_single() \
         .execute()
 
     if not proj or not proj.data:
         return {"allowed": False, "reason": "Project not found"}
+
+    # Suspension was only enforced deep inside run_chat, which runs AFTER
+    # public_chat has already inserted the `chats` row — so a suspended
+    # project's inbox could still be filled with conversations. Checked here
+    # instead, which puts it ahead of every caller's own writes and covers
+    # WhatsApp, Telegram and Slack at the same time, not just the widget.
+    if proj.data.get("suspended"):
+        return {"allowed": False, "reason": "Project suspended"}
 
     user_id = proj.data["user_id"]
 
