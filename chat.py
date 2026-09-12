@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 from urllib.parse import urlparse
@@ -178,11 +179,49 @@ def _origin_allowed(request, allowed_domains) -> bool:
     return False
 
 
+def _verify_chat_password(password: str, stored: str) -> bool:
+    """Verifies a chat password against its scrypt hash.
+
+    Format is `scrypt$N$r$p$salt_b64$hash_b64`, written by
+    src/lib/chat-password.js. The two must stay in step — a change to the
+    parameters there has to land here at the same time.
+
+    The password used to be stored and compared in plaintext. scrypt rather
+    than the bare SHA-256 used for api_keys, because this one is chosen by
+    a human and so needs a slow, salted KDF rather than a fast digest.
+    """
+    try:
+        parts = (stored or "").split("$")
+        if len(parts) != 6 or parts[0] != "scrypt":
+            return False
+        _, n, r, p, salt_b64, hash_b64 = parts
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        actual = hashlib.scrypt(
+            (password or "").encode(),
+            salt=salt,
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(expected),
+            maxmem=64 * 1024 * 1024,
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
 def _project_public_settings(project_id: str) -> dict:
+    # chat_password_hash is selected, not the old plaintext column, and only
+    # its presence is ever read (see the gate in public_chat). Reduced to a
+    # boolean here so the secret never sits in memory on a public request.
     res = supabase.table("projects").select(
-        "chat_enabled, chat_password, allowed_domains"
+        "chat_enabled, chat_password_hash, allowed_domains"
     ).eq("id", project_id).maybe_single().execute()
-    return (res.data if res else None) or {}
+    data = (res.data if res else None) or {}
+    if data:
+        data["has_chat_password"] = bool(data.pop("chat_password_hash", None))
+    return data
 
 
 # -------------------------------------------------
@@ -1484,13 +1523,13 @@ def verify_chat_password(req: VerifyPasswordRequest, request: Request):
     if is_rate_limited(f"pw:{req.projectId}:{ip}", limit=5, window_seconds=300):
         raise HTTPException(status_code=429, detail="Too many attempts — please wait a few minutes and try again.")
 
-    res = supabase.table("projects").select("chat_password").eq("id", req.projectId).maybe_single().execute()
+    res = supabase.table("projects").select("chat_password_hash").eq("id", req.projectId).maybe_single().execute()
     project = res.data if res else None
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    stored = project.get("chat_password") or ""
-    if not stored or not hmac.compare_digest(stored, req.password or ""):
+    stored = project.get("chat_password_hash") or ""
+    if not stored or not _verify_chat_password(req.password or "", stored):
         raise HTTPException(status_code=401, detail="Incorrect password")
 
     return {"success": True, "accessToken": _issue_chat_access_token(req.projectId)}
@@ -1638,7 +1677,7 @@ def public_chat(req: PublicChatRequest, request: Request):
             detail="This assistant isn't available on this site.",
         )
 
-    if settings.get("chat_password"):
+    if settings.get("has_chat_password"):
         if not _chat_access_token_valid(req.projectId, req.accessToken or ""):
             raise HTTPException(status_code=401, detail="This chat is password protected.")
 
