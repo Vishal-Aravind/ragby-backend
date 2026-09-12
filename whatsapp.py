@@ -293,8 +293,17 @@ def _handle_state_sync(project_id: str, state_sync_items: list):
     incrementally as they add/edit contacts. 'remove' is intentionally a
     no-op: there's no safe, obviously-correct meaning for 'delete this
     lead' just because a phone contact was removed, so existing lead data
-    is never touched on remove — only 'add' feeds upsert_contact."""
+    is never touched on remove — only 'add' feeds upsert_contact.
+
+    This is an uncapped, full phone contact-list sync — potentially
+    thousands of contacts in one call, unlike the campaign upload path's
+    1,000-recipient ceiling. upsert_contact's own default behaviour is to
+    capture a failure directly, which is right for a single inbound
+    message but not for a loop this size: a systemic cause fails every
+    contact identically. on_error routes failures here instead, counted
+    and reported once."""
     from leads import upsert_contact
+    contact_save_failures = 0
     for item in state_sync_items:
         if item.get("type") != "contact" or item.get("action") != "add":
             continue
@@ -303,7 +312,18 @@ def _handle_state_sync(project_id: str, state_sync_items: list):
         if not phone:
             continue
         name = contact.get("full_name") or contact.get("first_name")
-        upsert_contact(project_id, phone, name=name, channel="whatsapp")
+
+        def _count_failure(e):
+            nonlocal contact_save_failures
+            contact_save_failures += 1
+
+        upsert_contact(project_id, phone, name=name, channel="whatsapp", on_error=_count_failure)
+
+    if contact_save_failures:
+        sentry_sdk.capture_message(
+            f"_handle_state_sync: {contact_save_failures} contact(s) failed to save for project {project_id}",
+            level="warning",
+        )
 
 
 def _handle_message_echoes(project_id: str, echoes: list, business_phone_number: str):

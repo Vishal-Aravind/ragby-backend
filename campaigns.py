@@ -129,13 +129,28 @@ def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_con
         # Save to leads table (upsert) — happens immediately at creation
         # time even for a scheduled campaign, so they show up in Leads
         # right away rather than only once the campaign fires.
+        #
+        # upsert_contact never raises — it captures its own failures
+        # internally by default — so the try/except this used to have here
+        # was unreachable. The real exposure was inside upsert_contact
+        # itself: capturing directly on every call meant a systemic cause
+        # (the leads table down) could spend up to MAX_CAMPAIGN_RECIPIENTS
+        # (1,000) Sentry events setting up ONE CSV campaign. on_error routes
+        # failures here instead, counted and reported once.
         from leads import upsert_contact
+        contact_save_failures = 0
         for c in contacts:
-            try:
-                upsert_contact(project_id, c["phone"], c.get("name") or None, channel="whatsapp")
-            except Exception as e:
-                # One bad contact must not abort the whole campaign setup.
-                sentry_sdk.capture_exception(e)
+            def _count_failure(e):
+                nonlocal contact_save_failures
+                contact_save_failures += 1
+            upsert_contact(project_id, c["phone"], c.get("name") or None, channel="whatsapp", on_error=_count_failure)
+
+        if contact_save_failures:
+            sentry_sdk.capture_message(
+                f"resolve_contacts: {contact_save_failures} of {len(contacts)} contact(s) "
+                f"failed to save for project {project_id}",
+                level="warning",
+            )
 
         return contacts
 

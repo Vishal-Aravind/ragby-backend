@@ -252,6 +252,10 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
         # submits both see nothing and both insert. The unique index added in
         # the leads_unique_constraints migration turns the loser into this.
         if not _is_duplicate_error(e):
+            # This route has no outer handler — an unrecognized insert
+            # failure on the public, unauthenticated lead form propagated
+            # as an unhandled 500 with nothing telling Sentry.
+            sentry_sdk.capture_exception(e)
             raise
         # Whoever won may have been an upsert_contact for the same phone, so
         # try once more to claim it rather than stranding this visitor.
@@ -345,8 +349,19 @@ def update_lead_tags(lead_id: str, req: LeadTagsUpdate, user=Depends(verify_toke
 # -------------------------------------------------
 # AUTO-SAVE CONTACT (called internally)
 # -------------------------------------------------
-def upsert_contact(project_id: str, phone: str, name: str = None, channel: str = "whatsapp"):
-    """Auto-save or update a contact when they message."""
+def upsert_contact(project_id: str, phone: str, name: str = None, channel: str = "whatsapp", on_error=None):
+    """Auto-save or update a contact when they message.
+
+    on_error, if given, is called with the exception instead of this
+    function capturing it directly. Three callers share this one function:
+    a single inbound WhatsApp message (not a loop — the default direct
+    capture is correct there), a CSV campaign upload (capped at
+    MAX_CAMPAIGN_RECIPIENTS, 1,000 contacts), and a WhatsApp contact-list
+    sync (uncapped — a real phone can carry thousands). Capturing directly
+    on every call meant a systemic cause (the leads table itself down)
+    could spend one Sentry event per contact in either bulk path. The bulk
+    callers pass on_error to count failures and report once instead.
+    """
     try:
         existing = supabase.table("leads") \
             .select("id, name") \
@@ -386,5 +401,8 @@ def upsert_contact(project_id: str, phone: str, name: str = None, channel: str =
             if not _is_duplicate_error(insert_error):
                 raise
     except Exception as e:
-        sentry_sdk.capture_exception(e)
+        if on_error:
+            on_error(e)
+        else:
+            sentry_sdk.capture_exception(e)
         print(f"upsert_contact error: {e}")
