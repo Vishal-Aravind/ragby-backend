@@ -20,6 +20,7 @@
 #    upsert — a blind upsert would silently clobber merchant customization
 #    on every resync.
 
+import hashlib
 import re
 import uuid
 from datetime import datetime, timezone
@@ -172,21 +173,69 @@ def _upsert_variant_rows(project_id: str, catalog_id: str, product: dict, sort_o
         supabase.table("products").update({"is_available": False}).in_("id", stale_ids).execute()
 
 
-def _reindex_product_in_qdrant(project_id: str, source_id: str, product: dict, qdrant, embeddings, collection: str):
+def _product_text(product: dict) -> str:
+    """The exact string that gets embedded. Extracted so the change check
+    below hashes precisely what would be sent to OpenAI, rather than an
+    approximation of it that could drift out of step.
+
+    Returns "" when the product carries no real content. The old inline
+    version tested the assembled string, which is never empty — the literal
+    ". Pricing — " always survives — so a product with no title, body or
+    variants still cost an embedding call for punctuation.
+    """
+    title = (product.get("title") or "").strip()
+    body = _strip_html(product.get("descriptionHtml") or "").strip()
+    variants = (product.get("variants") or {}).get("nodes") or []
+    price_lines = ", ".join(
+        f"{v.get('title') or 'Default'}: {v.get('price')}" for v in variants[:_MAX_VARIANTS_PER_PRODUCT]
+    )
+    if not (title or body or price_lines):
+        return ""
+    return f"{title}. {body} Pricing — {price_lines}".strip()
+
+
+def _reindex_product_in_qdrant(project_id: str, source_id: str, product: dict, qdrant, embeddings, collection: str) -> bool:
+    """Re-embeds one product. Returns True if it actually spent an embedding
+    call, False if the stored copy was already current.
+
+    The reconciliation job runs every six hours and used to re-embed the
+    entire catalog each time, whether or not anything had changed — up to
+    MAX_PRODUCTS_PER_SYNC embeddings per merchant, four times a day, for
+    identical text. The cap bounded that; it did not stop it. The stored
+    point now carries a hash of the embedded text, so an unchanged product
+    costs one cheap Qdrant lookup instead of an OpenAI call.
+    """
+    text = _product_text(product)
+    if not text:
+        return False
+
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    # If a point for this product already carries this exact hash, the
+    # stored embedding is current. A failure here falls through and
+    # re-embeds: paying twice is better than serving stale product answers.
+    try:
+        existing, _ = qdrant.scroll(
+            collection_name=collection,
+            scroll_filter=models.Filter(must=[
+                models.FieldCondition(key="shopify_product_id", match=models.MatchValue(value=product["id"])),
+                models.FieldCondition(key="content_hash", match=models.MatchValue(value=content_hash)),
+            ]),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        if existing:
+            return False
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
     qdrant.delete(
         collection_name=collection,
         points_selector=models.Filter(
             must=[models.FieldCondition(key="shopify_product_id", match=models.MatchValue(value=product["id"]))]
         )
     )
-
-    variants = (product.get("variants") or {}).get("nodes") or []
-    price_lines = ", ".join(
-        f"{v.get('title') or 'Default'}: {v.get('price')}" for v in variants[:_MAX_VARIANTS_PER_PRODUCT]
-    )
-    text = f"{product['title']}. {_strip_html(product.get('descriptionHtml') or '')} Pricing — {price_lines}".strip()
-    if not text:
-        return
 
     vector = embeddings.embed_documents([text])[0]
     qdrant.upload_points(
@@ -199,10 +248,12 @@ def _reindex_product_in_qdrant(project_id: str, source_id: str, product: dict, q
                 "source_id": source_id,
                 "source_type": "shopify",
                 "shopify_product_id": product["id"],
+                "content_hash": content_hash,
                 "text": text,
             },
         )],
     )
+    return True
 
 
 # Ceiling for a single catalog sync. Each product costs one embedding
@@ -225,6 +276,7 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
         cursor = None
         sort_order = 0
         product_count = 0
+        embedded_count = 0
         truncated = False
         while True:
             data = _graphql(shop_domain, access_token, _PRODUCT_QUERY, {"cursor": cursor})
@@ -239,7 +291,8 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
                     break
 
                 _upsert_variant_rows(project_id, catalog_id, product, sort_order)
-                _reindex_product_in_qdrant(project_id, source_id, product, qdrant, embeddings, collection)
+                if _reindex_product_in_qdrant(project_id, source_id, product, qdrant, embeddings, collection):
+                    embedded_count += 1
                 # Step by the full variant cap, not a small fixed amount —
                 # a product can have up to _MAX_VARIANTS_PER_PRODUCT variants,
                 # each consuming sort_order_start + i. A small step (e.g. 10)
@@ -255,7 +308,11 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
             cursor = connection["pageInfo"]["endCursor"]
 
         _mark_sync_result(project_id, error=None)
-        return {"products_synced": product_count, "truncated": truncated}
+        return {
+            "products_synced": product_count,
+            "products_embedded": embedded_count,
+            "truncated": truncated,
+        }
     except Exception as e:
         sentry_sdk.capture_exception(e)
         _mark_sync_result(project_id, error=str(e))

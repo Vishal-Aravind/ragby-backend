@@ -1229,34 +1229,65 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
 # -------------------------------------------------
 # STANDALONE JOB — called by background scheduler in main.py
 # -------------------------------------------------
+# How many un-reminded appointments one hourly pass will look at. Without a
+# ceiling this query grew without bound: a past appointment never satisfies
+# the "0 < hours_until" window below, so it was never marked and stayed in
+# the result set for ever. The date floor in the query is the real fix for
+# that; this is the backstop.
+MAX_REMINDERS_PER_RUN = 500
+
+
+def _reminder_now(tz_name: str) -> datetime:
+    """Local wall-clock time for a project, for deciding whether an
+    appointment has entered its reminder window.
+
+    appointment_date and start_time are stored as the merchant's local wall
+    clock, so the comparison has to happen in the merchant's zone. This was
+    utcnow() + 5:30 — hardcoded IST — even after the booking path started
+    honouring appointment_settings.timezone (see create_appointment), so a
+    merchant outside India got their reminders at the wrong hour.
+    """
+    try:
+        return datetime.now(ZoneInfo(tz_name or DEFAULT_TIMEZONE)).replace(tzinfo=None)
+    except Exception:
+        return datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).replace(tzinfo=None)
+
+
 def send_reminders_job():
     """
     Called directly by APScheduler every hour.
     Same logic as the /appointments/send-reminders endpoint
     but runs internally without needing an HTTP request.
     """
-    from datetime import datetime, timedelta
-    # Same IST-vs-server-UTC fix as generate_slots/send_reminders above.
-    now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     sent = 0
     failed = 0
 
     try:
+        # From yesterday onwards only. A past appointment can never enter the
+        # reminder window, so scanning them was waste that grew for ever. One
+        # day of slack absorbs any timezone difference between the floor
+        # (computed in the default zone) and the merchant's own.
+        floor = (datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date() - timedelta(days=1)).isoformat()
+
         appts_res = supabase.table("appointments") \
-            .select("*") \
+            .select("id, project_id, appointment_date, start_time, customer_name, customer_phone, service_name") \
             .eq("status", "confirmed") \
             .eq("reminder_sent", False) \
+            .gte("appointment_date", floor) \
+            .order("appointment_date") \
+            .limit(MAX_REMINDERS_PER_RUN) \
             .execute()
 
         for appt in (appts_res.data or []):
             try:
                 settings_res = supabase.table("appointment_settings") \
-                    .select("reminder_hours") \
+                    .select("reminder_hours, timezone") \
                     .eq("project_id", appt["project_id"]) \
                     .maybe_single() \
                     .execute()
                 settings = (settings_res.data if settings_res else None) or {}
                 reminder_hours = settings.get("reminder_hours", 24)
+                now = _reminder_now(settings.get("timezone"))
 
                 start_time_str = str(appt["start_time"])[:5]
                 appt_dt = datetime.strptime(f"{appt['appointment_date']} {start_time_str}", "%Y-%m-%d %H:%M")
@@ -1264,7 +1295,7 @@ def send_reminders_job():
 
                 if 0 < hours_until <= reminder_hours:
                     wa_res = supabase.table("whatsapp_integrations") \
-                        .select("*") \
+                        .select("phone_number_id, access_token") \
                         .eq("project_id", appt["project_id"]) \
                         .maybe_single() \
                         .execute()
@@ -1273,6 +1304,29 @@ def send_reminders_job():
                     if wa_data:
                         phone_number_id = wa_data["phone_number_id"]
                         token = wa_data.get("access_token") or WHATSAPP_TOKEN
+
+                        # CLAIM BEFORE SENDING. This was select, then send,
+                        # then mark — so two overlapping runs both selected
+                        # the row, both sent a PAID WhatsApp template, and
+                        # both marked it. The customer got two reminders and
+                        # the merchant was billed twice. Render's
+                        # zero-downtime deploys overlap two instances, so
+                        # that window opens on every deploy, not only if a
+                        # worker flag is added later.
+                        #
+                        # Same conditional-update claim that
+                        # dispatch_scheduled_campaigns uses. Marking first
+                        # means a crash before the send loses a reminder
+                        # rather than duplicating a charge, which is the
+                        # right way round for something spending money.
+                        claim = supabase.table("appointments") \
+                            .update({"reminder_sent": True}) \
+                            .eq("id", appt["id"]) \
+                            .eq("reminder_sent", False) \
+                            .execute()
+                        if not claim.data:
+                            continue
+
                         date_obj = datetime.strptime(appt["appointment_date"], "%Y-%m-%d")
                         date_formatted = date_obj.strftime("%d %B %Y")
 
@@ -1301,7 +1355,6 @@ def send_reminders_job():
                                 token=token,
                             )
 
-                        supabase.table("appointments").update({"reminder_sent": True}).eq("id", appt["id"]).execute()
                         sent += 1
 
             except Exception as e:
@@ -1472,10 +1525,15 @@ def release_expired_holds():
     released = 0
     failed = 0
     try:
+        # Bounded like the reminder sweep. This one runs every two minutes,
+        # so a backlog drains quickly; the cap only stops a single pass
+        # loading an unbounded result set.
         expired_res = supabase.table("appointments") \
             .select("id") \
             .eq("status", "pending_payment") \
             .lt("hold_expires_at", now_iso) \
+            .order("hold_expires_at") \
+            .limit(MAX_REMINDERS_PER_RUN) \
             .execute()
 
         for row in (expired_res.data or []):
