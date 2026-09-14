@@ -137,7 +137,7 @@ def add_source(data: dict, user=Depends(verify_token)):
                 max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
             if result["pages_indexed"] == 0:
-                raise ValueError("Could not crawl this website. It may be blocking automated access.")
+                raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
 
         elif data["type"] == "shopify":
             # In practice this data_sources row is usually created by the
@@ -242,7 +242,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
                 max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
             if result["pages_indexed"] == 0:
-                raise ValueError("Could not crawl this website. It may be blocking automated access.")
+                raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
 
         elif s["type"] == "shopify":
             sync_shopify_products(

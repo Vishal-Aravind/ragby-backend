@@ -66,22 +66,25 @@ def is_public_http_url(url: str) -> bool:
         return False
 
 
-def safe_get(session, url: str, max_redirects: int = 5, timeout: int = 30):
+def safe_get(session, url: str, max_redirects: int = 5, timeout=30, **kwargs):
     """GET a URL, validating EVERY hop instead of only the first.
 
     Validating just the entered URL is not enough on its own: a public
     address that 302s to an internal one passes the front-door check and
     then fetches the internal resource anyway. Redirects are disabled and
     followed manually so each destination is re-validated before we go
-    there."""
+    there. Extra kwargs (e.g. stream=True) go straight to session.get."""
     current = url
     for _ in range(max_redirects + 1):
         assert_public_http_url(current)
-        res = session.get(current, allow_redirects=False, timeout=timeout)
+        res = session.get(current, allow_redirects=False, timeout=timeout, **kwargs)
         if res.status_code not in (301, 302, 303, 307, 308):
             return res
         location = res.headers.get("Location")
         if not location:
             return res
+        # With stream=True an unread redirect response keeps its pooled
+        # connection checked out until garbage collection.
+        res.close()
         current = urljoin(current, location)
     raise ValueError("That link redirected too many times.")
