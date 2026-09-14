@@ -139,4 +139,23 @@ MAX_CAMPAIGN_RECIPIENTS = 1000
 # messages, so this is deliberately per-hour, not per-minute.
 MAX_CAMPAIGNS_PER_HOUR = 10
 
-assert QDRANT_URL and QDRANT_API_KEY and QDRANT_COLLECTION
+# Fail fast at boot, not on the first real request. Limited to vars that
+# every request path needs regardless of which channel/feature a merchant
+# uses (DB, embeddings, vector store) — WhatsApp/Telegram/Shopify/Razorpay
+# credentials are deliberately excluded, since those are per-feature and
+# already degrade gracefully (e.g. a merchant simply can't connect that
+# channel) rather than breaking the whole app.
+_REQUIRED_ENV_VARS = {
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "QDRANT_URL": QDRANT_URL,
+    "QDRANT_API_KEY": QDRANT_API_KEY,
+    "QDRANT_COLLECTION": QDRANT_COLLECTION,
+}
+_missing_env_vars = [name for name, value in _REQUIRED_ENV_VARS.items() if not value]
+if _missing_env_vars:
+    raise RuntimeError(
+        f"Missing required environment variable(s): {', '.join(_missing_env_vars)}. "
+        "Set them before starting the app."
+    )
