@@ -20,6 +20,14 @@ if SENTRY_DSN:
         traces_sample_rate=0.1,
         send_default_pii=False,
     )
+else:
+    # Say so out loud. Every capture_exception() in this codebase is a
+    # silent no-op without init(), so an unset DSN doesn't degrade error
+    # reporting — it removes it entirely, with no symptom to notice.
+    print(
+        "WARNING: SENTRY_DSN is not set - exception logging is DISABLED. "
+        "Errors will not be reported anywhere."
+    )
 
 # Import all routers
 from usage import router as usage_router
