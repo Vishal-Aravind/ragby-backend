@@ -1,5 +1,7 @@
 import io
+import time
 import uuid
+from typing import Optional
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
@@ -41,6 +43,14 @@ class IngestRequest(BaseModel):
     projectId: str
     filename: str
     filePath: str
+    # The object's size as Supabase's own Storage metadata API reported it,
+    # moments before this call. Re-saving a note overwrites the SAME storage
+    # key, and a download immediately after that overwrite can race ahead of
+    # it and return the PREVIOUS version's bytes — silently embedding stale
+    # content into a freshly-created, otherwise-successful-looking Qdrant
+    # point. Optional so an older frontend build that doesn't send it still
+    # works, just without this protection.
+    expectedBytes: Optional[int] = None
 
 
 # -------------------------------------------------
@@ -155,6 +165,22 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
     # reason recorded and an unhandled 500 to the caller.
     try:
         b = supabase.storage.from_("documents").download(req.filePath)
+        # A handful of quick retries if the download doesn't yet match the
+        # size Storage itself just reported — an overwrite hadn't finished
+        # propagating to whatever replica/cache served this read. Short,
+        # bounded backoff: this is a race measured in tens to hundreds of
+        # milliseconds, not a real outage worth waiting seconds for.
+        if req.expectedBytes is not None:
+            attempts = 0
+            while len(b) != req.expectedBytes and attempts < 4:
+                time.sleep(0.3 * (attempts + 1))
+                b = supabase.storage.from_("documents").download(req.filePath)
+                attempts += 1
+            if len(b) != req.expectedBytes:
+                print(
+                    f"ingest: downloaded {len(b)} bytes for file {file_id}, "
+                    f"expected {req.expectedBytes}, after {attempts} retries — proceeding anyway"
+                )
     except HTTPException:
         raise
     except Exception as e:
