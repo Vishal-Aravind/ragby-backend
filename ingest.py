@@ -155,11 +155,38 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
     # reason recorded and an unhandled 500 to the caller.
     try:
         b = supabase.storage.from_("documents").download(req.filePath)
+    except HTTPException:
+        raise
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"ingest download failed for file {file_id}: {e}")
+        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't process that file. Please try uploading it again.",
+        )
 
+    # A renamed .zip/.exe/whatever-to-.pdf, or any genuinely corrupt file,
+    # fails HERE — inside the parsing library, not our infrastructure. That
+    # used to fall into the same catch-all below as an OpenAI/Qdrant/Supabase
+    # outage: same 502, same Sentry alert, same generic message, even though
+    # this is routine bad user input and happens constantly, not a bug to
+    # page anyone about.
+    try:
+        pages = extractor(b)
+    except Exception as e:
+        print(f"extraction failed for file {file_id} ({ext}): {e}")
+        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
+        raise HTTPException(
+            status_code=400,
+            detail=f"This doesn't look like a valid .{ext} file. It may be corrupted, password-protected, or renamed from a different file type.",
+        )
+
+    try:
         splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks, metas = [], []
 
-        for page, text in extractor(b):
+        for page, text in pages:
             for c in splitter.split_text(text):
                 chunks.append(c)
                 metas.append({
