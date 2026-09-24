@@ -1,13 +1,28 @@
-from qdrant_client import QdrantClient, models
+"""Delete every vector in the Qdrant collection. Run manually, never imported.
 
-qdrant = QdrantClient(
-    url="https://5b7d6025-1177-4768-9528-4f2956029865.eu-west-2-0.aws.cloud.qdrant.io",  # 👈 from dashboard
-    api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.131SJphdYAMmXbolnaxysNpOkIL8CEgRyCuEpCanLvs",                     # 👈 from dashboard
-)
+Was hardcoding a live Qdrant URL and API key directly in this file, committed
+to git — anyone with repo access (now or from git history, since the key
+stays recoverable even after this fix) could read or wipe the vector store
+with it. Reads from config.py like every other client in this codebase, and
+that key should be treated as already compromised: rotate it in Qdrant's
+dashboard regardless of this fix.
 
-qdrant.delete(
-    collection_name="documents",
-    points_selector=models.Filter(must=[])
-)
+This deletes ALL projects' vectors, not one. There is no per-project undo.
+"""
+from clients import qdrant
+from config import QDRANT_COLLECTION
+from qdrant_client import models
 
-print("✅ All points deleted")
+if __name__ == "__main__":
+    confirm = input(
+        f"This deletes every vector in '{QDRANT_COLLECTION}', across ALL projects. "
+        f"Type the collection name to confirm: "
+    )
+    if confirm != QDRANT_COLLECTION:
+        print("Aborted — input did not match.")
+    else:
+        qdrant.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=models.Filter(must=[]),
+        )
+        print(f"All points deleted from '{QDRANT_COLLECTION}'.")
