@@ -165,14 +165,17 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
     # reason recorded and an unhandled 500 to the caller.
     try:
         b = supabase.storage.from_("documents").download(req.filePath)
-        # A handful of quick retries if the download doesn't yet match the
-        # size Storage itself just reported — an overwrite hadn't finished
-        # propagating to whatever replica/cache served this read. Short,
-        # bounded backoff: this is a race measured in tens to hundreds of
-        # milliseconds, not a real outage worth waiting seconds for.
+        # A handful of retries if the download doesn't yet match the size
+        # the BROWSER'S OWN File object reported before it ever uploaded
+        # anything — deliberately not a re-query of Storage's own metadata,
+        # which is subject to the exact same overwrite-propagation lag as
+        # this download and so isn't a trustworthy reference point either.
+        # Bounded backoff, ~7.5s worst case: this is a race measured in
+        # well under a second normally, not a real outage worth blocking
+        # much longer for.
         if req.expectedBytes is not None:
             attempts = 0
-            while len(b) != req.expectedBytes and attempts < 4:
+            while len(b) != req.expectedBytes and attempts < 6:
                 time.sleep(0.3 * (attempts + 1))
                 b = supabase.storage.from_("documents").download(req.filePath)
                 attempts += 1
