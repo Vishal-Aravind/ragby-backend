@@ -84,8 +84,21 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
     all_metas = []
     skipped = []
     synced = []
+    # Tabs never even attempted because an earlier tab already hit the row
+    # cap — distinct from `skipped`, which means a tab failed to fetch. The
+    # old code only checked the cap at the BOTTOM of this loop, so if tab 1
+    # alone exceeded it, tabs 2+ were dropped by `break` with no record of
+    # them anywhere, not even here. Checking at the top instead means every
+    # remaining requested tab is accounted for one way or another.
+    capped_tabs = []
+    truncated = False
 
     for tab in tabs_to_read:
+        if len(all_chunks) >= MAX_SHEET_ROWS:
+            capped_tabs.append(tab if tab is not None else "default")
+            truncated = True
+            continue
+
         if tab is None:
             url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
             try:
@@ -122,13 +135,16 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
 
         synced.append(tab_label)
 
-        # Stop reading once we hit the ceiling rather than embedding an
-        # unbounded number of rows on our own OpenAI key.
-        if len(all_chunks) >= MAX_SHEET_ROWS:
+        # Truncate THIS tab's rows if it alone pushed past the ceiling,
+        # rather than embedding an unbounded number of rows on our own
+        # OpenAI key. Any tabs still left in tabs_to_read are caught by the
+        # check at the top of the next iteration — no `break` here, so they
+        # end up recorded in capped_tabs instead of silently vanishing.
+        if len(all_chunks) > MAX_SHEET_ROWS:
             print(f"sheet {sheet_id} truncated at {MAX_SHEET_ROWS} rows")
             all_chunks = all_chunks[:MAX_SHEET_ROWS]
             all_metas = all_metas[:MAX_SHEET_ROWS]
-            break
+            truncated = True
 
     # Previously this returned successfully, so a private/deleted/unreachable
     # sheet was saved as a "connected" source with nothing behind it — the
@@ -166,5 +182,11 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
         ]
     )
 
-    print(f"Synced {len(all_chunks)} rows from tabs: {synced}, skipped: {skipped}")
-    return {"synced_tabs": synced, "skipped_tabs": skipped}
+    print(f"Synced {len(all_chunks)} rows from tabs: {synced}, skipped: {skipped}, capped: {capped_tabs}")
+    return {
+        "synced_tabs": synced,
+        "skipped_tabs": skipped,
+        "capped_tabs": capped_tabs,
+        "indexed_count": len(all_chunks),
+        "truncated": truncated,
+    }

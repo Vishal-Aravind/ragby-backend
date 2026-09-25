@@ -267,7 +267,7 @@ def sync_website(
 
     if not pages:
         print("No content found.")
-        return {"pages_indexed": 0, "chunks_indexed": 0}
+        return {"pages_indexed": 0, "chunks_indexed": 0, "truncated": False}
 
     # FIX: larger chunk size for website content
     # 2000 chars ≈ half the chunks vs 1000, better for long-form articles
@@ -288,11 +288,13 @@ def sync_website(
             })
 
     if not all_chunks:
-        return {"pages_indexed": len(pages), "chunks_indexed": 0}
+        return {"pages_indexed": len(pages), "chunks_indexed": 0, "truncated": False}
 
     # One unbounded embed call for a large documentation site is an
     # unbounded bill on our own OpenAI key.
-    if len(all_chunks) > MAX_CHUNKS_PER_INGEST:
+    total_found = len(all_chunks)
+    truncated = total_found > MAX_CHUNKS_PER_INGEST
+    if truncated:
         print(f"website {url} truncated to {MAX_CHUNKS_PER_INGEST} chunks")
         all_chunks = all_chunks[:MAX_CHUNKS_PER_INGEST]
         all_metas = all_metas[:MAX_CHUNKS_PER_INGEST]
@@ -322,4 +324,10 @@ def sync_website(
     )
 
     print(f"Indexed {len(all_chunks)} chunks from {len(pages)} pages")
-    return {"pages_indexed": len(pages), "chunks_indexed": len(all_chunks)}
+    return {
+        "pages_indexed": len(pages),
+        "chunks_indexed": len(all_chunks),
+        "indexed_count": len(all_chunks),
+        "total_count": total_found,
+        "truncated": truncated,
+    }

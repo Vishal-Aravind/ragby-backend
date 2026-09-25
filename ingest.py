@@ -236,7 +236,8 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
 
         # A single enormous file would otherwise become one unbounded
         # embedding bill. Index the first N chunks and stop there.
-        truncated = len(chunks) > MAX_CHUNKS_PER_INGEST
+        total_found = len(chunks)
+        truncated = total_found > MAX_CHUNKS_PER_INGEST
         if truncated:
             chunks = chunks[:MAX_CHUNKS_PER_INGEST]
             metas = metas[:MAX_CHUNKS_PER_INGEST]
@@ -272,7 +273,13 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
         )
 
     supabase.table("files").update({"status": "indexed"}).eq("id", file_id).execute()
-    return {"status": "indexed", "chunks_indexed": len(chunks), "truncated": truncated}
+    return {
+        "status": "indexed",
+        "chunks_indexed": len(chunks),
+        "indexed_count": len(chunks),
+        "total_count": total_found,
+        "truncated": truncated,
+    }
 
 
 @router.delete("/document/{file_id}")

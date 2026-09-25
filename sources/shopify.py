@@ -311,6 +311,7 @@ def sync_products(project_id: str, source_id: str, qdrant, embeddings, collectio
         return {
             "products_synced": product_count,
             "products_embedded": embedded_count,
+            "indexed_count": embedded_count,
             "truncated": truncated,
         }
     except Exception as e:

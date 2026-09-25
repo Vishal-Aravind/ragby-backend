@@ -99,6 +99,7 @@ def add_source(data: dict, user=Depends(verify_token)):
     source = res.data[0]
 
     skipped_tabs = []
+    sync_result = {}
 
     # The data_sources row above is inserted BEFORE any of these sync calls
     # run. If a sync call raises (network error, crawler blocked, embedding
@@ -111,22 +112,22 @@ def add_source(data: dict, user=Depends(verify_token)):
     try:
         if data["type"] == "gsheets":
             cfg = data["config"]
-            result = sync_sheet(
+            sync_result = sync_sheet(
                 cfg["sheet_id"], cfg["range"], data["projectId"],
                 source["id"], qdrant, embeddings, QDRANT_COLLECTION
             )
-            skipped_tabs = result.get("skipped_tabs", [])
+            skipped_tabs = sync_result.get("skipped_tabs", [])
 
         elif data["type"] == "excel_online":
             cfg = data["config"]
-            sync_excel_url(
+            sync_result = sync_excel_url(
                 cfg["url"], data["projectId"],
                 source["id"], qdrant, embeddings, QDRANT_COLLECTION
             )
 
         elif data["type"] == "website":
             cfg = data["config"]
-            result = sync_website(
+            sync_result = sync_website(
                 url=cfg["url"],
                 project_id=data["projectId"],
                 source_id=source["id"],
@@ -136,7 +137,7 @@ def add_source(data: dict, user=Depends(verify_token)):
                 full_site=cfg.get("full_site", True),
                 max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
-            if result["pages_indexed"] == 0:
+            if sync_result["pages_indexed"] == 0:
                 raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
 
         elif data["type"] == "shopify":
@@ -144,7 +145,7 @@ def add_source(data: dict, user=Depends(verify_token)):
             # OAuth callback (shopify_oauth.py) itself, not this generic
             # form — wiring it here too keeps the resync/list UI uniform
             # across every source type.
-            sync_shopify_products(
+            sync_result = sync_shopify_products(
                 data["projectId"], source["id"], qdrant, embeddings, QDRANT_COLLECTION
             )
 
@@ -172,7 +173,14 @@ def add_source(data: dict, user=Depends(verify_token)):
             detail=str(e) if isinstance(e, ValueError) else "Failed to connect this source. Please check the details and try again."
         )
 
-    return {"id": source["id"], "skipped_tabs": skipped_tabs}
+    return {
+        "id": source["id"],
+        "skipped_tabs": skipped_tabs,
+        "capped_tabs": sync_result.get("capped_tabs", []),
+        "truncated": sync_result.get("truncated", False),
+        "indexed_count": sync_result.get("indexed_count"),
+        "total_count": sync_result.get("total_count"),
+    }
 
 
 def _require_role_for_source(user_id: str, source_id: str, min_role: str = None) -> str:
@@ -215,23 +223,24 @@ def resync_source(source_id: str, user=Depends(verify_token)):
     # a resync that failed BEFORE reaching the sync call (bad config, failed
     # validation) destroyed the existing index for nothing, leaving the
     # source "connected" but genuinely empty.
+    sync_result = {}
     try:
         if s["type"] == "gsheets":
             cfg = s["config"]
-            sync_sheet(
+            sync_result = sync_sheet(
                 cfg["sheet_id"], cfg["range"],
                 s["project_id"], source_id,
                 qdrant, embeddings, QDRANT_COLLECTION
             )
         elif s["type"] == "excel_online":
             cfg = s["config"]
-            sync_excel_url(
+            sync_result = sync_excel_url(
                 cfg["url"], s["project_id"],
                 source_id, qdrant, embeddings, QDRANT_COLLECTION
             )
         elif s["type"] == "website":
             cfg = s["config"]
-            result = sync_website(
+            sync_result = sync_website(
                 url=cfg["url"],
                 project_id=s["project_id"],
                 source_id=source_id,
@@ -241,11 +250,11 @@ def resync_source(source_id: str, user=Depends(verify_token)):
                 full_site=cfg.get("full_site", True),
                 max_pages=_clamp_max_pages(cfg.get("max_pages")),
             )
-            if result["pages_indexed"] == 0:
+            if sync_result["pages_indexed"] == 0:
                 raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
 
         elif s["type"] == "shopify":
-            sync_shopify_products(
+            sync_result = sync_shopify_products(
                 s["project_id"], source_id, qdrant, embeddings, QDRANT_COLLECTION
             )
 
@@ -268,7 +277,13 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             detail=str(e) if isinstance(e, ValueError) else "Failed to refresh this source. Please try again."
         )
 
-    return {"status": "synced"}
+    return {
+        "status": "synced",
+        "truncated": sync_result.get("truncated", False),
+        "indexed_count": sync_result.get("indexed_count"),
+        "total_count": sync_result.get("total_count"),
+        "capped_tabs": sync_result.get("capped_tabs", []),
+    }
 
 
 @router.post("/sources/introspect")
@@ -345,7 +360,7 @@ async def upload_excel(
         # needs the documents permission.
         owning_project_id = _require_role_for_source(user.id, source_id, min_role="admin")
         try:
-            sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+            sync_result = sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"upload_excel re-upload error (source {source_id}): {e}")
@@ -357,7 +372,13 @@ async def upload_excel(
             "config": {"filename": file.filename},
             "label": label or file.filename,
         }).eq("id", source_id).execute()
-        return {"id": source_id, "filename": file.filename}
+        return {
+            "id": source_id,
+            "filename": file.filename,
+            "truncated": sync_result.get("truncated", False),
+            "indexed_count": sync_result.get("indexed_count"),
+            "total_count": sync_result.get("total_count"),
+        }
 
     # This endpoint creates a data_sources row just like add_source does,
     # but skipped the plan cap entirely — so uploading here instead of
@@ -383,7 +404,7 @@ async def upload_excel(
     # a permanently orphaned row showing as "connected" with no content,
     # and returned a raw 500 whose body was shown to the user.
     try:
-        sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
+        sync_result = sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"upload_excel error (project {projectId}): {e}")
@@ -394,4 +415,10 @@ async def upload_excel(
             detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
         )
 
-    return {"id": source["id"], "filename": file.filename}
+    return {
+        "id": source["id"],
+        "filename": file.filename,
+        "truncated": sync_result.get("truncated", False),
+        "indexed_count": sync_result.get("indexed_count"),
+        "total_count": sync_result.get("total_count"),
+    }

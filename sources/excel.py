@@ -139,7 +139,9 @@ def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, col
 
     # One row is one embedding, so a 200k-row workbook was 200k embeddings
     # in a single unbounded call against our own OpenAI key.
-    if len(chunks) > MAX_CHUNKS_PER_INGEST:
+    total_found = len(chunks)
+    truncated = total_found > MAX_CHUNKS_PER_INGEST
+    if truncated:
         print(f"excel source {source_id} truncated to {MAX_CHUNKS_PER_INGEST} rows")
         chunks = chunks[:MAX_CHUNKS_PER_INGEST]
         metas = metas[:MAX_CHUNKS_PER_INGEST]
@@ -169,4 +171,9 @@ def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, col
     )
 
     print(f"[{source_label}] Synced {len(chunks)} rows from Excel")
-    return {"chunks_indexed": len(chunks)}
+    return {
+        "chunks_indexed": len(chunks),
+        "indexed_count": len(chunks),
+        "total_count": total_found,
+        "truncated": truncated,
+    }
