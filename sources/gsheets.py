@@ -13,8 +13,20 @@ from config import MAX_SHEET_ROWS
 # FIX: removed unused RecursiveCharacterTextSplitter import
 
 
-def get_sheet_names(sheet_id: str, range_name: str):
-    if not range_name or range_name.strip().lower() in ("", "all"):
+def get_sheet_names(sheet_id: str, range_name):
+    if not range_name:
+        return None, []
+    # The frontend now sends a real list of tab names (a chip/tag input,
+    # not a single comma-separated text field) — a tab literally named
+    # "Q1, Actuals" could never be selected correctly through a delimiter
+    # that's also a valid character in the thing being delimited. Splitting
+    # on "," is kept only so a source connected before this change (whose
+    # stored config still has the old comma-joined string) keeps working
+    # without a migration.
+    if isinstance(range_name, list):
+        requested = [str(r).strip() for r in range_name if str(r).strip()]
+        return requested, []
+    if range_name.strip().lower() in ("", "all"):
         return None, []
     requested = [r.strip() for r in range_name.split(",") if r.strip()]
     return requested, []
