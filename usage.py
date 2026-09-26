@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 
 from clients import supabase
 from config import PLAN_LIMITS
-from auth import verify_token
+from auth import verify_token, require_project_access
 
 router = APIRouter()
 
@@ -25,6 +25,23 @@ def get_plan_limits(project_id: str) -> dict:
     profile = supabase.table("profiles")         .select("plan")         .eq("id", proj.data["user_id"])         .maybe_single()         .execute()
     plan = (profile.data or {}).get("plan") or "free" if profile else "free"
     return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+
+@router.get("/projects/{project_id}/limits")
+def project_limits(project_id: str, user=Depends(verify_token)):
+    """Exposes the caller's effective plan limits to the frontend, scoped to
+    THIS project (i.e. its owner's plan, via get_plan_limits — not the
+    caller's own /usage/status, which is keyed on the caller's own profile
+    and would be wrong for a teammate uploading into someone else's
+    project). Currently just the subset the upload flow needs; add more
+    keys here rather than inventing a second endpoint."""
+    require_project_access(user.id, project_id, tab="documents")
+    limits = get_plan_limits(project_id)
+    return {
+        "documents": limits["documents"],
+        "sources": limits["sources"],
+        "maxFileMB": limits["maxFileMB"],
+    }
 
 
 def check_rate_limit(project_id: str) -> dict:

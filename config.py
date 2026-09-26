@@ -103,9 +103,20 @@ RAZORPAY_PLAN_TO_PLAN = {
 }
 
 PLAN_LIMITS = {
-    "free":     {"conversations": 300,   "seats": 1,   "documents": 25,   "sources": 3},
-    "pro":      {"conversations": 5000,  "seats": 5,   "documents": 500,  "sources": 20},
-    "business": {"conversations": 25000, "seats": 100, "documents": 5000, "sources": 100},
+    # maxFileMB: a plan-tiered replacement for exposing MAX_CHUNKS_PER_INGEST
+    # to users as "pages" — that number is a flat internal safety backstop
+    # (see below), not something a merchant can judge before uploading, and
+    # its real dollar cost is trivial either way. File size is the metric
+    # every comparable product (Chatbase, Voiceflow, Intercom Fin) actually
+    # surfaces, and unlike the chunk cap, it's a legitimate free->pro lever:
+    # free's 10MB comfortably fits a real single scanned catalog/menu (2-8MB
+    # typical) so ordinary usage is never rejected, while a genuinely large
+    # PDF hits a real wall. Business stays at 49MB -- the Storage bucket's
+    # own existing hard file_size_limit, so it's effectively uncapped beyond
+    # the technical ceiling that already existed before this.
+    "free":     {"conversations": 300,   "seats": 1,   "documents": 25,   "sources": 3,   "maxFileMB": 10},
+    "pro":      {"conversations": 5000,  "seats": 5,   "documents": 500,  "sources": 20,  "maxFileMB": 25},
+    "business": {"conversations": 25000, "seats": 100, "documents": 5000, "sources": 100, "maxFileMB": 49},
 }
 
 # Hard ceilings that apply on EVERY plan, including business. Embedding is

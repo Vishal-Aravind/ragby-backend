@@ -128,13 +128,10 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
 
     file_id = row.data[0]["id"]
 
-    # Count OTHER documents in the project — this one's row already exists,
-    # created by the upload route before it called us.
-    limits = get_plan_limits(req.projectId)
-    existing = supabase.table("files")         .select("id", count="exact")         .eq("project_id", req.projectId)         .neq("id", file_id)         .execute()
-    if (existing.count or 0) >= limits["documents"]:
-        # Clean up rather than leaving a failed row and a stored object the
-        # user didn't get any value from.
+    def _reject(status_code: int, detail: str):
+        # Shared by both plan-limit checks below: clean up rather than
+        # leaving a failed row and a stored object the user didn't get any
+        # value from.
         supabase.table("files").delete().eq("id", file_id).execute()
         try:
             supabase.storage.from_("documents").remove([req.filePath])
@@ -146,9 +143,26 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
             # anywhere in the product. Single call per over-limit attempt,
             # not a loop.
             sentry_sdk.capture_exception(e)
-        raise HTTPException(
-            status_code=403,
-            detail=f"You've reached your plan's limit of {limits['documents']} documents. Delete one, or upgrade your plan, to add more.",
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    # Count OTHER documents in the project — this one's row already exists,
+    # created by the upload route before it called us.
+    limits = get_plan_limits(req.projectId)
+    existing = supabase.table("files")         .select("id", count="exact")         .eq("project_id", req.projectId)         .neq("id", file_id)         .execute()
+    if (existing.count or 0) >= limits["documents"]:
+        _reject(
+            403,
+            f"You've reached your plan's limit of {limits['documents']} documents. Delete one, or upgrade your plan, to add more.",
+        )
+
+    # Real backstop behind the frontend's own pre-check and the upload-url
+    # route's fast-fail — a client that skips both could still reach here.
+    # expectedBytes is the browser-reported size, already plumbed through
+    # for the overwrite-race fix, so this needs no extra download or lookup.
+    if req.expectedBytes is not None and req.expectedBytes > limits["maxFileMB"] * 1024 * 1024:
+        _reject(
+            403,
+            f"This file is too large for your plan (limit {limits['maxFileMB']}MB). Upgrade your plan to upload larger files.",
         )
 
     supabase.table("files").update({"status": "processing"}).eq("id", file_id).execute()
