@@ -1395,7 +1395,20 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 # source. Without a relevance floor, any single low-quality
                 # spreadsheet hit (even a near-irrelevant one) permanently
                 # blocked the database fallback below from ever running.
-                score_threshold=0.5,
+                #
+                # 0.5 was measured (real text-embedding-3-small cosine
+                # similarities against an actual indexed row) to be higher
+                # than a genuinely correct match scores for an ordinary
+                # short question — "who is bryan?" against the row that
+                # actually answers it landed at ~0.44, "linkedin of bryan
+                # harvey?" at ~0.47 — so the floor was silently rejecting
+                # correct matches and falling through to the database/
+                # conceptual paths, which then answered "I don't know" even
+                # though the sheet had the exact right row. A wrong-but-
+                # similarly-shaped row (a different person, same columns)
+                # scored ~0.25 in the same test, and unrelated text ~0.02 —
+                # 0.35 sits well clear of both real ranges.
+                score_threshold=0.35,
                 query_filter=models.Filter(
                     must=[
                         models.FieldCondition(key="project_id", match=models.MatchValue(value=project_id)),
