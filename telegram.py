@@ -16,6 +16,7 @@ from auth import verify_token, require_project_access
 from config import TELEGRAM_WEBHOOK_SECRET
 from usage import check_rate_limit, increment_usage
 from chat import run_chat, get_history
+from text_split import split_message
 
 router = APIRouter()
 
@@ -46,6 +47,16 @@ def _require_uuid(project_id: str) -> str:
 # HELPERS
 # -------------------------------------------------
 def send_telegram_message(bot_token: str, chat_id: int, text: str) -> bool:
+    """Returns True if Telegram accepted every part. Text over Telegram's
+    4096-char cap (e.g. a full list from a spreadsheet) is sent as several
+    messages, split between lines."""
+    for part in split_message(text, 4096):
+        if not _send_telegram_part(bot_token, chat_id, part):
+            return False
+    return True
+
+
+def _send_telegram_part(bot_token: str, chat_id: int, text: str) -> bool:
     """Returns True if Telegram accepted the message.
 
     The response used to be discarded, so two common failures were silent:

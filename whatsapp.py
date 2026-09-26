@@ -16,6 +16,7 @@ from clients import supabase
 from ratelimit import is_rate_limited
 from config import WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, META_APP_ID, META_APP_SECRET
 from auth import verify_token, require_project_access
+from text_split import split_message
 
 router = APIRouter()
 
@@ -492,20 +493,21 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
     headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
     # WhatsApp rejects a text message over 4096 chars outright, so an
     # over-long merchant-authored node body (or a long AI answer) would send
-    # NOTHING rather than something. Same safety net as the 1024-char cap in
-    # send_whatsapp_buttons below.
-    text = text or ""
-    if len(text) > 4096:
-        text = text[:4093] + "..."
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-    res = http.post(url, headers=headers, json=payload)
-    if not res.ok:
-        print(f"WhatsApp send error: {res.text}")
+    # NOTHING rather than something. Long text (e.g. a full list from a
+    # spreadsheet) is sent as several messages, split between lines, rather
+    # than cut off. Returns the last response; stops at the first failure.
+    res = None
+    for part in split_message(text, MAX_TEXT_LEN):
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": part},
+        }
+        res = http.post(url, headers=headers, json=payload)
+        if not res.ok:
+            print(f"WhatsApp send error: {res.text}")
+            break
     return res
 
 

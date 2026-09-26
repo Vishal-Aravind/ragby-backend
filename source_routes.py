@@ -26,6 +26,8 @@ from sources.postgres import introspect_schema, validate_url
 from sources.excel import sync_excel_url, sync_excel_bytes
 from sources.website import sync_website
 from sources.shopify import sync_products as sync_shopify_products
+from sources.sheet_tables import reembed_from_tables
+from sources.table_query import invalidate as invalidate_tables
 
 router = APIRouter()
 
@@ -180,6 +182,7 @@ def add_source(data: dict, user=Depends(verify_token)):
         "truncated": sync_result.get("truncated", False),
         "indexed_count": sync_result.get("indexed_count"),
         "total_count": sync_result.get("total_count"),
+        "hidden_columns": sync_result.get("hidden_columns", []),
     }
 
 
@@ -196,10 +199,91 @@ def _require_role_for_source(user_id: str, source_id: str, min_role: str = None)
 
 @router.delete("/sources/{source_id}")
 def delete_source(source_id: str, user=Depends(verify_token)):
-    _require_role_for_source(user.id, source_id, min_role="admin")
+    project_id = _require_role_for_source(user.id, source_id, min_role="admin")
     _purge_source_points(source_id)
+    # source_tables rows go with it (FK cascade); drop the cached copy too so
+    # the bot stops answering from it immediately.
     supabase.table("data_sources").delete().eq("id", source_id).execute()
+    invalidate_tables(project_id)
     return {"status": "deleted"}
+
+
+# -------------------------------------------------
+# SPREADSHEET COLUMNS (which ones the bot may use)
+# -------------------------------------------------
+_TABLE_SOURCE_TYPES = ("gsheets", "excel_online", "excel_local")
+
+
+def _table_source(user_id: str, source_id: str, min_role: str = None) -> dict:
+    project_id = _require_role_for_source(user_id, source_id, min_role=min_role)
+    s = supabase.table("data_sources").select("type").eq("id", source_id).single().execute().data
+    if s["type"] not in _TABLE_SOURCE_TYPES:
+        raise HTTPException(status_code=400, detail="Only spreadsheet sources have columns.")
+    return {"project_id": project_id, "type": s["type"]}
+
+
+@router.get("/sources/{source_id}/columns")
+def get_source_columns(source_id: str, user=Depends(verify_token)):
+    _table_source(user.id, source_id)
+    res = supabase.table("source_tables") \
+        .select("tab, columns, hidden_columns") \
+        .eq("source_id", source_id) \
+        .execute()
+    return {"tabs": [
+        {"tab": r["tab"], "columns": r.get("columns") or [], "hidden": r.get("hidden_columns") or []}
+        for r in (res.data or [])
+    ]}
+
+
+@router.put("/sources/{source_id}/columns")
+def set_source_columns(source_id: str, data: dict, user=Depends(verify_token)):
+    # Exposing a column makes it answerable to anyone chatting with the bot,
+    # so this takes the same admin role as deleting the source.
+    src = _table_source(user.id, source_id, min_role="admin")
+
+    # Re-embeds the whole source against our OpenAI key.
+    if is_rate_limited(f"source-columns:{source_id}", limit=5, window_seconds=300):
+        raise HTTPException(
+            status_code=429,
+            detail="Column settings were just changed. Please wait a few minutes before changing them again.",
+        )
+
+    requested = {t.get("tab"): t.get("hidden") for t in (data.get("tabs") or []) if isinstance(t, dict)}
+    res = supabase.table("source_tables") \
+        .select("tab, columns") \
+        .eq("source_id", source_id) \
+        .execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Reload this source first, then choose its columns.")
+
+    for r in res.data:
+        hidden = requested.get(r["tab"])
+        if not isinstance(hidden, list):
+            continue
+        # Only real column names are stored.
+        valid = [c for c in (r.get("columns") or []) if c in set(map(str, hidden))]
+        supabase.table("source_tables") \
+            .update({"hidden_columns": valid}) \
+            .eq("source_id", source_id) \
+            .eq("tab", r["tab"]) \
+            .execute()
+
+    source_type = "gsheets" if src["type"] == "gsheets" else "excel"
+    try:
+        # Hidden columns must leave the vector index too, not just the
+        # table query.
+        reembed_from_tables(source_id, src["project_id"], source_type, qdrant, embeddings, QDRANT_COLLECTION)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"set_source_columns re-embed failed (source {source_id}): {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Saved, but the bot's search index couldn't be updated. Please press Reload on this source.",
+        )
+    finally:
+        invalidate_tables(src["project_id"])
+
+    return {"status": "saved"}
 
 
 @router.post("/sources/sync/{source_id}")
@@ -283,6 +367,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
         "indexed_count": sync_result.get("indexed_count"),
         "total_count": sync_result.get("total_count"),
         "capped_tabs": sync_result.get("capped_tabs", []),
+        "hidden_columns": sync_result.get("hidden_columns", []),
     }
 
 
@@ -378,6 +463,7 @@ async def upload_excel(
             "truncated": sync_result.get("truncated", False),
             "indexed_count": sync_result.get("indexed_count"),
             "total_count": sync_result.get("total_count"),
+            "hidden_columns": sync_result.get("hidden_columns", []),
         }
 
     # This endpoint creates a data_sources row just like add_source does,
@@ -421,4 +507,5 @@ async def upload_excel(
         "truncated": sync_result.get("truncated", False),
         "indexed_count": sync_result.get("indexed_count"),
         "total_count": sync_result.get("total_count"),
+        "hidden_columns": sync_result.get("hidden_columns", []),
     }

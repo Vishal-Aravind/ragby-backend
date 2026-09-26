@@ -1156,6 +1156,7 @@ Reply with only one word: structured or conceptual"""
 def run_chat(project_id: str, chat_id: str, message: str, history: list):
     try:
         from sources.postgres import run_text_to_sql
+        from sources.table_query import query_tables, format_context, format_full_list
 
         history = history or []
 
@@ -1375,18 +1376,41 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             save_message(chat_id, "assistant", answer)
             return {"answer": answer, "sources": []}
 
-        source_intent = classify_source_intent(message)
-
         query_for_embedding = message
+        previous_question = None
         if len(message.split()) <= 4 and history:
             last_user_msgs = [m for m in history if m["role"] == "user"]
             if last_user_msgs:
-                query_for_embedding = last_user_msgs[-1]["content"] + " " + message
+                previous_question = last_user_msgs[-1]["content"]
+                query_for_embedding = previous_question + " " + message
+
+        # Classified with the previous question attached for short
+        # follow-ups — "full list please" alone reads as conceptual.
+        source_intent = classify_source_intent(query_for_embedding)
 
         q = embeddings.embed_query(query_for_embedding)
         context = None
+        answer_tokens = 300
 
         if source_intent == "structured":
+            # Spreadsheets are queried as tables first: similarity search
+            # can't filter by number, sort, or count, and only ever returns
+            # its top few rows. Vector search stays as the fallback for
+            # fuzzy questions the table query can't map to columns.
+            table_result = query_tables(project_id, message, openai_client, previous_question)
+            if table_result and (table_result["rows"] or table_result["aggregate"]):
+                if table_result["full"] and table_result["rows"] and not table_result["aggregate"]:
+                    # A full list won't fit the model's reply budget, and
+                    # retyping it through the model only risks dropping or
+                    # altering rows — send the rows themselves.
+                    answer = format_full_list(table_result)
+                    save_message(chat_id, "assistant", answer)
+                    return {"answer": answer, "sources": []}
+                context = _truncate(format_context(table_result), MAX_CONTEXT_CHARS)
+                # Room for up to 10 rows in the reply.
+                answer_tokens = 700
+
+        if source_intent == "structured" and not context:
             res = qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
                 query=q,
@@ -1491,7 +1515,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
             )
         })
 
-        answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.2, max_tokens=300, chat_id=chat_id)
+        answer = run_completion(messages, active_tools, project_id, channel, external_id, temperature=0.2, max_tokens=answer_tokens, chat_id=chat_id)
         save_message(chat_id, "assistant", answer)
         return {"answer": answer, "sources": []}
 

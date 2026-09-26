@@ -7,6 +7,9 @@ import pandas as pd
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
 from vector_sync import replace_points
+from sources.sheet_tables import (
+    dataframe_to_table, load_previous, resolve_hidden, row_text, save_tables,
+)
 
 MAX_EXCEL_BYTES = 25 * 1024 * 1024
 
@@ -58,26 +61,19 @@ def fetch_excel_from_url(url: str) -> bytes:
     return res.content
 
 
-def excel_bytes_to_chunks(file_bytes: bytes):
+def excel_bytes_to_tables(file_bytes: bytes):
     """
-    Convert Excel bytes to list of (sheet_name, text) tuples.
-    FIX: removed duplicate definition — keeping the better version with
-    engine detection (openpyxl/xlrd) and nan filtering.
+    Convert Excel bytes to a list of (sheet_name, columns, rows) tables.
+    Tries openpyxl first (xlsx), falls back to xlrd (xls).
     """
-    # Try openpyxl first (xlsx), fall back to xlrd (xls)
     for engine in ["openpyxl", "xlrd"]:
         try:
             xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
             results = []
             for sheet_name in xls.sheet_names:
-                df = xls.parse(sheet_name).astype(str).fillna("")
-                for _, row in df.iterrows():
-                    text = ", ".join(
-                        f"{col}: {row[col]}" for col in df.columns
-                        if str(row[col]).strip() and str(row[col]) != "nan"
-                    )
-                    if text.strip():
-                        results.append((sheet_name, text))
+                columns, rows = dataframe_to_table(xls.parse(sheet_name))
+                if rows:
+                    results.append((str(sheet_name), columns, rows))
             return results
         except Exception:
             continue
@@ -114,43 +110,61 @@ def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, col
     # Purge happens after a successful parse (see below). Deleting first
     # meant re-uploading a corrupt or password-protected workbook wiped the
     # working index and left the source "connected" with nothing in it.
-    rows = excel_bytes_to_chunks(file_bytes)
+    parsed = excel_bytes_to_tables(file_bytes)
 
     # Previously returned success here, so an empty or header-only workbook
     # produced a green "connected" source the bot could never answer from.
-    if not rows:
+    if not parsed:
         raise ValueError(
             "Couldn't read any rows from that file. Check that it has a header "
             "row and at least one row of data."
         )
 
-    chunks = [text for _, text in rows]
-    metas = [
-        {
-            "project_id": project_id,
-            "source_id": source_id,
-            "source_type": "excel",
-            "sheet_tab": sheet,
-            "text": text,
-        }
-        for sheet, text in rows
-    ]
-
     # One row is one embedding, so a 200k-row workbook was 200k embeddings
-    # in a single unbounded call against our own OpenAI key.
-    total_found = len(chunks)
+    # in a single unbounded call against our own OpenAI key. The same cap
+    # bounds the stored table copy.
+    total_found = sum(len(rows) for _, _, rows in parsed)
     truncated = total_found > MAX_CHUNKS_PER_INGEST
     if truncated:
         print(f"excel source {source_id} truncated to {MAX_CHUNKS_PER_INGEST} rows")
-        chunks = chunks[:MAX_CHUNKS_PER_INGEST]
-        metas = metas[:MAX_CHUNKS_PER_INGEST]
+
+    previous = load_previous(source_id)
+    tables, chunks, metas = [], [], []
+    room = MAX_CHUNKS_PER_INGEST
+    for sheet, columns, rows in parsed:
+        if room <= 0:
+            break
+        rows = rows[:room]
+        room -= len(rows)
+        # Personal-data columns (emails, phones) start hidden: they're left
+        # out of the embedded text as well as the table query.
+        hidden = resolve_hidden(previous, sheet, columns, rows)
+        hidden_set = set(hidden)
+        tables.append({"tab": sheet, "columns": columns, "rows": rows, "hidden": hidden})
+        for row in rows:
+            text = row_text(columns, row, hidden_set)
+            if not text:
+                continue
+            chunks.append(text)
+            metas.append({
+                "project_id": project_id,
+                "source_id": source_id,
+                "source_type": "excel",
+                "sheet_tab": sheet,
+                "text": text,
+            })
 
     replace_points(qdrant, embeddings, collection, chunks, metas, "source_id", source_id)
+    # Only after the vectors were replaced, so a failed sync leaves the
+    # previous table and index consistent with each other.
+    save_tables(source_id, project_id, tables)
 
-    print(f"[{source_label}] Synced {len(chunks)} rows from Excel")
+    stored = sum(len(t["rows"]) for t in tables)
+    print(f"[{source_label}] Synced {stored} rows from Excel ({len(chunks)} embedded)")
     return {
         "chunks_indexed": len(chunks),
-        "indexed_count": len(chunks),
+        "indexed_count": stored,
         "total_count": total_found,
         "truncated": truncated,
+        "hidden_columns": sorted({c for t in tables for c in t["hidden"]}),
     }
