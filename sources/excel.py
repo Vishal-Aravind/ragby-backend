@@ -1,13 +1,12 @@
 # sources/excel.py
 
-import uuid
 import io
 import requests
 import pandas as pd
-from qdrant_client import models
 
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
+from vector_sync import replace_points
 
 MAX_EXCEL_BYTES = 25 * 1024 * 1024
 
@@ -146,29 +145,7 @@ def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, col
         chunks = chunks[:MAX_CHUNKS_PER_INGEST]
         metas = metas[:MAX_CHUNKS_PER_INGEST]
 
-    vectors = embeddings.embed_documents(chunks)
-
-    # Safe to drop the old index only now that replacement content exists.
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
-    qdrant.upload_points(
-        collection_name=collection,
-        points=[
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=v,
-                payload=m
-            ) for v, m in zip(vectors, metas)
-        ]
-    )
+    replace_points(qdrant, embeddings, collection, chunks, metas, "source_id", source_id)
 
     print(f"[{source_label}] Synced {len(chunks)} rows from Excel")
     return {

@@ -1,14 +1,13 @@
 # sources/gsheets.py
 
 import re
-import uuid
 from urllib.parse import quote
 
 import sentry_sdk
 import pandas as pd
-from qdrant_client import models
 
 from config import MAX_SHEET_ROWS
+from vector_sync import replace_points
 
 # FIX: removed unused RecursiveCharacterTextSplitter import
 
@@ -158,29 +157,7 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             "that any tab names you entered match exactly."
         )
 
-    vectors = embeddings.embed_documents(all_chunks)
-
-    # Only now that we have real data is it safe to drop the old index.
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
-    qdrant.upload_points(
-        collection_name=collection,
-        points=[
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=v,
-                payload=m
-            ) for v, m in zip(vectors, all_metas)
-        ]
-    )
+    replace_points(qdrant, embeddings, collection, all_chunks, all_metas, "source_id", source_id)
 
     print(f"Synced {len(all_chunks)} rows from tabs: {synced}, skipped: {skipped}, capped: {capped_tabs}")
     return {

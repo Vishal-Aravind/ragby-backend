@@ -8,7 +8,6 @@
 # JavaScript come back empty.
 
 import time
-import uuid
 from collections import deque
 from urllib.parse import urldefrag, urljoin, urlsplit
 
@@ -16,10 +15,10 @@ import requests
 import sentry_sdk
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from qdrant_client import models
 
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
+from vector_sync import replace_points
 
 
 # ── URL patterns to skip — low-value pages that add noise ──
@@ -299,29 +298,7 @@ def sync_website(
         all_chunks = all_chunks[:MAX_CHUNKS_PER_INGEST]
         all_metas = all_metas[:MAX_CHUNKS_PER_INGEST]
 
-    vectors = embeddings.embed_documents(all_chunks)
-
-    # Safe to drop the old index only now that replacement content exists.
-    qdrant.delete(
-        collection_name=collection,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(
-                key="source_id",
-                match=models.MatchValue(value=source_id)
-            )]
-        )
-    )
-
-    qdrant.upload_points(
-        collection_name=collection,
-        points=[
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=v,
-                payload=m
-            ) for v, m in zip(vectors, all_metas)
-        ]
-    )
+    replace_points(qdrant, embeddings, collection, all_chunks, all_metas, "source_id", source_id)
 
     print(f"Indexed {len(all_chunks)} chunks from {len(pages)} pages")
     return {

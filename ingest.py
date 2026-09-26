@@ -1,6 +1,5 @@
 import io
 import time
-import uuid
 from typing import Optional
 
 import sentry_sdk
@@ -15,6 +14,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
+from vector_sync import replace_points
 from config import QDRANT_COLLECTION, MAX_CHUNKS_PER_INGEST
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
@@ -257,24 +257,11 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
             metas = metas[:MAX_CHUNKS_PER_INGEST]
             print(f"ingest truncated file {file_id} to {MAX_CHUNKS_PER_INGEST} chunks")
 
-        vectors = embeddings.embed_documents(chunks)
-
-        # Re-ingesting reuses the same file_id (the row is upserted), so
-        # without this the previous version's chunks stayed in Qdrant
-        # alongside the new ones and the bot kept answering from content
-        # the user believed they had replaced.
-        _purge_file_points(file_id)
-
-        qdrant.upload_points(
-            collection_name=QDRANT_COLLECTION,
-            points=[
-                models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=v,
-                    payload=m
-                ) for v, m in zip(vectors, metas)
-            ]
-        )
+        # Re-ingesting reuses the same file_id (the row is upserted), so the
+        # previous version's chunks must be replaced, not left alongside the
+        # new ones. Batched: embedding all chunks at once held every vector
+        # in memory and pushed the instance past its memory limit.
+        replace_points(qdrant, embeddings, QDRANT_COLLECTION, chunks, metas, "file_id", file_id)
     except HTTPException:
         raise
     except Exception as e:
