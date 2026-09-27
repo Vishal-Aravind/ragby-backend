@@ -1,8 +1,10 @@
 # sources/gsheets.py
 
+import io
 import re
 from urllib.parse import quote
 
+import requests
 import sentry_sdk
 import pandas as pd
 
@@ -66,17 +68,56 @@ def fetch_tab(sheet_id: str, tab_name: str):
         return None
 
 
+# The export is parsed in memory on a 512MB instance, so keep it bounded;
+# a 5,000-row sheet exports at well under 2MB.
+MAX_WORKBOOK_BYTES = 10 * 1024 * 1024
+
+
+def fetch_workbook(sheet_id: str):
+    """{tab name: DataFrame} for every tab, via the sheet's public .xlsx
+    export. None if it can't be read (private sheet → Google returns an
+    HTML login page, network error, oversized, unparseable)."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    try:
+        with requests.get(url, timeout=30, stream=True) as res:
+            if not res.ok or "spreadsheetml" not in res.headers.get("Content-Type", ""):
+                return None
+            body = bytearray()
+            for chunk in res.iter_content(64 * 1024):
+                body.extend(chunk)
+                if len(body) > MAX_WORKBOOK_BYTES:
+                    print(f"sheet {sheet_id} export over {MAX_WORKBOOK_BYTES} bytes, using CSV fallback")
+                    return None
+        xls = pd.ExcelFile(io.BytesIO(bytes(body)), engine="openpyxl")
+        # Only as many rows as could ever be indexed (+1 so truncation is
+        # still detected), not the whole tab.
+        return {str(name): xls.parse(name, nrows=MAX_SHEET_ROWS + 1) for name in xls.sheet_names}
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Could not export sheet {sheet_id} as xlsx: {e}")
+        return None
+
+
 def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, qdrant, embeddings, collection: str):
     validate_sheet_id(sheet_id)
     requested_tabs, _ = get_sheet_names(sheet_id, range_name)
 
-    # There is no way to enumerate a sheet's tabs without Google credentials
-    # — the old code called the v3 "worksheets feed" API, which Google shut
-    # down in 2021, so it ALWAYS failed and silently fell back to reading
-    # only the first tab while reporting a full sync. Rather than lie, read
-    # the first tab when no tabs are named, and let the caller tell the user
-    # to name tabs explicitly if they need more than one.
-    tabs_to_read = requested_tabs if requested_tabs is not None else [None]
+    # The whole workbook (every tab, with real tab names) comes from the
+    # public .xlsx export — no Google credentials needed. The UI always
+    # promised "leave empty to index every tab" but only the first tab was
+    # ever read. If the export fails, fall back to the per-tab CSV
+    # endpoint, which can only read the first tab when none are named.
+    workbook = fetch_workbook(sheet_id)
+    if workbook is not None:
+        if requested_tabs is None:
+            tabs_to_read = list(workbook)
+        else:
+            by_lower = {name.strip().casefold(): name for name in workbook}
+            tabs_to_read = [
+                by_lower.get(t.strip().casefold(), t) for t in requested_tabs
+            ]
+    else:
+        tabs_to_read = requested_tabs if requested_tabs is not None else [None]
 
     # NOTE: the purge deliberately happens AFTER the fetch loop below, not
     # here. Deleting first meant a sheet that had since been made private
@@ -104,7 +145,13 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             truncated = True
             continue
 
-        if tab is None:
+        if workbook is not None:
+            df = workbook.get(tab)
+            if df is None or df.empty:
+                skipped.append(tab)
+                continue
+            tab_label = tab
+        elif tab is None:
             url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
             try:
                 df = pd.read_csv(url)

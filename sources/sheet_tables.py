@@ -13,6 +13,7 @@ the merchant can expose them from the dashboard. A merchant's choice for an
 existing column survives every re-sync.
 """
 import re
+from datetime import date, datetime, time as dtime
 
 import sentry_sdk
 
@@ -32,6 +33,14 @@ _PERSONAL_NAME_RE = re.compile(
 def _cell(value) -> str:
     if value is None:
         return ""
+    # Date cells from .xlsx arrive as datetimes; "2024-01-05 00:00:00" reads
+    # badly and won't match a customer typing "2024-01-05".
+    if isinstance(value, (datetime, date)):
+        if value != value:  # NaT
+            return ""
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d") if value.time() == dtime(0, 0) else value.strftime("%Y-%m-%d %H:%M")
+        return value.isoformat()
     if isinstance(value, float):
         if value != value:  # NaN
             return ""
