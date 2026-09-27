@@ -1388,7 +1388,15 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         # follow-ups — "full list please" alone reads as conceptual.
         source_intent = classify_source_intent(query_for_embedding)
 
-        q = embeddings.embed_query(query_for_embedding)
+        # Embedded only when a vector search actually runs — a question the
+        # table query answers never needs it.
+        _q = []
+
+        def question_vector():
+            if not _q:
+                _q.append(embeddings.embed_query(query_for_embedding))
+            return _q[0]
+
         context = None
         answer_tokens = 300
 
@@ -1413,7 +1421,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         if source_intent == "structured" and not context:
             res = qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query=q,
+                query=question_vector(),
                 limit=7,
                 # A project can have BOTH a spreadsheet and a database
                 # source. Without a relevance floor, any single low-quality
@@ -1470,7 +1478,7 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
         if source_intent == "conceptual":
             res = qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query=q,
+                query=question_vector(),
                 limit=7,
                 query_filter=models.Filter(
                     must=[
