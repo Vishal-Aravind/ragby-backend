@@ -6,10 +6,7 @@ import pandas as pd
 
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
-from vector_sync import replace_points
-from sources.sheet_tables import (
-    dataframe_to_table, load_previous, resolve_hidden, row_text, save_tables,
-)
+from sources.sheet_tables import dataframe_to_table, index_tables, normalize_tab_list
 
 MAX_EXCEL_BYTES = 25 * 1024 * 1024
 
@@ -61,110 +58,114 @@ def fetch_excel_from_url(url: str) -> bytes:
     return res.content
 
 
-def excel_bytes_to_tables(file_bytes: bytes):
-    """
-    Convert Excel bytes to a list of (sheet_name, columns, rows) tables.
-    Tries openpyxl first (xlsx), falls back to xlrd (xls).
-    """
+def read_excel(file_bytes: bytes, tabs=None) -> dict:
+    """Parse the workbook into capped tables, without indexing anything —
+    shared by the column preview and the real sync. `tabs` empty/None reads
+    every sheet; otherwise only the named ones (case-insensitive)."""
+    requested = normalize_tab_list(tabs)
+    xls = None
+    # Try openpyxl first (xlsx), fall back to xlrd (xls).
     for engine in ["openpyxl", "xlrd"]:
         try:
             xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
-            results = []
-            for sheet_name in xls.sheet_names:
-                columns, rows = dataframe_to_table(xls.parse(sheet_name))
-                if rows:
-                    results.append((str(sheet_name), columns, rows))
-            return results
+            break
         except Exception:
             continue
+    if xls is None:
+        raise ValueError("Could not read the Excel file. Make sure it is a valid .xlsx or .xls file.")
 
-    raise ValueError("Could not read the Excel file. Make sure it is a valid .xlsx or .xls file.")
-
-
-def sync_excel_url(
-    url: str,
-    project_id: str,
-    source_id: str,
-    qdrant,
-    embeddings,
-    collection: str
-):
-    """Fetch Excel from a URL, embed and store in Qdrant."""
-    file_bytes = fetch_excel_from_url(url)
-    return _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection, source_label="excel_online")
-
-
-def sync_excel_bytes(
-    file_bytes: bytes,
-    project_id: str,
-    source_id: str,
-    qdrant,
-    embeddings,
-    collection: str
-):
-    """Embed and store local Excel bytes in Qdrant."""
-    return _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection, source_label="excel_local")
-
-
-def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection, source_label):
-    # Purge happens after a successful parse (see below). Deleting first
-    # meant re-uploading a corrupt or password-protected workbook wiped the
-    # working index and left the source "connected" with nothing in it.
-    parsed = excel_bytes_to_tables(file_bytes)
-
-    # Previously returned success here, so an empty or header-only workbook
-    # produced a green "connected" source the bot could never answer from.
-    if not parsed:
-        raise ValueError(
-            "Couldn't read any rows from that file. Check that it has a header "
-            "row and at least one row of data."
-        )
+    names = [str(n) for n in xls.sheet_names]
+    skipped = []
+    if requested is None:
+        to_read = names
+    else:
+        by_lower = {n.strip().casefold(): n for n in names}
+        to_read = []
+        for t in requested:
+            match = by_lower.get(t.strip().casefold())
+            if match is None:
+                skipped.append(t)
+            elif match not in to_read:
+                to_read.append(match)
 
     # One row is one embedding, so a 200k-row workbook was 200k embeddings
     # in a single unbounded call against our own OpenAI key. The same cap
     # bounds the stored table copy.
-    total_found = sum(len(rows) for _, _, rows in parsed)
-    truncated = total_found > MAX_CHUNKS_PER_INGEST
-    if truncated:
+    tables, capped_tabs = [], []
+    room, total_found, truncated = MAX_CHUNKS_PER_INGEST, 0, False
+    for name in to_read:
+        if room <= 0:
+            capped_tabs.append(name)
+            truncated = True
+            continue
+        columns, rows = dataframe_to_table(xls.parse(name, nrows=room + 1))
+        if not rows:
+            skipped.append(name)
+            continue
+        total_found += len(rows)
+        if len(rows) > room:
+            rows = rows[:room]
+            truncated = True
+        room -= len(rows)
+        tables.append((name, columns, rows))
+
+    # Previously returned success here, so an empty or header-only workbook
+    # produced a green "connected" source the bot could never answer from.
+    if not tables:
+        raise ValueError(
+            "Couldn't read any rows from that file. Check that it has a header "
+            "row and at least one row of data, and that any sheet names you "
+            "entered match the file."
+        )
+    return {
+        "tables": tables,
+        "skipped_tabs": skipped,
+        "capped_tabs": capped_tabs,
+        "row_count": sum(len(r) for _, _, r in tables),
+        "total_found": total_found,
+        "truncated": truncated,
+    }
+
+
+def sync_excel_url(url: str, project_id: str, source_id: str, qdrant, embeddings,
+                   collection: str, tabs=None, hidden_override: dict = None):
+    """Fetch Excel from a URL, embed and store in Qdrant."""
+    file_bytes = fetch_excel_from_url(url)
+    return _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection,
+                             "excel_online", tabs, hidden_override)
+
+
+def sync_excel_bytes(file_bytes: bytes, project_id: str, source_id: str, qdrant, embeddings,
+                     collection: str, tabs=None, hidden_override: dict = None):
+    """Embed and store local Excel bytes in Qdrant."""
+    return _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection,
+                             "excel_local", tabs, hidden_override)
+
+
+def _sync_excel_bytes(file_bytes, project_id, source_id, qdrant, embeddings, collection,
+                      source_label, tabs=None, hidden_override=None):
+    # Purge happens after a successful parse (inside index_tables).
+    # Deleting first meant re-uploading a corrupt or password-protected
+    # workbook wiped the working index and left the source "connected" with
+    # nothing in it.
+    book = read_excel(file_bytes, tabs)
+    if book["truncated"]:
         print(f"excel source {source_id} truncated to {MAX_CHUNKS_PER_INGEST} rows")
 
-    previous = load_previous(source_id)
-    tables, chunks, metas = [], [], []
-    room = MAX_CHUNKS_PER_INGEST
-    for sheet, columns, rows in parsed:
-        if room <= 0:
-            break
-        rows = rows[:room]
-        room -= len(rows)
-        # Personal-data columns (emails, phones) start hidden: they're left
-        # out of the embedded text as well as the table query.
-        hidden = resolve_hidden(previous, sheet, columns, rows)
-        hidden_set = set(hidden)
-        tables.append({"tab": sheet, "columns": columns, "rows": rows, "hidden": hidden})
-        for row in rows:
-            text = row_text(columns, row, hidden_set)
-            if not text:
-                continue
-            chunks.append(text)
-            metas.append({
-                "project_id": project_id,
-                "source_id": source_id,
-                "source_type": "excel",
-                "sheet_tab": sheet,
-                "text": text,
-            })
-
-    replace_points(qdrant, embeddings, collection, chunks, metas, "source_id", source_id)
-    # Only after the vectors were replaced, so a failed sync leaves the
-    # previous table and index consistent with each other.
-    save_tables(source_id, project_id, tables)
-
-    stored = sum(len(t["rows"]) for t in tables)
-    print(f"[{source_label}] Synced {stored} rows from Excel ({len(chunks)} embedded)")
+    stored, embedded = index_tables(
+        book["tables"], project_id, source_id, "excel",
+        qdrant, embeddings, collection, hidden_override,
+    )
+    print(f"[{source_label}] Synced {book['row_count']} rows from Excel ({embedded} embedded)")
     return {
-        "chunks_indexed": len(chunks),
-        "indexed_count": stored,
-        "total_count": total_found,
-        "truncated": truncated,
-        "hidden_columns": sorted({c for t in tables for c in t["hidden"]}),
+        "chunks_indexed": embedded,
+        "indexed_count": book["row_count"],
+        # Rows past the cap are never parsed (memory), so the true total is
+        # unknown once truncated; the caller then shows the generic
+        # "only part was indexed" message.
+        "total_count": None if book["truncated"] else book["total_found"],
+        "truncated": book["truncated"],
+        "skipped_tabs": book["skipped_tabs"],
+        "capped_tabs": book["capped_tabs"],
+        "hidden_columns": sorted({c for t in stored for c in t["hidden"]}),
     }

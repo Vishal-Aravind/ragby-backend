@@ -9,31 +9,18 @@ import sentry_sdk
 import pandas as pd
 
 from config import MAX_SHEET_ROWS
-from vector_sync import replace_points
-from sources.sheet_tables import (
-    dataframe_to_table, load_previous, resolve_hidden, row_text, save_tables,
-)
+from sources.sheet_tables import dataframe_to_table, index_tables, normalize_tab_list
 
 # FIX: removed unused RecursiveCharacterTextSplitter import
 
 
 def get_sheet_names(sheet_id: str, range_name):
-    if not range_name:
-        return None, []
-    # The frontend now sends a real list of tab names (a chip/tag input,
-    # not a single comma-separated text field) — a tab literally named
-    # "Q1, Actuals" could never be selected correctly through a delimiter
-    # that's also a valid character in the thing being delimited. Splitting
-    # on "," is kept only so a source connected before this change (whose
-    # stored config still has the old comma-joined string) keeps working
-    # without a migration.
-    if isinstance(range_name, list):
-        requested = [str(r).strip() for r in range_name if str(r).strip()]
-        return requested, []
-    if range_name.strip().lower() in ("", "all"):
-        return None, []
-    requested = [r.strip() for r in range_name.split(",") if r.strip()]
-    return requested, []
+    # The frontend sends a real list of tab names (a chip/tag input, not a
+    # comma-separated field) — a tab literally named "Q1, Actuals" could
+    # never be selected through a delimiter that's also a valid character in
+    # the name. Comma splitting is kept only for sources connected before
+    # that change (see normalize_tab_list).
+    return normalize_tab_list(range_name), []
 
 
 SHEET_ID_RE = re.compile(r"^[A-Za-z0-9-_]{20,}$")
@@ -98,7 +85,10 @@ def fetch_workbook(sheet_id: str):
         return None
 
 
-def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, qdrant, embeddings, collection: str):
+def read_sheet(sheet_id: str, range_name) -> dict:
+    """Fetch and parse the sheet into capped tables, without indexing
+    anything — shared by the column preview and the real sync.
+    Leaving tabs empty reads every tab; naming tabs reads only those."""
     validate_sheet_id(sheet_id)
     requested_tabs, _ = get_sheet_names(sheet_id, range_name)
 
@@ -119,13 +109,10 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
     else:
         tabs_to_read = requested_tabs if requested_tabs is not None else [None]
 
-    # NOTE: the purge deliberately happens AFTER the fetch loop below, not
-    # here. Deleting first meant a sheet that had since been made private
-    # wiped the existing index and then "succeeded" with nothing.
+    # NOTE: the purge deliberately happens AFTER all fetching, not before.
+    # Deleting first meant a sheet that had since been made private wiped
+    # the existing index and then "succeeded" with nothing.
 
-    previous = load_previous(source_id)
-    all_chunks = []
-    all_metas = []
     tables = []
     row_count = 0
     skipped = []
@@ -181,26 +168,7 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             rows = rows[:room]
             truncated = True
         row_count += len(rows)
-
-        # Personal-data columns (emails, phones) start hidden: they're left
-        # out of the embedded text as well as the table query.
-        hidden = resolve_hidden(previous, tab_label, columns, rows)
-        hidden_set = set(hidden)
-        tables.append({"tab": tab_label, "columns": columns, "rows": rows, "hidden": hidden})
-
-        for row in rows:
-            text = row_text(columns, row, hidden_set)
-            if not text:
-                continue
-            all_chunks.append(text)
-            all_metas.append({
-                "project_id": project_id,
-                "source_id": source_id,
-                "source_type": "gsheets",
-                "sheet_tab": tab_label,
-                "text": text,
-            })
-
+        tables.append((tab_label, columns, rows))
         synced.append(tab_label)
 
     # Previously this returned successfully, so a private/deleted/unreachable
@@ -215,17 +183,31 @@ def sync_sheet(sheet_id: str, range_name: str, project_id: str, source_id: str, 
             "that any tab names you entered match exactly."
         )
 
-    replace_points(qdrant, embeddings, collection, all_chunks, all_metas, "source_id", source_id)
-    # Only after the vectors were replaced, so a failed sync leaves the
-    # previous table and index consistent with each other.
-    save_tables(source_id, project_id, tables)
-
-    print(f"Synced {len(all_chunks)} rows from tabs: {synced}, skipped: {skipped}, capped: {capped_tabs}")
     return {
+        "tables": tables,
         "synced_tabs": synced,
         "skipped_tabs": skipped,
         "capped_tabs": capped_tabs,
-        "indexed_count": row_count,
+        "row_count": row_count,
         "truncated": truncated,
-        "hidden_columns": sorted({c for t in tables for c in t["hidden"]}),
+    }
+
+
+def sync_sheet(sheet_id: str, range_name, project_id: str, source_id: str, qdrant, embeddings,
+               collection: str, hidden_override: dict = None):
+    """hidden_override: {tab: [columns]} the merchant chose in the preview;
+    tabs not in it get the automatic personal-data defaults."""
+    sheet = read_sheet(sheet_id, range_name)
+    stored, embedded = index_tables(
+        sheet["tables"], project_id, source_id, "gsheets",
+        qdrant, embeddings, collection, hidden_override,
+    )
+    print(f"Synced {embedded} rows from tabs: {sheet['synced_tabs']}, skipped: {sheet['skipped_tabs']}, capped: {sheet['capped_tabs']}")
+    return {
+        "synced_tabs": sheet["synced_tabs"],
+        "skipped_tabs": sheet["skipped_tabs"],
+        "capped_tabs": sheet["capped_tabs"],
+        "indexed_count": sheet["row_count"],
+        "truncated": sheet["truncated"],
+        "hidden_columns": sorted({c for t in stored for c in t["hidden"]}),
     }

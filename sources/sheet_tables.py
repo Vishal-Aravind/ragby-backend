@@ -135,6 +135,85 @@ def resolve_hidden(previous: dict, tab: str, columns: list, rows: list) -> list:
     return [c for c in columns if c in prev_hidden or (c not in known and c in detected)]
 
 
+def normalize_tab_list(raw):
+    """Tab names to read, or None for "every tab". Accepts the chip input's
+    list, or the old comma-joined string that sources connected before the
+    chip input still have stored ("" / "all" = every tab)."""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        names = [str(r).strip() for r in raw if str(r).strip()]
+    else:
+        text = str(raw).strip()
+        if text.lower() in ("", "all"):
+            return None
+        names = [r.strip() for r in text.split(",") if r.strip()]
+    return names or None
+
+
+def preview_tables(parsed: list) -> list:
+    """What the merchant sees before connecting: each tab's columns with
+    personal-data-looking ones pre-unticked. Nothing is stored or embedded."""
+    out = []
+    for tab, columns, rows in parsed:
+        detected = detect_personal_columns(columns, rows)
+        out.append({
+            "tab": tab,
+            "columns": columns,
+            "hidden": [c for c in columns if c in detected],
+            "row_count": len(rows),
+        })
+    return out
+
+
+def parse_hidden_override(raw) -> dict:
+    """{tab: [column, ...]} from the request, or None if absent/malformed.
+    Column names are checked against the real columns at index time."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        str(tab): [str(c) for c in cols]
+        for tab, cols in raw.items()
+        if isinstance(cols, list)
+    }
+
+
+def index_tables(parsed: list, project_id: str, source_id: str, source_type: str,
+                 qdrant, embeddings, collection: str, hidden_override: dict = None):
+    """Embed the visible columns of each (tab, columns, rows) and store the
+    tables. hidden_override holds the merchant's choices from the preview;
+    any tab it doesn't cover keeps its previous choices / the automatic
+    personal-data defaults. Returns (stored tables, embedded row count)."""
+    previous = load_previous(source_id)
+    tables, chunks, metas = [], [], []
+    for tab, columns, rows in parsed:
+        if hidden_override is not None and tab in hidden_override:
+            chosen = set(hidden_override[tab])
+            hidden = [c for c in columns if c in chosen]
+        else:
+            hidden = resolve_hidden(previous, tab, columns, rows)
+        hidden_set = set(hidden)
+        tables.append({"tab": tab, "columns": columns, "rows": rows, "hidden": hidden})
+        for row in rows:
+            text = row_text(columns, row, hidden_set)
+            if not text:
+                continue
+            chunks.append(text)
+            metas.append({
+                "project_id": project_id,
+                "source_id": source_id,
+                "source_type": source_type,
+                "sheet_tab": tab,
+                "text": text,
+            })
+
+    replace_points(qdrant, embeddings, collection, chunks, metas, "source_id", source_id)
+    # Only after the vectors were replaced, so a failed sync leaves the
+    # previous table and index consistent with each other.
+    save_tables(source_id, project_id, tables)
+    return tables, len(chunks)
+
+
 def row_text(columns: list, row: list, hidden: set) -> str:
     return ", ".join(
         f"{col}: {val}" for col, val in zip(columns, row) if val and col not in hidden

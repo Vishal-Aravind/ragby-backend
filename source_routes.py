@@ -1,6 +1,9 @@
+import json
+
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from qdrant_client import models
+from starlette.concurrency import run_in_threadpool
 
 from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
@@ -21,12 +24,12 @@ def _clamp_max_pages(raw) -> int:
     except (TypeError, ValueError):
         return 30
     return max(1, min(value, MAX_CRAWL_PAGES))
-from sources.gsheets import sync_sheet
+from sources.gsheets import sync_sheet, read_sheet
 from sources.postgres import introspect_schema, validate_url
-from sources.excel import sync_excel_url, sync_excel_bytes
+from sources.excel import sync_excel_url, sync_excel_bytes, read_excel, fetch_excel_from_url
 from sources.website import sync_website
 from sources.shopify import sync_products as sync_shopify_products
-from sources.sheet_tables import reembed_from_tables
+from sources.sheet_tables import reembed_from_tables, preview_tables, parse_hidden_override
 from sources.table_query import invalidate as invalidate_tables
 
 router = APIRouter()
@@ -115,8 +118,9 @@ def add_source(data: dict, user=Depends(verify_token)):
         if data["type"] == "gsheets":
             cfg = data["config"]
             sync_result = sync_sheet(
-                cfg["sheet_id"], cfg["range"], data["projectId"],
-                source["id"], qdrant, embeddings, QDRANT_COLLECTION
+                cfg["sheet_id"], cfg.get("range"), data["projectId"],
+                source["id"], qdrant, embeddings, QDRANT_COLLECTION,
+                hidden_override=parse_hidden_override(data.get("hidden_columns")),
             )
             skipped_tabs = sync_result.get("skipped_tabs", [])
 
@@ -124,7 +128,9 @@ def add_source(data: dict, user=Depends(verify_token)):
             cfg = data["config"]
             sync_result = sync_excel_url(
                 cfg["url"], data["projectId"],
-                source["id"], qdrant, embeddings, QDRANT_COLLECTION
+                source["id"], qdrant, embeddings, QDRANT_COLLECTION,
+                tabs=cfg.get("tabs"),
+                hidden_override=parse_hidden_override(data.get("hidden_columns")),
             )
 
         elif data["type"] == "website":
@@ -312,7 +318,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
         if s["type"] == "gsheets":
             cfg = s["config"]
             sync_result = sync_sheet(
-                cfg["sheet_id"], cfg["range"],
+                cfg["sheet_id"], cfg.get("range"),
                 s["project_id"], source_id,
                 qdrant, embeddings, QDRANT_COLLECTION
             )
@@ -320,7 +326,8 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             cfg = s["config"]
             sync_result = sync_excel_url(
                 cfg["url"], s["project_id"],
-                source_id, qdrant, embeddings, QDRANT_COLLECTION
+                source_id, qdrant, embeddings, QDRANT_COLLECTION,
+                tabs=cfg.get("tabs"),
             )
         elif s["type"] == "website":
             cfg = s["config"]
@@ -363,6 +370,7 @@ def resync_source(source_id: str, user=Depends(verify_token)):
 
     return {
         "status": "synced",
+        "skipped_tabs": sync_result.get("skipped_tabs", []),
         "truncated": sync_result.get("truncated", False),
         "indexed_count": sync_result.get("indexed_count"),
         "total_count": sync_result.get("total_count"),
@@ -403,12 +411,101 @@ def introspect(data: dict, user=Depends(verify_token)):
         raise HTTPException(status_code=400, detail=f"Couldn't connect to that database — {str(e)}")
 
 
+def _json_form(raw: str, name: str):
+    """Multipart can't carry nested JSON natively, so list/dict fields
+    arrive as JSON strings. None when the field wasn't sent at all."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {name}.")
+
+
+async def _read_excel_upload(file: UploadFile) -> bytes:
+    file_bytes = await file.read()
+    # No byte cap existed anywhere on this path — not here, not in the
+    # Next.js proxy — so a scripted 2GB POST was read straight into the
+    # worker's memory. Mirrors the 25MB cap on the document upload route.
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="That file is too large. The limit is 25MB.")
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    return file_bytes
+
+
+# -------------------------------------------------
+# COLUMN PREVIEW (before connecting a sheet / Excel)
+# -------------------------------------------------
+# Reads the sheet/file and returns each tab's columns, with personal-data
+# ones pre-unticked, so the merchant chooses what the bot may use BEFORE
+# anything is indexed. Nothing is stored and nothing is embedded.
+def _preview_response(book: dict) -> dict:
+    return {
+        "tabs": preview_tables(book["tables"]),
+        "skipped_tabs": book.get("skipped_tabs", []),
+        "capped_tabs": book.get("capped_tabs", []),
+        "truncated": book.get("truncated", False),
+    }
+
+
+@router.post("/sources/preview")
+def preview_source(data: dict, user=Depends(verify_token)):
+    project_id = data.get("projectId")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="projectId is required")
+    require_project_access(user.id, project_id, tab="documents")
+    if is_rate_limited(f"source-preview:{project_id}", limit=20, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a minute and try again.")
+
+    cfg = data.get("config") or {}
+    try:
+        if data.get("type") == "gsheets":
+            return _preview_response(read_sheet(cfg.get("sheet_id", ""), cfg.get("range")))
+        if data.get("type") == "excel_online":
+            return _preview_response(read_excel(fetch_excel_from_url(cfg.get("url", "")), cfg.get("tabs")))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"preview_source error ({data.get('type')}): {e}")
+        raise HTTPException(status_code=400, detail="Couldn't read that source. Please check the link and try again.")
+    raise HTTPException(status_code=400, detail="Only spreadsheet sources have columns.")
+
+
+@router.post("/sources/preview-excel")
+async def preview_excel(
+    file: UploadFile = File(...),
+    projectId: str = Form(...),
+    tabs: str = Form(None),
+    user=Depends(verify_token),
+):
+    require_project_access(user.id, projectId, tab="documents")
+    if is_rate_limited(f"source-preview:{projectId}", limit=20, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a minute and try again.")
+    file_bytes = await _read_excel_upload(file)
+    tab_list = _json_form(tabs, "tabs")
+    try:
+        return await run_in_threadpool(lambda: _preview_response(read_excel(file_bytes, tab_list)))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"preview_excel error (project {projectId}): {e}")
+        raise HTTPException(status_code=400, detail="Couldn't read that file. Please check it and try again.")
+
+
 @router.post("/sources/upload-excel")
 async def upload_excel(
     file: UploadFile = File(...),
     projectId: str = Form(...),
     label: str = Form(""),
     source_id: str = Form(""),
+    # JSON list of sheet names; not sent (None) = keep a re-uploaded
+    # source's stored choice, [] = every sheet.
+    tabs: str = Form(None),
+    # JSON {sheet: [hidden columns]} from the preview popup.
+    hidden_columns: str = Form(None),
     user=Depends(verify_token)
 ):
     require_project_access(user.id, projectId, tab="documents")
@@ -422,15 +519,9 @@ async def upload_excel(
             detail="Too many uploads at once. Please wait a minute and try again.",
         )
 
-    file_bytes = await file.read()
-
-    # No byte cap existed anywhere on this path — not here, not in the
-    # Next.js proxy — so a scripted 2GB POST was read straight into the
-    # worker's memory. Mirrors the 25MB cap on the document upload route.
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="That file is too large. The limit is 25MB.")
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="That file is empty.")
+    file_bytes = await _read_excel_upload(file)
+    tab_list = _json_form(tabs, "tabs")
+    hidden_override = parse_hidden_override(_json_form(hidden_columns, "hidden_columns"))
 
     if source_id:
         # source_id is caller-supplied and was previously trusted on the
@@ -444,8 +535,15 @@ async def upload_excel(
         # role that delete_source requires. Creating a NEW source only
         # needs the documents permission.
         owning_project_id = _require_role_for_source(user.id, source_id, min_role="admin")
+        if tab_list is None:
+            # A plain re-upload keeps the sheets chosen when connecting.
+            existing_row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
+            tab_list = (existing_row.get("config") or {}).get("tabs")
         try:
-            sync_result = sync_excel_bytes(file_bytes, owning_project_id, source_id, qdrant, embeddings, QDRANT_COLLECTION)
+            sync_result = await run_in_threadpool(
+                sync_excel_bytes, file_bytes, owning_project_id, source_id, qdrant, embeddings,
+                QDRANT_COLLECTION, tab_list, hidden_override,
+            )
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"upload_excel re-upload error (source {source_id}): {e}")
@@ -454,7 +552,7 @@ async def upload_excel(
                 detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
             )
         supabase.table("data_sources").update({
-            "config": {"filename": file.filename},
+            "config": {"filename": file.filename, "tabs": tab_list},
             "label": label or file.filename,
         }).eq("id", source_id).execute()
         return {
@@ -463,6 +561,8 @@ async def upload_excel(
             "truncated": sync_result.get("truncated", False),
             "indexed_count": sync_result.get("indexed_count"),
             "total_count": sync_result.get("total_count"),
+            "skipped_tabs": sync_result.get("skipped_tabs", []),
+            "capped_tabs": sync_result.get("capped_tabs", []),
             "hidden_columns": sync_result.get("hidden_columns", []),
         }
 
@@ -470,7 +570,7 @@ async def upload_excel(
     # but skipped the plan cap entirely — so uploading here instead of
     # through /sources/add was an unlimited way around it.
     limits = get_plan_limits(projectId)
-    existing = supabase.table("data_sources")         .select("id", count="exact")         .eq("project_id", projectId)         .execute()
+    existing = supabase.table("data_sources").select("id", count="exact").eq("project_id", projectId).execute()
     if (existing.count or 0) >= limits["sources"]:
         raise HTTPException(
             status_code=403,
@@ -481,7 +581,7 @@ async def upload_excel(
         "project_id": projectId,
         "type": "excel_local",
         "label": label or file.filename,
-        "config": {"filename": file.filename},
+        "config": {"filename": file.filename, "tabs": tab_list},
         "allowed_schema": None,
     }).execute()
     source = res.data[0]
@@ -490,7 +590,10 @@ async def upload_excel(
     # a permanently orphaned row showing as "connected" with no content,
     # and returned a raw 500 whose body was shown to the user.
     try:
-        sync_result = sync_excel_bytes(file_bytes, projectId, source["id"], qdrant, embeddings, QDRANT_COLLECTION)
+        sync_result = await run_in_threadpool(
+            sync_excel_bytes, file_bytes, projectId, source["id"], qdrant, embeddings,
+            QDRANT_COLLECTION, tab_list, hidden_override,
+        )
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"upload_excel error (project {projectId}): {e}")
@@ -507,5 +610,7 @@ async def upload_excel(
         "truncated": sync_result.get("truncated", False),
         "indexed_count": sync_result.get("indexed_count"),
         "total_count": sync_result.get("total_count"),
+        "skipped_tabs": sync_result.get("skipped_tabs", []),
+        "capped_tabs": sync_result.get("capped_tabs", []),
         "hidden_columns": sync_result.get("hidden_columns", []),
     }
