@@ -14,7 +14,7 @@ from urllib.parse import urldefrag, urljoin, urlsplit
 import requests
 import sentry_sdk
 from bs4 import BeautifulSoup
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from text_splitter import split_text
 
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
@@ -270,12 +270,11 @@ def sync_website(
 
     # FIX: larger chunk size for website content
     # 2000 chars ≈ half the chunks vs 1000, better for long-form articles
-    splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
     all_chunks = []
     all_metas = []
 
     for page in pages:
-        chunks = splitter.split_text(page["text"])
+        chunks = split_text(page["text"], chunk_size=2000, chunk_overlap=300)
         for c in chunks:
             all_chunks.append(c)
             all_metas.append({

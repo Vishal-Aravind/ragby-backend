@@ -10,7 +10,7 @@ import pdfplumber
 from docx import Document
 from pptx import Presentation
 import pandas as pd
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from text_splitter import split_text
 from qdrant_client import models
 
 from clients import supabase, qdrant, embeddings
@@ -235,11 +235,10 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
         )
 
     try:
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks, metas = [], []
 
         for page, text in pages:
-            for c in splitter.split_text(text):
+            for c in split_text(text, chunk_size=1500, chunk_overlap=200):
                 chunks.append(c)
                 metas.append({
                     "project_id": req.projectId,

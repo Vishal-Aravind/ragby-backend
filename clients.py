@@ -2,7 +2,6 @@ import httpx
 from supabase import create_client, ClientOptions
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from langchain_openai import OpenAIEmbeddings
 
 from config import (
     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
@@ -50,9 +49,33 @@ openai_client = OpenAI(
     max_retries=1,
 )
 
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    openai_api_key=OPENAI_API_KEY,
-    timeout=OPENAI_TIMEOUT_SECONDS,
-    max_retries=1,
-)
+class OpenAIEmbedder:
+    """Same interface as langchain's OpenAIEmbeddings (embed_documents /
+    embed_query), calling the OpenAI client we already have. langchain_openai
+    cost ~21MB of RAM at import on a 512MB instance just to wrap this call.
+
+    Texts are capped at 6,000 characters, safely under the model's 8,191
+    token input limit. Document/website chunks are 1,500-2,000 characters,
+    so only an unusually long sheet row is ever shortened — and only for
+    the vector search; the full row stays in the table copy."""
+
+    MODEL = "text-embedding-3-small"
+    MAX_CHARS = 6000
+    MAX_PER_REQUEST = 1000
+
+    def __init__(self, client):
+        self._client = client
+
+    def embed_documents(self, texts: list) -> list:
+        vectors = []
+        for i in range(0, len(texts), self.MAX_PER_REQUEST):
+            batch = [(t or " ")[:self.MAX_CHARS] for t in texts[i:i + self.MAX_PER_REQUEST]]
+            res = self._client.embeddings.create(model=self.MODEL, input=batch)
+            vectors.extend(d.embedding for d in sorted(res.data, key=lambda d: d.index))
+        return vectors
+
+    def embed_query(self, text: str) -> list:
+        return self.embed_documents([text])[0]
+
+
+embeddings = OpenAIEmbedder(openai_client)
