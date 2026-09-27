@@ -1,5 +1,7 @@
 import json
 
+from memlog import mem_summary
+
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from qdrant_client import models
@@ -441,6 +443,7 @@ async def _read_excel_upload(file: UploadFile) -> bytes:
 # ones pre-unticked, so the merchant chooses what the bot may use BEFORE
 # anything is indexed. Nothing is stored and nothing is embedded.
 def _preview_response(book: dict) -> dict:
+    print(f"[mem] column preview read {book.get('row_count')} rows: {mem_summary()}")
     return {
         "tabs": preview_tables(book["tables"]),
         "skipped_tabs": book.get("skipped_tabs", []),

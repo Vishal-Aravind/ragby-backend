@@ -18,6 +18,8 @@ import uuid
 import sentry_sdk
 from qdrant_client import models
 
+from memlog import mem_summary
+
 EMBED_BATCH_SIZE = 100
 _DELETE_BATCH_SIZE = 1000
 
@@ -57,10 +59,13 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
     it before. `match_key`/`match_value` identify the file/source
     (e.g. "source_id", <id>) — the same field the old purge filtered on."""
     old_ids = _existing_point_ids(qdrant, collection, match_key, match_value)
+    print(f"[mem] replace_points start ({len(chunks)} chunks, {match_key}={match_value}): {mem_summary()}")
 
     new_ids = []
     try:
         for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+            if i and i % (EMBED_BATCH_SIZE * 10) == 0:
+                print(f"[mem] replace_points {i}/{len(chunks)}: {mem_summary()}")
             vectors = embeddings.embed_documents(chunks[i:i + EMBED_BATCH_SIZE])
             points = [
                 models.PointStruct(id=str(uuid.uuid4()), vector=v, payload=m)
@@ -78,3 +83,4 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
         raise
 
     _delete_ids(qdrant, collection, old_ids)
+    print(f"[mem] replace_points done: {mem_summary()}")

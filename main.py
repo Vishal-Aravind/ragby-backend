@@ -367,3 +367,6 @@ app.include_router(razorpay_oauth_router)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+from memlog import mem_summary as _mem_summary
+print(f"[mem] app loaded: {_mem_summary()}")
