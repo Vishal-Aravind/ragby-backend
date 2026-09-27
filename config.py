@@ -114,9 +114,16 @@ PLAN_LIMITS = {
     # PDF hits a real wall. Business stays at 49MB -- the Storage bucket's
     # own existing hard file_size_limit, so it's effectively uncapped beyond
     # the technical ceiling that already existed before this.
-    "free":     {"conversations": 300,   "seats": 1,   "documents": 25,   "sources": 3,   "maxFileMB": 10},
-    "pro":      {"conversations": 5000,  "seats": 5,   "documents": 500,  "sources": 20,  "maxFileMB": 25},
-    "business": {"conversations": 25000, "seats": 100, "documents": 5000, "sources": 100, "maxFileMB": 49},
+    #
+    # items: ONE shared limit on everything in the knowledge base — uploaded
+    # documents, text notes, Google Sheets, Excel files, websites and
+    # databases together (see usage.count_knowledge_items). Separate
+    # "25 documents / 3 sources" counters were confusing to merchants, and a
+    # typical small business needs ~5-10 items (menu/price list, FAQ note,
+    # website, a sheet, a few PDFs), so Pro covers that with room to spare.
+    "free":     {"conversations": 300,   "seats": 1,   "items": 3,  "maxFileMB": 10},
+    "pro":      {"conversations": 5000,  "seats": 5,   "items": 15, "maxFileMB": 25},
+    "business": {"conversations": 25000, "seats": 100, "items": 50, "maxFileMB": 49},
 }
 
 # Hard ceilings that apply on EVERY plan, including business. Embedding is

@@ -38,10 +38,41 @@ def project_limits(project_id: str, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="documents")
     limits = get_plan_limits(project_id)
     return {
-        "documents": limits["documents"],
-        "sources": limits["sources"],
+        "items": limits["items"],
+        "used": count_knowledge_items(project_id),
         "maxFileMB": limits["maxFileMB"],
     }
+
+
+def count_knowledge_items(project_id: str, exclude_file_id: str = None) -> int:
+    """Everything counted against the plan's single "items" limit: uploaded
+    documents and text notes (files) plus connected sources (sheets, Excel,
+    websites, databases). Shopify is excluded — it's a store integration
+    connected through OAuth, not something uploaded into the knowledge base.
+    exclude_file_id: the file being ingested right now, whose row already
+    exists (re-saving a note must not count against itself)."""
+    # A file whose processing failed stays listed (so the merchant can see
+    # the error and delete it) but isn't in the knowledge base — with a
+    # limit of 3 it must not eat a slot.
+    files = (
+        supabase.table("files").select("id", count="exact")
+        .eq("project_id", project_id).neq("status", "failed")
+    )
+    if exclude_file_id:
+        files = files.neq("id", exclude_file_id)
+    sources = (
+        supabase.table("data_sources").select("id", count="exact")
+        .eq("project_id", project_id).neq("type", "shopify")
+    )
+    return (files.execute().count or 0) + (sources.execute().count or 0)
+
+
+def knowledge_limit_message(limit: int) -> str:
+    return (
+        f"You've reached your plan's limit of {limit} items in your knowledge base "
+        f"(documents, notes, sheets, Excel files, websites and databases combined). "
+        f"Delete one, or upgrade your plan, to add more."
+    )
 
 
 def check_rate_limit(project_id: str) -> dict:

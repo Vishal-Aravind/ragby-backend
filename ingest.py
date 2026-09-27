@@ -18,7 +18,7 @@ from vector_sync import replace_points
 from config import QDRANT_COLLECTION, MAX_CHUNKS_PER_INGEST
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
-from usage import get_plan_limits
+from usage import get_plan_limits, count_knowledge_items, knowledge_limit_message
 
 router = APIRouter()
 
@@ -145,15 +145,24 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
             sentry_sdk.capture_exception(e)
         raise HTTPException(status_code=status_code, detail=detail)
 
-    # Count OTHER documents in the project — this one's row already exists,
-    # created by the upload route before it called us.
+    # Count everything ELSE in the knowledge base — this file's row already
+    # exists, created by the upload route before it called us.
+    #
+    # Skipped when this REPLACES a file that's already indexed (an edited
+    # note re-saved, a same-named re-upload): that adds no item. Without
+    # this, a merchant already over a lowered limit who edited a note had it
+    # rejected — and _reject deletes the row, so the note was lost. "Already
+    # indexed" is read from Qdrant, not from anything the caller sends.
     limits = get_plan_limits(req.projectId)
-    existing = supabase.table("files")         .select("id", count="exact")         .eq("project_id", req.projectId)         .neq("id", file_id)         .execute()
-    if (existing.count or 0) >= limits["documents"]:
-        _reject(
-            403,
-            f"You've reached your plan's limit of {limits['documents']} documents. Delete one, or upgrade your plan, to add more.",
-        )
+    already_indexed = qdrant.count(
+        collection_name=QDRANT_COLLECTION,
+        count_filter=models.Filter(must=[
+            models.FieldCondition(key="file_id", match=models.MatchValue(value=file_id))
+        ]),
+        exact=False,
+    ).count > 0
+    if not already_indexed and count_knowledge_items(req.projectId, exclude_file_id=file_id) >= limits["items"]:
+        _reject(403, knowledge_limit_message(limits["items"]))
 
     # Real backstop behind the frontend's own pre-check and the upload-url
     # route's fast-fail — a client that skips both could still reach here.

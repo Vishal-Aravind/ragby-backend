@@ -11,7 +11,7 @@ from clients import supabase, qdrant, embeddings
 from config import QDRANT_COLLECTION
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
-from usage import get_plan_limits
+from usage import get_plan_limits, count_knowledge_items, knowledge_limit_message
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_CRAWL_PAGES = 100
@@ -89,12 +89,8 @@ def add_source(data: dict, user=Depends(verify_token)):
         )
 
     limits = get_plan_limits(project_id)
-    existing = supabase.table("data_sources")         .select("id", count="exact")         .eq("project_id", project_id)         .execute()
-    if (existing.count or 0) >= limits["sources"]:
-        raise HTTPException(
-            status_code=403,
-            detail=f"You've reached your plan's limit of {limits['sources']} connected sources. Disconnect one, or upgrade your plan, to add more.",
-        )
+    if count_knowledge_items(project_id) >= limits["items"]:
+        raise HTTPException(status_code=403, detail=knowledge_limit_message(limits["items"]))
 
     res = supabase.table("data_sources").insert({
         "project_id": data["projectId"],
@@ -578,12 +574,8 @@ async def upload_excel(
     # but skipped the plan cap entirely — so uploading here instead of
     # through /sources/add was an unlimited way around it.
     limits = get_plan_limits(projectId)
-    existing = supabase.table("data_sources").select("id", count="exact").eq("project_id", projectId).execute()
-    if (existing.count or 0) >= limits["sources"]:
-        raise HTTPException(
-            status_code=403,
-            detail=f"You've reached your plan's limit of {limits['sources']} connected sources. Disconnect one, or upgrade your plan, to add more.",
-        )
+    if count_knowledge_items(projectId) >= limits["items"]:
+        raise HTTPException(status_code=403, detail=knowledge_limit_message(limits["items"]))
 
     res = supabase.table("data_sources").insert({
         "project_id": projectId,
