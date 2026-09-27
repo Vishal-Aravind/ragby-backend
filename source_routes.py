@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from memlog import mem_summary, release_memory
 
@@ -77,6 +78,42 @@ def list_sources(project_id: str, user=Depends(verify_token)):
     return [_redact_source(s) for s in res.data]
 
 
+# -------------------------------------------------
+# SYNC STATE
+# -------------------------------------------------
+# Indexing runs inside the request. If the instance dies mid-sync (out of
+# memory, a deploy restart) nothing gets to clean up: the source row stays,
+# with only the batches embedded before the crash — it looked "connected"
+# while answering from ~150 of 5,000 rows. config.sync_status records
+# "syncing" before indexing and "done" after, so a sync that never finished
+# is visible (the UI shows it as incomplete and asks for a Reload).
+# Kept inside config (jsonb) so it needs no schema change.
+_INDEXED_TYPES = ("gsheets", "excel_online", "excel_local", "website", "shopify")
+
+
+def _syncing_config(config: dict) -> dict:
+    return {
+        **(config or {}),
+        "sync_status": "syncing",
+        "sync_started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _set_sync_status(source_id: str, status: str, config: dict = None):
+    try:
+        if config is None:
+            row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
+            config = row.get("config") or {}
+        config = {**config, "sync_status": status}
+        if status == "syncing":
+            config["sync_started_at"] = datetime.now(timezone.utc).isoformat()
+        supabase.table("data_sources").update({"config": config}).eq("id", source_id).execute()
+    except Exception as e:
+        # Status bookkeeping must never fail the sync itself.
+        sentry_sdk.capture_exception(e)
+        print(f"sync status update failed for {source_id}: {e}")
+
+
 @router.post("/sources/add")
 def add_source(data: dict, user=Depends(verify_token)):
     require_project_access(user.id, data["projectId"], tab="documents")
@@ -96,7 +133,7 @@ def add_source(data: dict, user=Depends(verify_token)):
         "project_id": data["projectId"],
         "type": data["type"],
         "label": data.get("label") or data["type"],
-        "config": data["config"],
+        "config": _syncing_config(data["config"]) if data["type"] in _INDEXED_TYPES else data["config"],
         "allowed_schema": data.get("allowed_schema"),
     }).execute()
     source = res.data[0]
@@ -178,6 +215,9 @@ def add_source(data: dict, user=Depends(verify_token)):
             status_code=400,
             detail=str(e) if isinstance(e, ValueError) else "Failed to connect this source. Please check the details and try again."
         )
+
+    if data["type"] in _INDEXED_TYPES:
+        _set_sync_status(source["id"], "done", source.get("config"))
 
     return {
         "id": source["id"],
@@ -305,6 +345,8 @@ def resync_source(source_id: str, user=Depends(verify_token)):
 
     res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
     s = res.data
+    if s["type"] in _INDEXED_TYPES:
+        _set_sync_status(source_id, "syncing", s.get("config"))
 
     # No pre-emptive purge here: every sync_* function already deletes this
     # source's points itself as part of its own run. Deleting here too meant
@@ -361,10 +403,17 @@ def resync_source(source_id: str, user=Depends(verify_token)):
         # anyway, leaving the source connected but genuinely empty with no
         # indication anything went wrong.
         print(f"resync_source error ({s['type']}): {e}")
+        # A handled failure leaves the previous index in place (the new
+        # batches are rolled back), so the source is as complete as before.
+        if s["type"] in _INDEXED_TYPES:
+            _set_sync_status(source_id, "done", s.get("config"))
         raise HTTPException(
             status_code=400,
             detail=str(e) if isinstance(e, ValueError) else "Failed to refresh this source. Please try again."
         )
+
+    if s["type"] in _INDEXED_TYPES:
+        _set_sync_status(source_id, "done", s.get("config"))
 
     return {
         "status": "synced",
@@ -543,6 +592,7 @@ async def upload_excel(
             # A plain re-upload keeps the sheets chosen when connecting.
             existing_row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
             tab_list = (existing_row.get("config") or {}).get("tabs")
+        _set_sync_status(source_id, "syncing")
         try:
             sync_result = await run_in_threadpool(
                 sync_excel_bytes, file_bytes, owning_project_id, source_id, qdrant, embeddings,
@@ -551,12 +601,13 @@ async def upload_excel(
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"upload_excel re-upload error (source {source_id}): {e}")
+            _set_sync_status(source_id, "done")
             raise HTTPException(
                 status_code=400,
                 detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
             )
         supabase.table("data_sources").update({
-            "config": {"filename": file.filename, "tabs": tab_list},
+            "config": {"filename": file.filename, "tabs": tab_list, "sync_status": "done"},
             "label": label or file.filename,
         }).eq("id", source_id).execute()
         return {
@@ -581,7 +632,7 @@ async def upload_excel(
         "project_id": projectId,
         "type": "excel_local",
         "label": label or file.filename,
-        "config": {"filename": file.filename, "tabs": tab_list},
+        "config": _syncing_config({"filename": file.filename, "tabs": tab_list}),
         "allowed_schema": None,
     }).execute()
     source = res.data[0]
@@ -603,6 +654,8 @@ async def upload_excel(
             status_code=400,
             detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
         )
+
+    _set_sync_status(source["id"], "done", source.get("config"))
 
     return {
         "id": source["id"],
