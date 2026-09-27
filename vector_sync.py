@@ -65,11 +65,14 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
     try:
         for i in range(0, len(chunks), EMBED_BATCH_SIZE):
             if i:
-                # Hand the previous batch's memory back to the OS, or RSS
-                # creeps up ~10MB per 100 rows on Render (see memlog.py).
-                # Measured: trimming only every 1,000 rows still let it
-                # spike ~100MB between trims (peak 428MB of 512MB).
-                release_memory(collect=False)
+                # Free the previous batch and hand its memory back to the
+                # OS. The full gc.collect() matters: Render logs showed RSS
+                # climbing ~50MB per 1,000 rows with trim alone (the batch's
+                # response objects sit in reference cycles only a full
+                # collection frees) — peak 545MB on a 512MB instance, all
+                # released at the end where a full collect ran. Costs
+                # ~150ms per batch, ~7s on a 5,000-row sync.
+                release_memory(collect=True)
             if i and i % (EMBED_BATCH_SIZE * 10) == 0:
                 print(f"[mem] replace_points {i}/{len(chunks)}: {mem_summary()}")
             vectors = embeddings.embed_documents(chunks[i:i + EMBED_BATCH_SIZE])
