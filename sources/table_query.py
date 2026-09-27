@@ -18,12 +18,19 @@ from clients import supabase
 DEFAULT_ROWS = 10
 FULL_ROWS = 200
 
-# A few recently used projects' tables, so a burst of questions doesn't
-# re-download the same sheet every time. Bounded — the instance only has
-# 512MB — and short-lived; save_tables() also invalidates on every sync.
+# Recently used projects' tables, so a burst of questions doesn't
+# re-download the same sheet every time. Short-lived; save_tables() also
+# invalidates on every sync. Bounded by total CELLS, not project count: a
+# full 5,000 x 15 sheet measured ~5.5MB in memory and a Pro project can
+# have 20 sheets, so "20 projects" could have been over 1GB on a 512MB
+# instance. 300k cells is roughly 20-25MB.
 _CACHE_TTL_SECONDS = 60
-_CACHE_MAX_PROJECTS = 20
-_cache = OrderedDict()
+_CACHE_MAX_CELLS = 300_000
+_cache = OrderedDict()  # project_id -> (expires_at, tables, cell_count)
+
+
+def _cell_count(tables: list) -> int:
+    return sum(len(t["rows"]) * len(t["columns"]) for t in tables)
 
 _OPS = {"equals", "not_equals", "contains", "lt", "lte", "gt", "gte"}
 _AGG_FNS = {"count", "sum", "avg", "min", "max"}
@@ -69,10 +76,15 @@ def load_project_tables(project_id: str) -> list:
         sentry_sdk.capture_exception(e)
         print(f"load_project_tables failed for {project_id}: {e}")
 
-    _cache[project_id] = (time.time() + _CACHE_TTL_SECONDS, tables)
-    _cache.move_to_end(project_id)
-    while len(_cache) > _CACHE_MAX_PROJECTS:
-        _cache.popitem(last=False)
+    cells = _cell_count(tables)
+    # A single project bigger than the whole budget is just not cached.
+    if cells <= _CACHE_MAX_CELLS:
+        _cache[project_id] = (time.time() + _CACHE_TTL_SECONDS, tables, cells)
+        _cache.move_to_end(project_id)
+        total = sum(entry[2] for entry in _cache.values())
+        while total > _CACHE_MAX_CELLS:
+            _, evicted = _cache.popitem(last=False)
+            total -= evicted[2]
     return tables
 
 
