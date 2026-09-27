@@ -368,5 +368,8 @@ app.include_router(razorpay_oauth_router)
 def health():
     return {"status": "ok"}
 
-from memlog import mem_summary as _mem_summary
+# Before the threadpool starts: cap glibc malloc arenas so worker threads
+# don't each hoard freed memory (see memlog.py).
+from memlog import mem_summary as _mem_summary, limit_malloc_arenas as _limit_malloc_arenas
+_limit_malloc_arenas()
 print(f"[mem] app loaded: {_mem_summary()}")

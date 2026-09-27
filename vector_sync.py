@@ -18,7 +18,7 @@ import uuid
 import sentry_sdk
 from qdrant_client import models
 
-from memlog import mem_summary
+from memlog import mem_summary, release_memory
 
 EMBED_BATCH_SIZE = 100
 _DELETE_BATCH_SIZE = 1000
@@ -65,6 +65,9 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
     try:
         for i in range(0, len(chunks), EMBED_BATCH_SIZE):
             if i and i % (EMBED_BATCH_SIZE * 10) == 0:
+                # Every 1,000 rows: hand the finished batches' memory back
+                # to the OS, or RSS creeps up per batch (see memlog.py).
+                release_memory()
                 print(f"[mem] replace_points {i}/{len(chunks)}: {mem_summary()}")
             vectors = embeddings.embed_documents(chunks[i:i + EMBED_BATCH_SIZE])
             points = [
@@ -83,4 +86,5 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
         raise
 
     _delete_ids(qdrant, collection, old_ids)
+    release_memory()
     print(f"[mem] replace_points done: {mem_summary()}")

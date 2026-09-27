@@ -1,6 +1,6 @@
 import json
 
-from memlog import mem_summary
+from memlog import mem_summary, release_memory
 
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
@@ -443,13 +443,18 @@ async def _read_excel_upload(file: UploadFile) -> bytes:
 # ones pre-unticked, so the merchant chooses what the bot may use BEFORE
 # anything is indexed. Nothing is stored and nothing is embedded.
 def _preview_response(book: dict) -> dict:
-    print(f"[mem] column preview read {book.get('row_count')} rows: {mem_summary()}")
-    return {
+    response = {
         "tabs": preview_tables(book["tables"]),
         "skipped_tabs": book.get("skipped_tabs", []),
         "capped_tabs": book.get("capped_tabs", []),
         "truncated": book.get("truncated", False),
     }
+    # The parsed rows are discarded right after this; give their memory
+    # back before the real sync (which usually follows) starts.
+    book.clear()
+    release_memory()
+    print(f"[mem] column preview done: {mem_summary()}")
+    return response
 
 
 @router.post("/sources/preview")
