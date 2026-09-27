@@ -64,10 +64,13 @@ def replace_points(qdrant, embeddings, collection: str, chunks: list, metas: lis
     new_ids = []
     try:
         for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+            if i:
+                # Hand the previous batch's memory back to the OS, or RSS
+                # creeps up ~10MB per 100 rows on Render (see memlog.py).
+                # Measured: trimming only every 1,000 rows still let it
+                # spike ~100MB between trims (peak 428MB of 512MB).
+                release_memory(collect=False)
             if i and i % (EMBED_BATCH_SIZE * 10) == 0:
-                # Every 1,000 rows: hand the finished batches' memory back
-                # to the OS, or RSS creeps up per batch (see memlog.py).
-                release_memory()
                 print(f"[mem] replace_points {i}/{len(chunks)}: {mem_summary()}")
             vectors = embeddings.embed_documents(chunks[i:i + EMBED_BATCH_SIZE])
             points = [

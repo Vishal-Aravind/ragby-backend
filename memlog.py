@@ -31,9 +31,12 @@ def limit_malloc_arenas(n: int = 2):
             pass
 
 
-def release_memory():
-    """Collect garbage, then return freed heap pages to the OS."""
-    gc.collect()
+def release_memory(collect: bool = True):
+    """Return freed heap pages to the OS. The embedding batches are freed by
+    refcounting alone, so the cheap per-batch call skips the (slower) full
+    garbage collection and only trims."""
+    if collect:
+        gc.collect()
     if _libc is not None:
         try:
             _libc.malloc_trim(0)
