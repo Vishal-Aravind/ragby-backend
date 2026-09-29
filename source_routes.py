@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timezone
 
 from memlog import mem_summary, release_memory
@@ -8,32 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from qdrant_client import models
 from starlette.concurrency import run_in_threadpool
 
-from clients import supabase, qdrant, embeddings
+from clients import supabase, qdrant
 from config import QDRANT_COLLECTION
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
 from usage import get_plan_limits, count_knowledge_items, knowledge_limit_message
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-MAX_CRAWL_PAGES = 100
 
 
-def _clamp_max_pages(raw) -> int:
-    """max_pages is caller-supplied and drives how many pages we fetch and
-    embed. It was passed through unclamped, so `max_pages: 1000000` was
-    accepted; a null/NaN value also crashed the crawl loop on a comparison."""
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return 30
-    return max(1, min(value, MAX_CRAWL_PAGES))
-from sources.gsheets import sync_sheet, read_sheet
+from sources.gsheets import read_sheet
 from sources.postgres import introspect_schema, validate_url
-from sources.excel import sync_excel_url, sync_excel_bytes, read_excel, fetch_excel_from_url
-from sources.website import sync_website
-from sources.shopify import sync_products as sync_shopify_products
-from sources.sheet_tables import reembed_from_tables, preview_tables, parse_hidden_override
+from sources.excel import read_excel, fetch_excel_from_url
+from sources.sheet_tables import preview_tables
 from sources.table_query import invalidate as invalidate_tables
+from jobs import enqueue
 
 router = APIRouter()
 
@@ -81,37 +71,37 @@ def list_sources(project_id: str, user=Depends(verify_token)):
 # -------------------------------------------------
 # SYNC STATE
 # -------------------------------------------------
-# Indexing runs inside the request. If the instance dies mid-sync (out of
-# memory, a deploy restart) nothing gets to clean up: the source row stays,
-# with only the batches embedded before the crash — it looked "connected"
-# while answering from ~150 of 5,000 rows. config.sync_status records
-# "syncing" before indexing and "done" after, so a sync that never finished
-# is visible (the UI shows it as incomplete and asks for a Reload).
-# Kept inside config (jsonb) so it needs no schema change.
+# Indexing runs as a background job (jobs.py -> job_runner.py), so these
+# endpoints return as soon as the job is queued. The job records progress
+# and the outcome in config (jsonb, no schema change):
+#   sync_status  queued -> syncing -> done | failed
+#   sync_error / sync_result
+# which the dashboard polls. A status stuck at queued/syncing long past any
+# possible run time means the job never finished; the UI shows that as
+# incomplete and offers a Reload.
 _INDEXED_TYPES = ("gsheets", "excel_online", "excel_local", "website", "shopify")
+_ADDABLE_TYPES = ("gsheets", "excel_online", "website", "shopify", "postgres")
 
 
-def _syncing_config(config: dict) -> dict:
+def _queued_config(config: dict) -> dict:
     return {
         **(config or {}),
-        "sync_status": "syncing",
+        "sync_status": "queued",
         "sync_started_at": datetime.now(timezone.utc).isoformat(),
+        "sync_error": None,
     }
 
 
-def _set_sync_status(source_id: str, status: str, config: dict = None):
+def _is_indexing(config: dict) -> bool:
+    """A job for this source is queued or running (and not abandoned)."""
+    config = config or {}
+    if config.get("sync_status") not in ("queued", "syncing"):
+        return False
     try:
-        if config is None:
-            row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
-            config = row.get("config") or {}
-        config = {**config, "sync_status": status}
-        if status == "syncing":
-            config["sync_started_at"] = datetime.now(timezone.utc).isoformat()
-        supabase.table("data_sources").update({"config": config}).eq("id", source_id).execute()
-    except Exception as e:
-        # Status bookkeeping must never fail the sync itself.
-        sentry_sdk.capture_exception(e)
-        print(f"sync status update failed for {source_id}: {e}")
+        started = datetime.fromisoformat(config.get("sync_started_at"))
+    except (TypeError, ValueError):
+        return False
+    return (datetime.now(timezone.utc) - started).total_seconds() < 45 * 60
 
 
 @router.post("/sources/add")
@@ -119,6 +109,8 @@ def add_source(data: dict, user=Depends(verify_token)):
     require_project_access(user.id, data["projectId"], tab="documents")
 
     project_id = data["projectId"]
+    if data.get("type") not in _ADDABLE_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported source type.")
     if is_rate_limited(f"source-add:{project_id}", limit=10, window_seconds=60):
         raise HTTPException(
             status_code=429,
@@ -129,105 +121,45 @@ def add_source(data: dict, user=Depends(verify_token)):
     if count_knowledge_items(project_id) >= limits["items"]:
         raise HTTPException(status_code=403, detail=knowledge_limit_message(limits["items"]))
 
+    if data["type"] == "postgres":
+        # Nothing to embed — this just re-verifies the connection is real
+        # (same checks as /sources/introspect) before saving it, so it stays
+        # synchronous. Previously this branch didn't exist at all, so a
+        # postgres source skipped both the SSRF check and any connectivity
+        # verification and was always reported as saved successfully.
+        cfg = data["config"]
+        try:
+            validate_url(cfg["url"])
+            introspect_schema(cfg["url"])
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            raise HTTPException(
+                status_code=400,
+                detail=str(e) if isinstance(e, ValueError) else "Failed to connect this database. Please check the details and try again.",
+            )
+        res = supabase.table("data_sources").insert({
+            "project_id": project_id,
+            "type": "postgres",
+            "label": data.get("label") or "postgres",
+            "config": cfg,
+            "allowed_schema": data.get("allowed_schema"),
+        }).execute()
+        return {"id": res.data[0]["id"], "status": "done"}
+
     res = supabase.table("data_sources").insert({
-        "project_id": data["projectId"],
+        "project_id": project_id,
         "type": data["type"],
         "label": data.get("label") or data["type"],
-        "config": _syncing_config(data["config"]) if data["type"] in _INDEXED_TYPES else data["config"],
+        "config": _queued_config(data["config"]),
         "allowed_schema": data.get("allowed_schema"),
     }).execute()
     source = res.data[0]
 
-    skipped_tabs = []
-    sync_result = {}
-
-    # The data_sources row above is inserted BEFORE any of these sync calls
-    # run. If a sync call raises (network error, crawler blocked, embedding
-    # API failure, etc.) instead of cleanly returning, the row was
-    # previously left behind with no actual indexed content — showing up
-    # as "connected" in the UI while the bot has nothing to answer from.
-    # Wrapping each in try/except so ANY failure is treated the same way:
-    # clean up the orphaned row and tell the user honestly, instead of a
-    # raw 500 and a silently broken "connected" source.
-    try:
-        if data["type"] == "gsheets":
-            cfg = data["config"]
-            sync_result = sync_sheet(
-                cfg["sheet_id"], cfg.get("range"), data["projectId"],
-                source["id"], qdrant, embeddings, QDRANT_COLLECTION,
-                hidden_override=parse_hidden_override(data.get("hidden_columns")),
-            )
-            skipped_tabs = sync_result.get("skipped_tabs", [])
-
-        elif data["type"] == "excel_online":
-            cfg = data["config"]
-            sync_result = sync_excel_url(
-                cfg["url"], data["projectId"],
-                source["id"], qdrant, embeddings, QDRANT_COLLECTION,
-                tabs=cfg.get("tabs"),
-                hidden_override=parse_hidden_override(data.get("hidden_columns")),
-            )
-
-        elif data["type"] == "website":
-            cfg = data["config"]
-            sync_result = sync_website(
-                url=cfg["url"],
-                project_id=data["projectId"],
-                source_id=source["id"],
-                qdrant=qdrant,
-                embeddings=embeddings,
-                collection=QDRANT_COLLECTION,
-                full_site=cfg.get("full_site", True),
-                max_pages=_clamp_max_pages(cfg.get("max_pages")),
-            )
-            if sync_result["pages_indexed"] == 0:
-                raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
-
-        elif data["type"] == "shopify":
-            # In practice this data_sources row is usually created by the
-            # OAuth callback (shopify_oauth.py) itself, not this generic
-            # form — wiring it here too keeps the resync/list UI uniform
-            # across every source type.
-            sync_result = sync_shopify_products(
-                data["projectId"], source["id"], qdrant, embeddings, QDRANT_COLLECTION
-            )
-
-        elif data["type"] == "postgres":
-            # Unlike the other types, there's nothing to embed — this just
-            # re-verifies the connection is real (same checks as
-            # /sources/introspect) before treating the row as connected.
-            # Previously this branch didn't exist at all, so a postgres
-            # source skipped both the SSRF check and any connectivity
-            # verification and was always reported as saved successfully.
-            cfg = data["config"]
-            validate_url(cfg["url"])
-            introspect_schema(cfg["url"])
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        print(f"add_source sync error ({data['type']}): {e}")
-        # Purge points too, not just the row — a sync that failed partway
-        # may already have uploaded vectors, and once the row is gone
-        # nothing can ever reach them again (no delete path takes an
-        # orphaned source_id), so they'd keep answering questions forever.
-        _purge_source_points(source["id"])
-        supabase.table("data_sources").delete().eq("id", source["id"]).execute()
-        raise HTTPException(
-            status_code=400,
-            detail=str(e) if isinstance(e, ValueError) else "Failed to connect this source. Please check the details and try again."
-        )
-
-    if data["type"] in _INDEXED_TYPES:
-        _set_sync_status(source["id"], "done", source.get("config"))
-
-    return {
-        "id": source["id"],
-        "skipped_tabs": skipped_tabs,
-        "capped_tabs": sync_result.get("capped_tabs", []),
-        "truncated": sync_result.get("truncated", False),
-        "indexed_count": sync_result.get("indexed_count"),
-        "total_count": sync_result.get("total_count"),
-        "hidden_columns": sync_result.get("hidden_columns", []),
-    }
+    # If this sync fails (private sheet, blocked site), the job marks the
+    # source failed with the reason rather than deleting it, so the
+    # merchant sees why and can Reload or delete it.
+    enqueue("sync_source", {"source_id": source["id"], "hidden_columns": data.get("hidden_columns")})
+    return {"id": source["id"], "status": "queued"}
 
 
 def _require_role_for_source(user_id: str, source_id: str, min_role: str = None) -> str:
@@ -312,22 +244,19 @@ def set_source_columns(source_id: str, data: dict, user=Depends(verify_token)):
             .eq("tab", r["tab"]) \
             .execute()
 
-    source_type = "gsheets" if src["type"] == "gsheets" else "excel"
-    try:
-        # Hidden columns must leave the vector index too, not just the
-        # table query.
-        reembed_from_tables(source_id, src["project_id"], source_type, qdrant, embeddings, QDRANT_COLLECTION)
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        print(f"set_source_columns re-embed failed (source {source_id}): {e}")
-        raise HTTPException(
-            status_code=502,
-            detail="Saved, but the bot's search index couldn't be updated. Please press Reload on this source.",
-        )
-    finally:
-        invalidate_tables(src["project_id"])
+    # The table query uses the new choice straight away; the search index
+    # is rebuilt by a job so hidden columns leave it too.
+    invalidate_tables(src["project_id"])
+    _mark_queued(source_id)
+    enqueue("reembed_columns", {"source_id": source_id})
+    return {"status": "queued"}
 
-    return {"status": "saved"}
+
+def _mark_queued(source_id: str):
+    row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
+    supabase.table("data_sources").update(
+        {"config": _queued_config(row.get("config"))}
+    ).eq("id", source_id).execute()
 
 
 @router.post("/sources/sync/{source_id}")
@@ -343,87 +272,33 @@ def resync_source(source_id: str, user=Depends(verify_token)):
             detail="This source was just refreshed. Please wait a few minutes before refreshing it again.",
         )
 
-    res = supabase.table("data_sources").select("*").eq("id", source_id).single().execute()
-    s = res.data
-    if s["type"] in _INDEXED_TYPES:
-        _set_sync_status(source_id, "syncing", s.get("config"))
+    s = supabase.table("data_sources").select("*").eq("id", source_id).single().execute().data
 
-    # No pre-emptive purge here: every sync_* function already deletes this
-    # source's points itself as part of its own run. Deleting here too meant
-    # a resync that failed BEFORE reaching the sync call (bad config, failed
-    # validation) destroyed the existing index for nothing, leaving the
-    # source "connected" but genuinely empty.
-    sync_result = {}
-    try:
-        if s["type"] == "gsheets":
-            cfg = s["config"]
-            sync_result = sync_sheet(
-                cfg["sheet_id"], cfg.get("range"),
-                s["project_id"], source_id,
-                qdrant, embeddings, QDRANT_COLLECTION
-            )
-        elif s["type"] == "excel_online":
-            cfg = s["config"]
-            sync_result = sync_excel_url(
-                cfg["url"], s["project_id"],
-                source_id, qdrant, embeddings, QDRANT_COLLECTION,
-                tabs=cfg.get("tabs"),
-            )
-        elif s["type"] == "website":
-            cfg = s["config"]
-            sync_result = sync_website(
-                url=cfg["url"],
-                project_id=s["project_id"],
-                source_id=source_id,
-                qdrant=qdrant,
-                embeddings=embeddings,
-                collection=QDRANT_COLLECTION,
-                full_site=cfg.get("full_site", True),
-                max_pages=_clamp_max_pages(cfg.get("max_pages")),
-            )
-            if sync_result["pages_indexed"] == 0:
-                raise ValueError("Could not read any content from this website. It may block automated access, or only show its content with JavaScript.")
-
-        elif s["type"] == "shopify":
-            sync_result = sync_shopify_products(
-                s["project_id"], source_id, qdrant, embeddings, QDRANT_COLLECTION
-            )
-
-        elif s["type"] == "postgres":
-            # Re-verify the connection is still reachable; also refreshes
-            # allowed_schema's validity implicitly (introspect_schema will
-            # fail if the DB is gone/credentials rotated).
-            cfg = s["config"]
+    if s["type"] == "postgres":
+        # Re-verify the connection is still reachable (credentials rotated,
+        # DB gone). Nothing to embed, so it stays synchronous.
+        cfg = s["config"]
+        try:
             validate_url(cfg["url"])
             introspect_schema(cfg["url"])
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        # The old points for this source were already deleted above before
-        # this ran — a failed resync used to silently report "synced"
-        # anyway, leaving the source connected but genuinely empty with no
-        # indication anything went wrong.
-        print(f"resync_source error ({s['type']}): {e}")
-        # A handled failure leaves the previous index in place (the new
-        # batches are rolled back), so the source is as complete as before.
-        if s["type"] in _INDEXED_TYPES:
-            _set_sync_status(source_id, "done", s.get("config"))
-        raise HTTPException(
-            status_code=400,
-            detail=str(e) if isinstance(e, ValueError) else "Failed to refresh this source. Please try again."
-        )
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            raise HTTPException(
+                status_code=400,
+                detail=str(e) if isinstance(e, ValueError) else "Failed to refresh this source. Please try again.",
+            )
+        return {"status": "done"}
 
-    if s["type"] in _INDEXED_TYPES:
-        _set_sync_status(source_id, "done", s.get("config"))
+    if s["type"] == "excel_local":
+        raise HTTPException(status_code=400, detail="Re-upload the file to refresh an uploaded Excel source.")
+    if _is_indexing(s.get("config")):
+        raise HTTPException(status_code=409, detail="This source is already being indexed.")
 
-    return {
-        "status": "synced",
-        "skipped_tabs": sync_result.get("skipped_tabs", []),
-        "truncated": sync_result.get("truncated", False),
-        "indexed_count": sync_result.get("indexed_count"),
-        "total_count": sync_result.get("total_count"),
-        "capped_tabs": sync_result.get("capped_tabs", []),
-        "hidden_columns": sync_result.get("hidden_columns", []),
-    }
+    # No pre-emptive purge: the job replaces this source's points itself,
+    # and a failed job leaves the previous index untouched.
+    _mark_queued(source_id)
+    enqueue("sync_source", {"source_id": source_id})
+    return {"status": "queued"}
 
 
 @router.post("/sources/introspect")
@@ -574,7 +449,7 @@ async def upload_excel(
 
     file_bytes = await _read_excel_upload(file)
     tab_list = _json_form(tabs, "tabs")
-    hidden_override = parse_hidden_override(_json_form(hidden_columns, "hidden_columns"))
+    hidden_override = _json_form(hidden_columns, "hidden_columns")
 
     if source_id:
         # source_id is caller-supplied and was previously trusted on the
@@ -588,38 +463,22 @@ async def upload_excel(
         # role that delete_source requires. Creating a NEW source only
         # needs the documents permission.
         owning_project_id = _require_role_for_source(user.id, source_id, min_role="admin")
+        existing_row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
+        existing_cfg = existing_row.get("config") or {}
+        if _is_indexing(existing_cfg):
+            raise HTTPException(status_code=409, detail="This file is already being indexed.")
         if tab_list is None:
             # A plain re-upload keeps the sheets chosen when connecting.
-            existing_row = supabase.table("data_sources").select("config").eq("id", source_id).single().execute().data
-            tab_list = (existing_row.get("config") or {}).get("tabs")
-        _set_sync_status(source_id, "syncing")
-        try:
-            sync_result = await run_in_threadpool(
-                sync_excel_bytes, file_bytes, owning_project_id, source_id, qdrant, embeddings,
-                QDRANT_COLLECTION, tab_list, hidden_override,
-            )
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
-            print(f"upload_excel re-upload error (source {source_id}): {e}")
-            _set_sync_status(source_id, "done")
-            raise HTTPException(
-                status_code=400,
-                detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
-            )
+            tab_list = existing_cfg.get("tabs")
+        storage_path = _park_excel_upload(owning_project_id, source_id, file.filename, file_bytes)
         supabase.table("data_sources").update({
-            "config": {"filename": file.filename, "tabs": tab_list, "sync_status": "done"},
+            "config": _queued_config({"filename": file.filename, "tabs": tab_list}),
             "label": label or file.filename,
         }).eq("id", source_id).execute()
-        return {
-            "id": source_id,
-            "filename": file.filename,
-            "truncated": sync_result.get("truncated", False),
-            "indexed_count": sync_result.get("indexed_count"),
-            "total_count": sync_result.get("total_count"),
-            "skipped_tabs": sync_result.get("skipped_tabs", []),
-            "capped_tabs": sync_result.get("capped_tabs", []),
-            "hidden_columns": sync_result.get("hidden_columns", []),
-        }
+        enqueue("excel_upload", {
+            "source_id": source_id, "storage_path": storage_path, "hidden_columns": hidden_override,
+        })
+        return {"id": source_id, "filename": file.filename, "status": "queued"}
 
     # This endpoint creates a data_sources row just like add_source does,
     # but skipped the plan cap entirely — so uploading here instead of
@@ -632,38 +491,37 @@ async def upload_excel(
         "project_id": projectId,
         "type": "excel_local",
         "label": label or file.filename,
-        "config": _syncing_config({"filename": file.filename, "tabs": tab_list}),
+        "config": _queued_config({"filename": file.filename, "tabs": tab_list}),
         "allowed_schema": None,
     }).execute()
     source = res.data[0]
 
-    # Was completely unguarded, unlike add_source — a corrupt workbook left
-    # a permanently orphaned row showing as "connected" with no content,
-    # and returned a raw 500 whose body was shown to the user.
     try:
-        sync_result = await run_in_threadpool(
-            sync_excel_bytes, file_bytes, projectId, source["id"], qdrant, embeddings,
-            QDRANT_COLLECTION, tab_list, hidden_override,
-        )
+        storage_path = _park_excel_upload(projectId, source["id"], file.filename, file_bytes)
+    except HTTPException:
+        supabase.table("data_sources").delete().eq("id", source["id"]).execute()
+        raise
+    enqueue("excel_upload", {
+        "source_id": source["id"], "storage_path": storage_path, "hidden_columns": hidden_override,
+    })
+    return {"id": source["id"], "filename": file.filename, "status": "queued"}
+
+
+def _park_excel_upload(project_id: str, source_id: str, filename: str, file_bytes: bytes) -> str:
+    """A queued job can't carry the file itself, so the bytes wait in
+    Storage until the job reads them (and deletes them — uploaded Excel
+    files were never kept). Under the project's prefix, so deleting the
+    project removes any leftovers too."""
+    ext = "xls" if filename.lower().endswith(".xls") else "xlsx"
+    path = f"{project_id}/_source_uploads/{source_id}-{uuid.uuid4().hex}.{ext}"
+    content_type = (
+        "application/vnd.ms-excel" if ext == "xls"
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    try:
+        supabase.storage.from_("documents").upload(path, file_bytes, {"content-type": content_type})
     except Exception as e:
         sentry_sdk.capture_exception(e)
-        print(f"upload_excel error (project {projectId}): {e}")
-        _purge_source_points(source["id"])
-        supabase.table("data_sources").delete().eq("id", source["id"]).execute()
-        raise HTTPException(
-            status_code=400,
-            detail=str(e) if isinstance(e, ValueError) else "Couldn't read that file. Please check it and try again.",
-        )
-
-    _set_sync_status(source["id"], "done", source.get("config"))
-
-    return {
-        "id": source["id"],
-        "filename": file.filename,
-        "truncated": sync_result.get("truncated", False),
-        "indexed_count": sync_result.get("indexed_count"),
-        "total_count": sync_result.get("total_count"),
-        "skipped_tabs": sync_result.get("skipped_tabs", []),
-        "capped_tabs": sync_result.get("capped_tabs", []),
-        "hidden_columns": sync_result.get("hidden_columns", []),
-    }
+        print(f"excel upload parking failed for source {source_id}: {e}")
+        raise HTTPException(status_code=502, detail="Couldn't upload that file. Please try again.")
+    return path

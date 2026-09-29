@@ -12,6 +12,18 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ragby-frontend.vercel.app")
+
+# Indexing worker (see jobs.py / worker_main.py). All of the GCP_* values
+# plus WORKER_URL must be set for jobs to go to Cloud Tasks; otherwise they
+# run in a background thread on this instance. WORKER_SECRET is shared by
+# both services: the worker rejects any request without it.
+WORKER_URL = os.getenv("WORKER_URL")
+WORKER_SECRET = os.getenv("WORKER_SECRET")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+GCP_TASKS_LOCATION = os.getenv("GCP_TASKS_LOCATION", "asia-south1")
+GCP_TASKS_QUEUE = os.getenv("GCP_TASKS_QUEUE", "indexing")
+# The service account key (JSON, as one env var) used to create tasks.
+GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 

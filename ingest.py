@@ -6,10 +6,6 @@ import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import pdfplumber
-from docx import Document
-from pptx import Presentation
-import pandas as pd
 from text_splitter import split_text
 from qdrant_client import models
 
@@ -19,6 +15,7 @@ from config import QDRANT_COLLECTION, MAX_CHUNKS_PER_INGEST
 from auth import verify_token, require_project_access
 from ratelimit import is_rate_limited
 from usage import get_plan_limits, count_knowledge_items, knowledge_limit_message
+from jobs import enqueue
 
 router = APIRouter()
 
@@ -51,20 +48,26 @@ class IngestRequest(BaseModel):
     # point. Optional so an older frontend build that doesn't send it still
     # works, just without this protection.
     expectedBytes: Optional[int] = None
+    # The storage object this upload replaces (a re-saved note, a same-named
+    # re-upload). Deleted by the job only after the new one is indexed.
+    oldStoragePath: Optional[str] = None
 
 
 # -------------------------------------------------
 # TEXT EXTRACTORS
 # -------------------------------------------------
 def extract_pdf(b):
+    import pdfplumber
     with pdfplumber.open(io.BytesIO(b)) as pdf:
         return [(i+1, p.extract_text() or "") for i, p in enumerate(pdf.pages) if p.extract_text()]
 
 def extract_docx(b):
+    from docx import Document
     d = Document(io.BytesIO(b))
     return [(1, "\n".join(p.text for p in d.paragraphs if p.text.strip()))]
 
 def extract_pptx(b):
+    from pptx import Presentation
     prs = Presentation(io.BytesIO(b))
     out = []
     for i, s in enumerate(prs.slides):
@@ -74,6 +77,7 @@ def extract_pptx(b):
     return out
 
 def extract_excel(b):
+    import pandas as pd
     xls = pd.ExcelFile(io.BytesIO(b))
     return [(n, xls.parse(n).astype(str).fillna("").to_csv(index=False)) for n in xls.sheet_names]
 
@@ -97,6 +101,9 @@ EXTRACTORS = {
 # -------------------------------------------------
 @router.post("/ingest")
 def ingest(req: IngestRequest, user=Depends(verify_token)):
+    """Validate an uploaded file and queue it for indexing. The heavy part
+    (download, extract, embed) runs as a job — see process_file below and
+    jobs.py — so this returns in well under a second."""
     require_project_access(user.id, req.projectId, tab="documents")
 
     # Every ingest costs real OpenAI money, and nothing here was throttled
@@ -114,6 +121,9 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
     # tenant's file content into their own chatbot's knowledge base.
     if not req.filePath.startswith(f"{req.projectId}/"):
         raise HTTPException(status_code=403, detail="filePath does not belong to this project")
+    # Same for the object the job deletes once the new one is indexed.
+    if req.oldStoragePath and not req.oldStoragePath.startswith(f"{req.projectId}/"):
+        raise HTTPException(status_code=403, detail="oldStoragePath does not belong to this project")
 
     row = supabase.table("files") \
         .select("id") \
@@ -174,87 +184,131 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
             f"This file is too large for your plan (limit {limits['maxFileMB']}MB). Upgrade your plan to upload larger files.",
         )
 
-    supabase.table("files").update({"status": "processing"}).eq("id", file_id).execute()
-
     ext = req.filename.lower().split(".")[-1]
-    extractor = EXTRACTORS.get(ext)
-    if not extractor:
-        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
+    if ext not in EXTRACTORS:
+        _set_file_state(file_id, "failed", error="That file type isn't supported.")
         raise HTTPException(status_code=400, detail="That file type isn't supported.")
 
-    # Everything below can fail on someone else's infrastructure (Supabase
-    # storage, OpenAI, Qdrant) or on a corrupt/password-protected file. Without
-    # this, any of those left the row pinned at "processing" forever with no
-    # reason recorded and an unhandled 500 to the caller.
+    _set_file_state(file_id, "queued")
+    enqueue("ingest_file", {
+        "file_id": file_id,
+        "project_id": req.projectId,
+        "filename": req.filename,
+        "file_path": req.filePath,
+        "expected_bytes": req.expectedBytes,
+        "old_storage_path": req.oldStoragePath,
+    })
+    return {"status": "queued", "id": file_id}
+
+
+def _set_file_state(file_id: str, status: str, error: str = None, result: dict = None):
+    update = {"status": status, "error": error, "result": result}
     try:
-        b = supabase.storage.from_("documents").download(req.filePath)
+        supabase.table("files").update(update).eq("id", file_id).execute()
+    except Exception as e:
+        # Before the migration adding error/result has run, still record the
+        # status itself rather than leaving the row stuck.
+        print(f"file state update with error/result failed ({e}); retrying status only")
+        supabase.table("files").update({"status": status}).eq("id", file_id).execute()
+
+
+# -------------------------------------------------
+# THE JOB (runs on the worker, see job_runner.py)
+# -------------------------------------------------
+_PROCESS_ERROR = "We couldn't process that file. Please try uploading it again."
+
+
+def process_file(payload: dict):
+    """Download, extract, chunk and embed one uploaded file, recording the
+    outcome on its files row (status + error/result)."""
+    file_id = payload["file_id"]
+    project_id = payload["project_id"]
+    filename = payload["filename"]
+    file_path = payload["file_path"]
+    expected_bytes = payload.get("expected_bytes")
+    old_storage_path = payload.get("old_storage_path")
+
+    # A newer upload of the same file (a note saved twice quickly) points
+    # the row at a newer storage object. This older job must then do
+    # nothing, or it could finish last and index the previous version.
+    row = supabase.table("files").select("storage_path").eq("id", file_id).maybe_single().execute()
+    if not row or not row.data:
+        print(f"[ingest] file {file_id} deleted before its job ran, skipping")
+        return
+    if row.data.get("storage_path") and row.data["storage_path"] != file_path:
+        print(f"[ingest] file {file_id} has a newer upload, skipping stale job")
+        return
+
+    _set_file_state(file_id, "processing")
+    ext = filename.lower().split(".")[-1]
+    extractor = EXTRACTORS.get(ext)
+    if not extractor:
+        _set_file_state(file_id, "failed", error="That file type isn't supported.")
+        return
+
+    # Everything below can fail on someone else's infrastructure (Supabase
+    # storage, OpenAI, Qdrant) or on a corrupt/password-protected file.
+    # Without this, any of those left the row pinned at "processing" forever
+    # with no reason recorded.
+    try:
+        b = supabase.storage.from_("documents").download(file_path)
         # A handful of retries if the download doesn't yet match the size
         # the BROWSER'S OWN File object reported before it ever uploaded
         # anything — deliberately not a re-query of Storage's own metadata,
         # which is subject to the exact same overwrite-propagation lag as
         # this download and so isn't a trustworthy reference point either.
-        # Bounded backoff, ~7.5s worst case: this is a race measured in
-        # well under a second normally, not a real outage worth blocking
-        # much longer for.
-        if req.expectedBytes is not None:
+        # Bounded backoff, ~7.5s worst case.
+        if expected_bytes is not None:
             attempts = 0
-            while len(b) != req.expectedBytes and attempts < 6:
+            while len(b) != expected_bytes and attempts < 6:
                 time.sleep(0.3 * (attempts + 1))
-                b = supabase.storage.from_("documents").download(req.filePath)
+                b = supabase.storage.from_("documents").download(file_path)
                 attempts += 1
-            if len(b) != req.expectedBytes:
+            if len(b) != expected_bytes:
                 print(
                     f"ingest: downloaded {len(b)} bytes for file {file_id}, "
-                    f"expected {req.expectedBytes}, after {attempts} retries — proceeding anyway"
+                    f"expected {expected_bytes}, after {attempts} retries — proceeding anyway"
                 )
-    except HTTPException:
-        raise
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"ingest download failed for file {file_id}: {e}")
-        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
-        raise HTTPException(
-            status_code=502,
-            detail="We couldn't process that file. Please try uploading it again.",
-        )
+        _set_file_state(file_id, "failed", error=_PROCESS_ERROR)
+        return
 
     # A renamed .zip/.exe/whatever-to-.pdf, or any genuinely corrupt file,
     # fails HERE — inside the parsing library, not our infrastructure. That
-    # used to fall into the same catch-all below as an OpenAI/Qdrant/Supabase
-    # outage: same 502, same Sentry alert, same generic message, even though
-    # this is routine bad user input and happens constantly, not a bug to
-    # page anyone about.
+    # is routine bad user input, not a bug to page anyone about.
     try:
         pages = extractor(b)
     except Exception as e:
         print(f"extraction failed for file {file_id} ({ext}): {e}")
-        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
-        raise HTTPException(
-            status_code=400,
-            detail=f"This doesn't look like a valid .{ext} file. It may be corrupted, password-protected, or renamed from a different file type.",
+        _set_file_state(
+            file_id, "failed",
+            error=f"This doesn't look like a valid .{ext} file. It may be corrupted, password-protected, or renamed from a different file type.",
         )
+        return
+    del b
 
     try:
         chunks, metas = [], []
-
         for page, text in pages:
             for c in split_text(text, chunk_size=1500, chunk_overlap=200):
                 chunks.append(c)
                 metas.append({
-                    "project_id": req.projectId,
+                    "project_id": project_id,
                     "file_id": file_id,
-                    "filename": req.filename,
+                    "filename": filename,
                     "page_number": page,
                     "source_type": "document",
                     "text": c,
                 })
 
         if not chunks:
-            supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
-            raise HTTPException(
-                status_code=400,
-                detail="Couldn't read any text from that file. If it's a scanned PDF, it needs to contain selectable text.",
+            _set_file_state(
+                file_id, "failed",
+                error="Couldn't read any text from that file. If it's a scanned PDF, it needs to contain selectable text.",
             )
+            return
 
         # A single enormous file would otherwise become one unbounded
         # embedding bill. Index the first N chunks and stop there.
@@ -267,28 +321,29 @@ def ingest(req: IngestRequest, user=Depends(verify_token)):
 
         # Re-ingesting reuses the same file_id (the row is upserted), so the
         # previous version's chunks must be replaced, not left alongside the
-        # new ones. Batched: embedding all chunks at once held every vector
-        # in memory and pushed the instance past its memory limit.
+        # new ones.
         replace_points(qdrant, embeddings, QDRANT_COLLECTION, chunks, metas, "file_id", file_id)
-    except HTTPException:
-        raise
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"ingest failed for file {file_id}: {e}")
-        supabase.table("files").update({"status": "failed"}).eq("id", file_id).execute()
-        raise HTTPException(
-            status_code=502,
-            detail="We couldn't process that file. Please try uploading it again.",
-        )
+        _set_file_state(file_id, "failed", error=_PROCESS_ERROR)
+        return
 
-    supabase.table("files").update({"status": "indexed"}).eq("id", file_id).execute()
-    return {
-        "status": "indexed",
-        "chunks_indexed": len(chunks),
+    _set_file_state(file_id, "indexed", result={
+        "truncated": truncated,
         "indexed_count": len(chunks),
         "total_count": total_found,
-        "truncated": truncated,
-    }
+    })
+
+    # Only now — the new object is confirmed indexed — is the OLD physical
+    # object (a prior upload or note edit under this filename) removed.
+    # Never eagerly: if indexing had failed, the old object is left alone
+    # rather than lost.
+    if old_storage_path and old_storage_path != file_path:
+        try:
+            supabase.storage.from_("documents").remove([old_storage_path])
+        except Exception as e:
+            print(f"old storage object cleanup failed for {file_id}: {e}")
 
 
 @router.delete("/document/{file_id}")

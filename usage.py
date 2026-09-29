@@ -60,9 +60,13 @@ def count_knowledge_items(project_id: str, exclude_file_id: str = None) -> int:
     )
     if exclude_file_id:
         files = files.neq("id", exclude_file_id)
+    # Same for a source whose indexing failed (private sheet, blocked site):
+    # it stays listed with the reason, but holds nothing. Written as an
+    # "or": a plain neq would also drop rows with no sync_status at all.
     sources = (
         supabase.table("data_sources").select("id", count="exact")
         .eq("project_id", project_id).neq("type", "shopify")
+        .or_("config->>sync_status.is.null,config->>sync_status.neq.failed")
     )
     return (files.execute().count or 0) + (sources.execute().count or 0)
 

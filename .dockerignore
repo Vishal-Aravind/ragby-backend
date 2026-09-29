@@ -1,0 +1,11 @@
+# Secrets never go into the image; the worker gets them as Cloud Run env vars.
+.env
+.env.*
+*.env.yaml
+*key*.json
+
+venv/
+__pycache__/
+*.pyc
+.git/
+static/
