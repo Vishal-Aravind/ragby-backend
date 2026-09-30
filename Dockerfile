@@ -13,6 +13,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+# Headless Chromium for JavaScript-only websites (sources/browser_render.py).
+# Installed here only — not in requirements.txt — so the 512MB main backend
+# on Render never gets a browser. --with-deps adds the system libraries
+# Chromium needs on this slim base image.
+RUN pip install playwright==1.58.0 \
+ && playwright install --with-deps --only-shell chromium
+ENV PLAYWRIGHT_ENABLED=1
+
 COPY . .
 
 # One worker process, and Cloud Run is set to one request per instance

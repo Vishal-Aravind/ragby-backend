@@ -1,11 +1,14 @@
 # sources/website.py
 #
-# Plain HTTP fetching and HTML parsing, no browser. This used crawl4ai,
-# which drives a headless Chromium that Render's build never installed
-# (every crawl failed with "Executable doesn't exist"), and on a 512MB
-# instance shared with the whole API a real browser would OOM the web
-# process. The trade-off: pages that only render their content with
-# JavaScript come back empty.
+# Hybrid crawler. Every page is fetched with plain HTTP + BeautifulSoup
+# first: fast, and almost no memory. A page that comes back as an empty
+# JavaScript shell (React/Vue/Wix-style sites) is re-rendered in headless
+# Chromium (sources/browser_render.py), and once a site's start page needs
+# that, the rest of the site goes straight to the browser.
+#
+# The browser is only used where it's installed and enabled: the indexing
+# worker. Elsewhere (the 512MB main backend's fallback job runner) crawls
+# stay HTML-only, as before — a browser there used to OOM the instance.
 
 import time
 from collections import deque
@@ -18,6 +21,7 @@ from text_splitter import split_text
 
 from config import MAX_CHUNKS_PER_INGEST
 from sources.url_guard import assert_public_http_url, safe_get
+from sources.browser_render import BrowserRenderer, browser_available
 from vector_sync import replace_points
 
 
@@ -47,12 +51,24 @@ SKIP_EXTENSIONS = (
 
 MAX_DEPTH = 3
 REQUEST_TIMEOUT = (5, 15)          # (connect, read) per request
-# The crawl runs inside the /sources/add request, so it needs a hard stop.
+# Crawls run as background jobs, but still need a hard stop. Browser
+# rendering is ~2-5s a page, so it gets a longer budget.
 CRAWL_DEADLINE_SECONDS = 60
+CRAWL_DEADLINE_WITH_BROWSER_SECONDS = 240
 # Checked against DECOMPRESSED bytes, so a gzip bomb can't blow past it.
 MAX_PAGE_BYTES = 5 * 1024 * 1024
 # Below this a page is almost always an empty JS shell, not content.
 MIN_PAGE_TEXT_CHARS = 50
+# A plain-HTML page with less visible text than this, or with an app-shell
+# marker, is worth trying in the browser.
+JS_SUSPECT_TEXT_CHARS = 300
+# Upper bound on browser-rendered pages per crawl (each is seconds + RAM).
+MAX_BROWSER_PAGES = 40
+_JS_SHELL_MARKERS = (
+    b'id="root"', b'id="__next"', b'id="app"', b'id="__nuxt"', b"ng-version",
+    b"data-reactroot", b"enable javascript", b"requires javascript",
+    b"wix.com", b"static.parastorage.com", b"_next/static",
+)
 
 # Many small-business hosts sit behind bot protection that rejects the
 # default python-requests user agent outright.
@@ -146,6 +162,15 @@ def _extract(html: bytes, encoding, base_url: str):
     return "\n\n".join(p for p in parts if p), links
 
 
+def _looks_like_js_shell(html: bytes, text: str) -> bool:
+    if len(text) < JS_SUSPECT_TEXT_CHARS:
+        return True
+    lowered = html[:200_000].lower()
+    # A shell marker alone isn't enough (plenty of server-rendered Next.js
+    # sites carry _next/static); it must also be light on text.
+    return len(text) < 1500 and any(m in lowered for m in _JS_SHELL_MARKERS)
+
+
 def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list[dict]:
     # Nothing validated this URL before it reached the fetcher: any scheme
     # and any host was fetched server-side and indexed into the project's
@@ -154,7 +179,10 @@ def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list
     url = url.strip()
     assert_public_http_url(url)
 
-    deadline = time.monotonic() + CRAWL_DEADLINE_SECONDS
+    use_browser = browser_available()
+    deadline = time.monotonic() + (
+        CRAWL_DEADLINE_WITH_BROWSER_SECONDS if use_browser else CRAWL_DEADLINE_SECONDS
+    )
     # Failed and non-HTML fetches don't produce pages, so pages alone
     # can't bound how many requests one crawl makes.
     max_fetches = max_pages * 3 if full_site else 1
@@ -167,9 +195,13 @@ def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list
     fetches = failures = unexpected = 0
     first_unexpected = None
     stopped_by_deadline = False
+    # Set once the start page turned out to need JavaScript: the rest of
+    # that site goes straight to the browser.
+    site_needs_js = False
 
     session = requests.Session()
     session.headers.update(REQUEST_HEADERS)
+    renderer = BrowserRenderer(REQUEST_HEADERS["User-Agent"]) if use_browser else None
     try:
         while queue and len(pages) < max_pages and fetches < max_fetches:
             if time.monotonic() > deadline:
@@ -179,11 +211,30 @@ def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list
             current, depth = queue.popleft()
             fetches += 1
             try:
-                fetched = _fetch_html(session, current, deadline)
+                fetched = None
+                can_render = renderer is not None and renderer.rendered < MAX_BROWSER_PAGES
+                if not (site_needs_js and can_render):
+                    fetched = _fetch_html(session, current, deadline)
+                    if fetched is not None:
+                        final_url, html, encoding = fetched
+                        text, links = _extract(html, encoding, final_url)
+
+                # Empty JS shell (or a site already known to be one): render
+                # it in the browser and keep that if it found more.
+                if can_render and (fetched is None and site_needs_js or
+                                   fetched is not None and _looks_like_js_shell(html, text)):
+                    rendered = _render_page(renderer, current)
+                    if rendered is not None:
+                        r_url, r_html = rendered
+                        r_text, r_links = _extract(r_html, "utf-8", r_url)
+                        if fetched is None or len(r_text) > len(text):
+                            if depth == 0 and fetched is not None:
+                                site_needs_js = True
+                            final_url, html, encoding = r_url, r_html, "utf-8"
+                            text, links = r_text, r_links
+                            fetched = True
                 if fetched is None:
                     continue
-                final_url, html, encoding = fetched
-                text, links = _extract(html, encoding, final_url)
             except (requests.RequestException, ValueError):
                 # Routine for real websites (timeouts, resets, redirects to
                 # blocked addresses) and not our bug, so not a Sentry event.
@@ -232,6 +283,8 @@ def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list
                 queue.append((link, depth + 1))
     finally:
         session.close()
+        if renderer is not None:
+            renderer.close()
 
     if unexpected:
         sentry_sdk.capture_message(
@@ -242,10 +295,21 @@ def crawl_website(url: str, full_site: bool = True, max_pages: int = 30) -> list
 
     print(
         f"Crawled {len(pages)} pages from {url} (limit: {max_pages}, "
-        f"fetches: {fetches}, failed: {failures}, unexpected: {unexpected}"
+        f"fetches: {fetches}, browser-rendered: {renderer.rendered if renderer else 'off'}, "
+        f"failed: {failures}, unexpected: {unexpected}"
         f"{', stopped at deadline' if stopped_by_deadline else ''})"
     )
     return pages
+
+
+def _render_page(renderer, url: str):
+    """Browser render that never takes the crawl down: a page that times out
+    or crashes the tab is just skipped, like a failed plain fetch."""
+    try:
+        return renderer.render(url)
+    except Exception as e:
+        print(f"browser render failed for {url}: {type(e).__name__}: {e}")
+        return None
 
 
 def sync_website(
