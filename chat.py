@@ -152,6 +152,28 @@ def _chat_access_token_valid(project_id: str, token: str, password_fp: str = "")
     return hmac.compare_digest(expected, sig)
 
 
+def _request_host(request) -> str:
+    """Host of the browser-declared Origin (or Referer), lowercased; "" if
+    absent, "null" (a file:// page) or unparseable."""
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    try:
+        return (urlparse(origin).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _host_on_allowlist(host: str, allowed_domains) -> bool:
+    """Exact host, or any subdomain of a listed domain. An empty list
+    matches nothing."""
+    if not host:
+        return False
+    for entry in allowed_domains or []:
+        allowed = (entry or "").strip().lower()
+        if allowed and (host == allowed or host.endswith("." + allowed)):
+            return True
+    return False
+
+
 def _origin_allowed(request, allowed_domains) -> bool:
     """Check the browser-declared Origin against the merchant's allowlist.
 
@@ -167,7 +189,7 @@ def _origin_allowed(request, allowed_domains) -> bool:
     if not allowed_domains:
         return True
 
-    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    host = _request_host(request)
 
     # Our own hosted chat page (the Shareable Chat Link). Its requests reach
     # this backend through the Next.js proxy, which forwards the browser's
@@ -177,30 +199,13 @@ def _origin_allowed(request, allowed_domains) -> bool:
     # link has its own on/off switch and password.
     try:
         own_host = (urlparse(FRONTEND_URL).hostname or "").lower()
-        if own_host and (urlparse(origin).hostname or "").lower() == own_host:
+        if own_host and host == own_host:
             return True
     except Exception:
         pass
-    if not origin:
-        # Non-browser caller (curl, server-side). Rate limits still apply.
-        return False
 
-    try:
-        host = urlparse(origin).hostname or ""
-    except Exception:
-        return False
-    host = host.lower()
-    if not host:
-        return False
-
-    for entry in allowed_domains:
-        allowed = (entry or "").strip().lower()
-        if not allowed:
-            continue
-        # Exact host, or any subdomain of it.
-        if host == allowed or host.endswith("." + allowed):
-            return True
-    return False
+    # Non-browser caller (curl, server-side) has no host: rate limits still apply.
+    return _host_on_allowlist(host, allowed_domains)
 
 
 def _verify_chat_password(password: str, stored: str) -> bool:
@@ -1834,8 +1839,20 @@ def public_chat(req: PublicChatRequest, request: Request):
             detail="This assistant isn't available on this site.",
         )
 
+    # The password protects the Shareable Chat Link. The website widget is
+    # exempt ONLY on the sites the merchant listed under Allowed domains: it
+    # runs on their own public website, where asking every visitor for the
+    # link's password makes no sense. The exemption has to rest on something
+    # a caller can't simply claim — an empty allowlist exempts nothing, so a
+    # stranger who read the project id out of the chat link can't call this
+    # endpoint directly and walk past the password. (Origin can't be forged
+    # by a browser page; a scripted client could send a listed domain, but
+    # that is the same limit the allowlist itself documents.)
     if settings.get("has_chat_password"):
-        if not _chat_access_token_valid(req.projectId, req.accessToken or "", settings.get("chat_password_fp", "")):
+        on_listed_site = _host_on_allowlist(_request_host(request), settings.get("allowed_domains"))
+        if not on_listed_site and not _chat_access_token_valid(
+            req.projectId, req.accessToken or "", settings.get("chat_password_fp", "")
+        ):
             raise HTTPException(status_code=401, detail="This chat is password protected.")
 
     session_id = req.sessionId or str(uuid.uuid4())
