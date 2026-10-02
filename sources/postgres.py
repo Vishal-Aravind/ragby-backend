@@ -66,19 +66,32 @@ def validate_url(db_url: str):
 
 def _connect_args(db_url: str) -> dict:
     """Per-dialect connect-time timeout so a slow/unreachable customer DB
-    can't hang the request indefinitely."""
+    can't hang the request indefinitely.
+
+    Postgres settings (statement timeout, read-only) are deliberately NOT
+    sent here as startup "options": connection poolers (Neon's -pooler
+    hosts, Supabase's pooler, PgBouncer) reject unknown startup parameters
+    outright ("unsupported startup parameter"), so no pooled connection
+    string could connect at all. They're applied per query instead, inside
+    the transaction, by _harden_postgres_transaction."""
     if "mysql" in db_url:
         return {"connect_timeout": 5, "read_timeout": 10}
-    # default_transaction_read_only makes the server itself refuse a write,
-    # whatever the model generated. The SELECT-prefix check below already
-    # blocks data-modifying CTEs (in Postgres those must be a top-level
-    # WITH), so this is defence in depth rather than a known bypass — but it
-    # is the only guard here that does not depend on parsing the SQL
-    # correctly.
-    return {
-        "connect_timeout": 5,
-        "options": "-c statement_timeout=10000 -c default_transaction_read_only=on",
-    }
+    return {"connect_timeout": 5}
+
+
+def _harden_postgres_transaction(conn):
+    """Must be the first statement of the transaction. SET LOCAL/SET
+    TRANSACTION last only for this transaction, so they work through
+    transaction-mode poolers and can't leak onto another client's session
+    that shares the server connection.
+
+    READ ONLY makes the server itself refuse a write, whatever the model
+    generated. The SELECT-prefix check already blocks data-modifying CTEs
+    (in Postgres those must be a top-level WITH), so this is defence in
+    depth rather than a known bypass — but it is the only guard here that
+    does not depend on parsing the SQL correctly."""
+    conn.execute(sqlalchemy.text("SET TRANSACTION READ ONLY"))
+    conn.execute(sqlalchemy.text("SET LOCAL statement_timeout = 10000"))
 
 
 def get_schema(db_url: str, allowed_schema: dict | None = None) -> str:
@@ -206,10 +219,11 @@ Return ONLY the SQL query, nothing else."""
     engine = sqlalchemy.create_engine(db_url, connect_args=_connect_args(db_url))
     try:
         with engine.connect() as conn:
-            # MySQL has no connect-time equivalent of Postgres'
-            # default_transaction_read_only, so ask for it here instead.
+            # Read-only is requested per query, for both dialects.
             if "mysql" in db_url:
                 conn.execute(sqlalchemy.text("SET SESSION TRANSACTION READ ONLY"))
+            else:
+                _harden_postgres_transaction(conn)
             result = conn.execute(sqlalchemy.text(stripped))
             rows = result.fetchmany(200)
             if not rows:
