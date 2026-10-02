@@ -281,6 +281,12 @@ STRICT RULES:
 - Only use columns that appear in the schema above
 - Where a column lists its values, use those exact values. Match other text
   case-insensitively ({"LIKE" if dialect == "MySQL" else "ILIKE"}).
+- ALWAYS include the column that names each row (name, title, label...) in
+  the SELECT, even when the question only asks about another column such as
+  price. A bare "80" doesn't say what it is the price of; the row must.
+- "In stock", "available" or "left" means the stock/quantity column is
+  greater than 0; "out of stock" means it equals 0. Apply this filter
+  whenever the question says so, including in "how many" questions.
 - "How many <things>" counts ROWS (COUNT). Only add up a quantity column
   (SUM) when the question asks for total units, quantity or amount.
 - Only write SELECT queries, never INSERT/UPDATE/DELETE
@@ -343,7 +349,11 @@ Return ONLY the SQL query, nothing else."""
             if not rows:
                 return "Query returned no results."
             cols = list(result.keys())
-            lines = [", ".join(cols)]
+            # Framed as the answer to THIS question. Given a bare table, the
+            # answering model, which is told to use only the provided
+            # context, treats a lone "price: 80" as unrelated to the item
+            # asked about and replies "I couldn't find specific information".
+            lines = ["Database rows matching the customer's question:", ", ".join(cols)]
             for row in rows:
                 lines.append(", ".join(str(v) for v in row))
             return "\n".join(lines)
