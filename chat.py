@@ -1449,49 +1449,31 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 )
             )
             hits = res.points
-            sheet_context = "\n\n---\n\n".join(
-                f"[Source: gsheets]\n{h.payload.get('text', '')}" for h in hits
-            ) if hits else None
 
-            # The database is asked whether or not the spreadsheet search
-            # found something. It used to be asked ONLY when the sheet search
-            # came back empty, so with a sheet and a database connected, any
-            # loosely-matching (even irrelevant) sheet row meant the database
-            # was never consulted — "price of gulab jamun" got an "I couldn't
-            # find" while the answer sat in the database. Both results go to
-            # the model, labelled by source, and it uses whichever applies.
-            pg_source = supabase.table("data_sources") \
-                .select("config, allowed_schema") \
-                .eq("project_id", project_id) \
-                .eq("type", "postgres") \
-                .limit(1) \
-                .execute()
-
-            db_url = (pg_source.data[0].get("config") or {}).get("url") if pg_source.data else None
-            db_context = None
-            sql_result = None
-            if db_url:
-                allowed_schema = pg_source.data[0].get("allowed_schema")
-                try:
-                    sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
-                except Exception as e:
-                    sentry_sdk.capture_exception(e)
-                    print(f"run_text_to_sql failed: {e}")
-                    sql_result = "I couldn't get that information from the database right now."
-                # An empty or failed lookup isn't evidence; don't let it
-                # crowd out a real sheet answer.
-                if not sql_result.startswith(("Query returned no results", "Query blocked", "I couldn't get that")):
-                    db_context = f"[Source: database]\n{sql_result}"
-
-            parts = [c for c in (db_context, sheet_context) if c]
-            if parts:
-                context = _truncate("\n\n---\n\n".join(parts), MAX_CONTEXT_CHARS)
-            elif db_url:
-                # Nothing found anywhere: still tell the model what the
-                # database said, so its reply matches (e.g. "no results").
-                context = _truncate(f"[Source: database]\n{sql_result}", MAX_CONTEXT_CHARS)
+            if hits:
+                context = _truncate("\n\n---\n\n".join(
+                    f"[Source: gsheets]\n{h.payload.get('text', '')}" for h in hits
+                ), MAX_CONTEXT_CHARS)
             else:
-                source_intent = "conceptual"
+                pg_source = supabase.table("data_sources") \
+                    .select("config, allowed_schema") \
+                    .eq("project_id", project_id) \
+                    .eq("type", "postgres") \
+                    .limit(1) \
+                    .execute()
+
+                db_url = (pg_source.data[0].get("config") or {}).get("url") if pg_source.data else None
+                if db_url:
+                    allowed_schema = pg_source.data[0].get("allowed_schema")
+                    try:
+                        sql_result = run_text_to_sql(message, db_url, openai_client, allowed_schema)
+                    except Exception as e:
+                        sentry_sdk.capture_exception(e)
+                        print(f"run_text_to_sql failed: {e}")
+                        sql_result = "I couldn't get that information from the database right now."
+                    context = _truncate(f"[Source: database]\n{sql_result}", MAX_CONTEXT_CHARS)
+                else:
+                    source_intent = "conceptual"
 
         if source_intent == "conceptual":
             res = qdrant.query_points(
