@@ -353,7 +353,11 @@ Return ONLY the SQL query, nothing else."""
             # answering model, which is told to use only the provided
             # context, treats a lone "price: 80" as unrelated to the item
             # asked about and replies "I couldn't find specific information".
-            lines = ["Database rows matching the customer's question:", ", ".join(cols)]
+            lines = [
+                "Database rows matching the customer's question (the lookup already "
+                "applied the customer's conditions, so every row below satisfies them):",
+                ", ".join(cols),
+            ]
             for row in rows:
                 lines.append(", ".join(str(v) for v in row))
             return "\n".join(lines)

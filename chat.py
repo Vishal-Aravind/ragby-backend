@@ -1122,14 +1122,43 @@ def get_project_domain(project_id: str):
     return res.data.get("domain") if res.data else None
 
 
-def classify_source_intent(message: str) -> str:
+def _data_hint(project_id: str, pg_row) -> str:
+    """One line per table/sheet this business has connected (names only, no
+    values), so the classifier below knows what 'structured' questions can
+    actually be answered. Without it a short question like "cheapest dessert"
+    or "Gulab Jamun" reads as general knowledge, goes to document search, and
+    the connected database is never asked."""
+    lines = []
+    try:
+        from sources.table_query import load_project_tables
+        for t in load_project_tables(project_id)[:5]:
+            lines.append(f'- spreadsheet "{t["label"]}": columns {", ".join(t["columns"][:12])}')
+    except Exception as e:
+        print(f"data hint (sheets) failed: {e}")
+    if pg_row:
+        schema = pg_row.get("allowed_schema") or {}
+        for table, cols in list(schema.items())[:8]:
+            lines.append(f"- database table {table}: columns {', '.join(cols[:12])}" if cols else f"- database table {table}")
+        if not schema:
+            lines.append("- a connected database")
+    return "\n".join(lines)[:1200]
+
+
+def classify_source_intent(message: str, data_hint: str = "") -> str:
+    hint_block = (
+        "This business has structured data (records you can look things up in):\n"
+        f"{data_hint}\n"
+        "A question about items, prices, stock, people, counts or lists that "
+        "this data could hold is 'structured', however short or informal. So is "
+        "a message that is just the name of an item or person that could be in it.\n\n"
+    ) if data_hint else ""
     resp = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{
             "role": "user",
             "content": f"""Classify this question as either 'structured' or 'conceptual'.
 
-'structured' = looking up a specific record, person, value, date, status, or list
+{hint_block}'structured' = looking up a specific record, person, value, date, status, or list
 Examples: "what are John's remarks", "show sales for March", "find order status for ID 123", "list all employees"
 
 'conceptual' = asking about a process, policy, explanation, or general knowledge
@@ -1386,7 +1415,18 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 
         # Classified with the previous question attached for short
         # follow-ups — "full list please" alone reads as conceptual.
-        source_intent = classify_source_intent(query_for_embedding)
+        pg_source = supabase.table("data_sources") \
+            .select("config, allowed_schema") \
+            .eq("project_id", project_id) \
+            .eq("type", "postgres") \
+            .limit(1) \
+            .execute()
+        data_hint = _data_hint(project_id, pg_source.data[0] if pg_source.data else None)
+        source_intent = classify_source_intent(query_for_embedding, data_hint)
+        print(
+            f"[chat] project={project_id[:8]} question={message[:60]!r} intent={source_intent} "
+            f"data_hint={'yes' if data_hint else 'no'} tools={len(active_tools)}"
+        )
 
         # Embedded only when a vector search actually runs — a question the
         # table query answers never needs it.
@@ -1455,13 +1495,6 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: gsheets]\n{h.payload.get('text', '')}" for h in hits
                 ), MAX_CONTEXT_CHARS)
             else:
-                pg_source = supabase.table("data_sources") \
-                    .select("config, allowed_schema") \
-                    .eq("project_id", project_id) \
-                    .eq("type", "postgres") \
-                    .limit(1) \
-                    .execute()
-
                 db_url = (pg_source.data[0].get("config") or {}).get("url") if pg_source.data else None
                 if db_url:
                     allowed_schema = pg_source.data[0].get("allowed_schema")
@@ -1494,6 +1527,10 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                     f"[Source: document]\n{h.payload.get('text', '')}" for h in hits
                 ), MAX_CONTEXT_CHARS)
 
+        print(
+            f"[chat] route={source_intent} context="
+            f"{(context or '').split(chr(10), 1)[0][:30]!r} chars={len(context or '')}"
+        )
         if not context and not active_tools:
             answer = "I couldn't find that in your documents or data sources."
             save_message(chat_id, "assistant", answer)
