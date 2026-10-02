@@ -185,6 +185,79 @@ def delete_source(source_id: str, user=Depends(verify_token)):
 
 
 # -------------------------------------------------
+# DATABASE TABLES/COLUMNS (which ones the bot may query)
+# -------------------------------------------------
+# A database source is read live at question time, so changing what it may
+# see needs no re-indexing: saving just updates data_sources.allowed_schema,
+# which run_text_to_sql enforces on every query (see sources/postgres.py).
+def _db_source(user_id: str, source_id: str, min_role: str = None) -> dict:
+    project_id = _require_role_for_source(user_id, source_id, min_role=min_role)
+    row = supabase.table("data_sources").select("type, config, allowed_schema").eq("id", source_id).single().execute().data
+    if row["type"] != "postgres":
+        raise HTTPException(status_code=400, detail="Only database sources have tables and columns.")
+    return {"project_id": project_id, "config": row.get("config") or {}, "allowed_schema": row.get("allowed_schema")}
+
+
+def _read_db_schema(db_url: str) -> dict:
+    try:
+        validate_url(db_url)
+        return introspect_schema(db_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        # About the customer's OWN database (wrong host, rotated password,
+        # firewall), so the driver's message is actionable — same as /introspect.
+        raise HTTPException(status_code=400, detail=f"Couldn't connect to that database — {e}")
+
+
+@router.get("/sources/{source_id}/database-columns")
+def get_database_columns(source_id: str, user=Depends(verify_token)):
+    src = _db_source(user.id, source_id)
+    if is_rate_limited(f"db-introspect:{src['project_id']}", limit=10, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait a minute and try again.")
+    schema = _read_db_schema(src["config"].get("url", ""))
+
+    saved = src["allowed_schema"]
+    if not saved:
+        # No restriction stored: everything is visible.
+        allowed = {t: list(cols) for t, cols in schema.items()}
+    else:
+        # An empty column list has always meant "all columns of that table".
+        allowed = {t: (saved[t] or list(schema[t])) for t in saved if t in schema}
+    return {"schema": schema, "allowed": allowed}
+
+
+@router.put("/sources/{source_id}/database-columns")
+def set_database_columns(source_id: str, data: dict, user=Depends(verify_token)):
+    # Exposing a column makes it answerable to anyone chatting with the bot,
+    # so this takes the same admin role as deleting the source.
+    src = _db_source(user.id, source_id, min_role="admin")
+    if is_rate_limited(f"db-columns:{source_id}", limit=10, window_seconds=300):
+        raise HTTPException(status_code=429, detail="Settings were just changed. Please wait a few minutes and try again.")
+
+    requested = data.get("allowed")
+    if not isinstance(requested, dict):
+        raise HTTPException(status_code=400, detail="Invalid request.")
+    schema = _read_db_schema(src["config"].get("url", ""))
+
+    # Only tables and columns that really exist, and only non-empty picks:
+    # the browser's list is never trusted as identifiers.
+    allowed = {}
+    for table, cols in requested.items():
+        if table not in schema or not isinstance(cols, list):
+            continue
+        keep = [c for c in schema[table] if c in {str(x) for x in cols}]
+        if keep:
+            allowed[table] = keep
+    if not allowed:
+        raise HTTPException(status_code=400, detail="Choose at least one table with at least one column.")
+
+    supabase.table("data_sources").update({"allowed_schema": allowed}).eq("id", source_id).execute()
+    return {"status": "saved", "tables": len(allowed)}
+
+
+# -------------------------------------------------
 # SPREADSHEET COLUMNS (which ones the bot may use)
 # -------------------------------------------------
 _TABLE_SOURCE_TYPES = ("gsheets", "excel_online", "excel_local")

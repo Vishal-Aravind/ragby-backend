@@ -149,7 +149,7 @@ def _sample_values(db_url: str, visible: dict) -> dict:
         (table, name)
         for table, cols in visible.items()
         for name, col_type in cols
-        if isinstance(col_type, sqlalchemy.types.String) and not _PERSONAL_NAME_RE.search(name)
+        if isinstance(col_type, sqlalchemy.types.String) and not _PERSONAL_NAME_RE.search(name.replace("_", " "))
     ][:_SAMPLE_MAX_COLUMNS]
     if not targets:
         return {}
