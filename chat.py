@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 
 from clients import supabase, openai_client, embeddings, qdrant
-from config import QDRANT_COLLECTION, FRONTEND_URL, SUPABASE_SERVICE_ROLE_KEY
+from config import QDRANT_COLLECTION, FRONTEND_URL, SUPABASE_SERVICE_ROLE_KEY, INTERNAL_PROXY_SECRET
 from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
 from ratelimit import is_rate_limited, client_ip
@@ -174,10 +174,37 @@ def _host_on_allowlist(host: str, allowed_domains) -> bool:
     return False
 
 
-def _origin_allowed(request, allowed_domains) -> bool:
-    """Check the browser-declared Origin against the merchant's allowlist.
+def _is_hosted_page_request(request) -> bool:
+    """True when the request comes from our own hosted chat page (the
+    Shareable Chat Link) rather than from a website widget.
 
-    An EMPTY allowlist matches nothing: the widget does not run until the
+    The two are separate products with separate rules: the link has its own
+    on/off switch and password; the widget has only the Allowed websites
+    list. They share one endpoint, so this decides which rules apply.
+
+    Identified by the shared secret our Next.js proxy attaches (checked with
+    a constant-time compare; a visitor can't know it), or — in case that
+    secret isn't configured — by the page's own address as the browser
+    declares it. Neither lets a caller dodge a rule: someone who claims to
+    be the hosted page gets the link's rules (password included), and
+    everyone else gets the widget's (listed website required).
+    """
+    if INTERNAL_PROXY_SECRET:
+        presented = request.headers.get("X-Internal-Proxy-Secret", "")
+        if presented and hmac.compare_digest(presented, INTERNAL_PROXY_SECRET):
+            return True
+    try:
+        own_host = (urlparse(FRONTEND_URL).hostname or "").lower()
+    except Exception:
+        own_host = ""
+    return bool(own_host) and _request_host(request) == own_host
+
+
+def _origin_allowed(request, allowed_domains) -> bool:
+    """The website widget's rule: the browser-declared Origin must be one of
+    the merchant's Allowed websites.
+
+    An EMPTY list matches nothing: the widget does not run until the
     merchant has said which website it belongs on. It used to mean "allowed
     anywhere", which left every embed open to anyone who copied the project
     id out of the page source and ran the bot from their own site on the
@@ -189,23 +216,9 @@ def _origin_allowed(request, allowed_domains) -> bool:
     can send whatever Origin it likes. The per-IP/session/project rate
     limits and the monthly quota are the backstop for that case.
     """
-    host = _request_host(request)
-
-    # Our own hosted chat page (the Shareable Chat Link). Its requests reach
-    # this backend through the Next.js proxy, which forwards the browser's
-    # Origin: this app's own address. The allowlist exists to stop OTHER
-    # sites copying the embed snippet; applying it to the hosted page broke
-    # the Shareable Link the moment a merchant added any domain here. The
-    # link has its own on/off switch and password.
-    try:
-        own_host = (urlparse(FRONTEND_URL).hostname or "").lower()
-        if own_host and host == own_host:
-            return True
-    except Exception:
-        pass
-
-    # Non-browser caller (curl, server-side) has no host: rate limits still apply.
-    return _host_on_allowlist(host, allowed_domains)
+    # A caller with no usable Origin (curl, a file:// page) has no host, so
+    # it matches nothing. Rate limits still apply to it.
+    return _host_on_allowlist(_request_host(request), allowed_domains)
 
 
 def _verify_chat_password(password: str, stored: str) -> bool:
@@ -1826,48 +1839,44 @@ def public_chat(req: PublicChatRequest, request: Request):
             "sessionId": req.sessionId or str(uuid.uuid4()),
         }
 
-    # chat_enabled and the password were both enforced only in the Next.js
-    # page, so turning a link "off" merely hid the UI while /public/chat
-    # (and the embeddable widget) kept answering and kept billing.
     settings = _project_public_settings(req.projectId)
-    if settings.get("chat_enabled") is False:
-        raise HTTPException(status_code=403, detail="This chat is not available.")
 
-    # The merchant's own websites, plus — for the Shopify storefront widget —
-    # the connected store's domain, so Shopify merchants' widgets keep working
-    # without having to list their myshopify.com address by hand. (A store on
-    # a custom domain adds that domain to the list like any other website.)
-    allowed_sites = list(settings.get("allowed_domains") or [])
-    if req.channel == "shopify":
-        shop = supabase.table("shopify_integrations") \
-            .select("shop_domain") \
-            .eq("project_id", req.projectId) \
-            .limit(1) \
-            .execute()
-        if shop.data and shop.data[0].get("shop_domain"):
-            allowed_sites.append(shop.data[0]["shop_domain"])
-
-    if not _origin_allowed(request, allowed_sites):
-        raise HTTPException(
-            status_code=403,
-            detail="This assistant isn't available on this site.",
-        )
-
-    # The password protects the Shareable Chat Link. The website widget is
-    # exempt ONLY on the sites the merchant listed under Allowed domains: it
-    # runs on their own public website, where asking every visitor for the
-    # link's password makes no sense. The exemption has to rest on something
-    # a caller can't simply claim — an empty allowlist exempts nothing, so a
-    # stranger who read the project id out of the chat link can't call this
-    # endpoint directly and walk past the password. (Origin can't be forged
-    # by a browser page; a scripted client could send a listed domain, but
-    # that is the same limit the allowlist itself documents.)
-    if settings.get("has_chat_password"):
-        on_listed_site = _host_on_allowlist(_request_host(request), settings.get("allowed_domains"))
-        if not on_listed_site and not _chat_access_token_valid(
+    if _is_hosted_page_request(request):
+        # The Shareable Chat Link: its own on/off switch and password, and
+        # nothing else. (These were once enforced only in the Next.js page,
+        # so turning the link off merely hid the UI while this endpoint kept
+        # answering and kept billing.) The Allowed websites list does not
+        # apply here — it belongs to the widget.
+        if settings.get("chat_enabled") is False:
+            raise HTTPException(status_code=403, detail="This chat is not available.")
+        if settings.get("has_chat_password") and not _chat_access_token_valid(
             req.projectId, req.accessToken or "", settings.get("chat_password_fp", "")
         ):
             raise HTTPException(status_code=401, detail="This chat is password protected.")
+    else:
+        # The website widget: only the Allowed websites list. No password and
+        # no link switch — the link's settings don't touch the widget.
+        #
+        # The list is the merchant's own websites, plus — for the Shopify
+        # storefront widget — the connected store's domain, so Shopify
+        # merchants' widgets keep working without listing their
+        # myshopify.com address by hand. (A store on a custom domain adds
+        # that domain to the list like any other website.)
+        allowed_sites = list(settings.get("allowed_domains") or [])
+        if req.channel == "shopify":
+            shop = supabase.table("shopify_integrations") \
+                .select("shop_domain") \
+                .eq("project_id", req.projectId) \
+                .limit(1) \
+                .execute()
+            if shop.data and shop.data[0].get("shop_domain"):
+                allowed_sites.append(shop.data[0]["shop_domain"])
+
+        if not _origin_allowed(request, allowed_sites):
+            raise HTTPException(
+                status_code=403,
+                detail="This assistant isn't available on this site.",
+            )
 
     session_id = req.sessionId or str(uuid.uuid4())
 
