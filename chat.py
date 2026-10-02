@@ -118,14 +118,25 @@ def _chat_access_secret() -> bytes:
     return SUPABASE_SERVICE_ROLE_KEY.encode()
 
 
-def _issue_chat_access_token(project_id: str) -> str:
+def _password_fingerprint(stored_hash: str) -> str:
+    """A short, one-way marker of the CURRENT password hash. Mixed into the
+    access token so changing or removing the password invalidates every
+    token issued under the old one. The token used to depend only on the
+    project and an expiry, so someone who had unlocked the chat kept access
+    for up to 12 hours after the merchant changed the password — which is
+    usually done precisely because it leaked. Not the hash itself, so the
+    secret still never sits in memory on a public request."""
+    return hashlib.sha256((stored_hash or "").encode()).hexdigest()[:16]
+
+
+def _issue_chat_access_token(project_id: str, password_fp: str = "") -> str:
     expires = int(time.time()) + _CHAT_ACCESS_TTL_SECONDS
-    payload = f"{project_id}:{expires}"
+    payload = f"{project_id}:{expires}:{password_fp}"
     sig = hmac.new(_chat_access_secret(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{expires}.{sig}"
 
 
-def _chat_access_token_valid(project_id: str, token: str) -> bool:
+def _chat_access_token_valid(project_id: str, token: str, password_fp: str = "") -> bool:
     if not token or "." not in token:
         return False
     expires_str, _, sig = token.partition(".")
@@ -136,7 +147,7 @@ def _chat_access_token_valid(project_id: str, token: str) -> bool:
     if expires < time.time():
         return False
     expected = hmac.new(
-        _chat_access_secret(), f"{project_id}:{expires}".encode(), hashlib.sha256
+        _chat_access_secret(), f"{project_id}:{expires}:{password_fp}".encode(), hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, sig)
 
@@ -157,6 +168,19 @@ def _origin_allowed(request, allowed_domains) -> bool:
         return True
 
     origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+
+    # Our own hosted chat page (the Shareable Chat Link). Its requests reach
+    # this backend through the Next.js proxy, which forwards the browser's
+    # Origin: this app's own address. The allowlist exists to stop OTHER
+    # sites copying the embed snippet; applying it to the hosted page broke
+    # the Shareable Link the moment a merchant added any domain here. The
+    # link has its own on/off switch and password.
+    try:
+        own_host = (urlparse(FRONTEND_URL).hostname or "").lower()
+        if own_host and (urlparse(origin).hostname or "").lower() == own_host:
+            return True
+    except Exception:
+        pass
     if not origin:
         # Non-browser caller (curl, server-side). Rate limits still apply.
         return False
@@ -226,7 +250,9 @@ def _project_public_settings(project_id: str) -> dict:
     ).eq("id", project_id).maybe_single().execute()
     data = (res.data if res else None) or {}
     if data:
-        data["has_chat_password"] = bool(data.pop("chat_password_hash", None))
+        stored = data.pop("chat_password_hash", None)
+        data["has_chat_password"] = bool(stored)
+        data["chat_password_fp"] = _password_fingerprint(stored) if stored else ""
     return data
 
 
@@ -1659,7 +1685,7 @@ def verify_chat_password(req: VerifyPasswordRequest, request: Request):
     if not stored or not _verify_chat_password(req.password or "", stored):
         raise HTTPException(status_code=401, detail="Incorrect password")
 
-    return {"success": True, "accessToken": _issue_chat_access_token(req.projectId)}
+    return {"success": True, "accessToken": _issue_chat_access_token(req.projectId, _password_fingerprint(stored))}
 
 
 @router.get("/public/chat/history/{session_id}")
@@ -1809,7 +1835,7 @@ def public_chat(req: PublicChatRequest, request: Request):
         )
 
     if settings.get("has_chat_password"):
-        if not _chat_access_token_valid(req.projectId, req.accessToken or ""):
+        if not _chat_access_token_valid(req.projectId, req.accessToken or "", settings.get("chat_password_fp", "")):
             raise HTTPException(status_code=401, detail="This chat is password protected.")
 
     session_id = req.sessionId or str(uuid.uuid4())
