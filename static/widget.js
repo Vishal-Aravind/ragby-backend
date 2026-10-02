@@ -496,6 +496,19 @@
         return;
       }
 
+      if (res.status === 403) {
+        // Refused: this website isn't on the project's Allowed websites list
+        // (or the chat is switched off). The body is {detail}, not an answer,
+        // so it used to fall through to a vague "something went wrong" that
+        // gave a merchant who forgot to list their site no clue why.
+        const refusal = await res.json().catch(() => ({}));
+        typing.remove();
+        console.warn("[Zavo chat] Request refused: " + (refusal.detail || "this website isn't allowed.") +
+          " Add this website under Integrations > Embeddable Chat Widget > Allowed websites.");
+        addMsg("assistant", render(refusal.detail || "This assistant isn't available here."));
+        return;
+      }
+
       const data = await res.json();
       typing.remove();
       if (data.sessionId) saveSessionId(data.sessionId);
