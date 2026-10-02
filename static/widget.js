@@ -321,45 +321,44 @@
     const title = esc(leadConfig?.form_title || "Before we continue...");
     const subtitle = esc(leadConfig?.form_subtitle || "Please share your details to keep chatting.");
 
-    // Overlay sits inside msgs container
+    // Already showing: just bring it back into view rather than stacking a
+    // second form.
+    const showing = document.getElementById("lead-form-card");
+    if (showing) {
+      msgs.scrollTop = msgs.scrollHeight;
+      return;
+    }
+
+    // Part of the conversation, in the same left-aligned bubble style as the
+    // bot's messages, right after the question that triggered it. It used to
+    // be a full-area overlay pinned to the top of the scrolling message list:
+    // it hid the chat, and once the chat had scrolled it sat off-screen
+    // above the visible area.
     const overlay = document.createElement("div");
-    overlay.id = "lead-overlay";
-    overlay.style.cssText = `
-      position:absolute;inset:0;
-      background:rgba(255,255,255,0.97);
-      display:flex;flex-direction:column;
-      align-items:center;justify-content:center;
-      padding:24px;z-index:10;
+    overlay.id = "lead-form-card";
+    overlay.style.cssText = "margin-bottom:10px;text-align:left;";
+
+    const fieldStyle = `
+      border:1px solid #ddd;border-radius:8px;background:#fff;color:#000;
+      padding:8px 10px;font-size:13px;
+      width:100%;box-sizing:border-box;outline:none;
     `;
 
     overlay.innerHTML = `
-      <div style="width:100%;max-width:280px;text-align:center;">
-        <div style="font-size:22px;margin-bottom:8px;">👋</div>
-        <h3 style="font-size:15px;font-weight:600;margin:0 0 6px;">${title}</h3>
-        <p style="font-size:12px;color:#666;margin:0 0 18px;">${subtitle}</p>
+      <div style="
+        display:inline-block;background:#f4f4f5;color:#000;
+        padding:12px;border-radius:8px;width:85%;max-width:85%;box-sizing:border-box;">
+        <div style="font-size:13px;font-weight:600;margin:0 0 3px;">${title}</div>
+        <div style="font-size:12px;color:#666;margin:0 0 10px;">${subtitle}</div>
 
-        <div style="display:flex;flex-direction:column;gap:8px;text-align:left;">
-          <input id="lf-name" type="text" placeholder="Your name *" style="
-            border:1px solid #ddd;border-radius:8px;
-            padding:9px 12px;font-size:13px;
-            width:100%;box-sizing:border-box;outline:none;
-          "/>
-          <input id="lf-email" type="email" placeholder="Email address *" style="
-            border:1px solid #ddd;border-radius:8px;
-            padding:9px 12px;font-size:13px;
-            width:100%;box-sizing:border-box;outline:none;
-          "/>
-          <input id="lf-phone" type="tel" placeholder="Phone number *" style="
-            border:1px solid #ddd;border-radius:8px;
-            padding:9px 12px;font-size:13px;
-            width:100%;box-sizing:border-box;outline:none;
-          "/>
-          <div id="lf-error" style="
-            color:#e53e3e;font-size:11px;display:none;
-          "></div>
+        <div style="display:flex;flex-direction:column;gap:7px;">
+          <input id="lf-name" type="text" placeholder="Your name *" style="${fieldStyle}"/>
+          <input id="lf-email" type="email" placeholder="Email address *" style="${fieldStyle}"/>
+          <input id="lf-phone" type="tel" placeholder="Phone number *" style="${fieldStyle}"/>
+          <div id="lf-error" style="color:#e53e3e;font-size:11px;display:none;"></div>
           <button id="lf-submit" style="
             background:#000;color:#fff;border:none;
-            border-radius:8px;padding:10px;
+            border-radius:8px;padding:9px;
             font-size:13px;font-weight:500;
             cursor:pointer;margin-top:2px;
           ">
@@ -369,8 +368,8 @@
       </div>
     `;
 
-    msgs.style.position = "relative";
     msgs.appendChild(overlay);
+    msgs.scrollTop = msgs.scrollHeight;
 
     // Submit handler
     overlay.querySelector("#lf-submit").onclick = async () => {
