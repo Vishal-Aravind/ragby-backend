@@ -164,6 +164,14 @@ def telegram_connect(body: TelegramConnectRequest, user=Depends(verify_token)):
     # reconnecting and can never be replayed against another project.
     webhook_secret = secrets.token_urlsafe(32)
 
+    # What was connected before, so a failed reconnect can put it back.
+    previous = (
+        supabase.table("telegram_integrations")
+        .select("project_id, bot_token, bot_username, webhook_secret")
+        .eq("project_id", project_id)
+        .execute()
+    ).data
+
     supabase.table("telegram_integrations").upsert({
         "project_id": project_id,
         "bot_token": bot_token,
@@ -176,6 +184,15 @@ def telegram_connect(body: TelegramConnectRequest, user=Depends(verify_token)):
 
     if not result.get("ok"):
         print(f"Telegram setWebhook failed: {result}")
+        # The row above was saved BEFORE Telegram confirmed the webhook, so
+        # a refusal left the dashboard showing "connected" for a bot that
+        # never receives anything (and a reconnect over a working bot broke
+        # it: the new secret no longer matched Telegram's old webhook).
+        # Restore what was there, or remove the row if there was nothing.
+        if previous:
+            supabase.table("telegram_integrations").upsert(previous[0], on_conflict="project_id").execute()
+        else:
+            supabase.table("telegram_integrations").delete().eq("project_id", project_id).execute()
         raise HTTPException(
             status_code=400,
             detail="Could not register the webhook with Telegram. Please check your bot token and try again.",
@@ -266,7 +283,21 @@ def _process_telegram_update(project_id: str, body: dict, bot_token: str, bot_us
     """
     try:
         message = body.get("message") or body.get("edited_message")
-        if not message or "text" not in message:
+        if message and "text" not in message:
+            # A photo, voice note, sticker or file used to get no reply at
+            # all, so the customer thought the bot was down. Say what works.
+            # Private chats only: in a group, replying to every non-text
+            # message would be noise. (A caption is not text, so it isn't
+            # answered either.)
+            if (message.get("chat") or {}).get("type") == "private" and any(
+                k in message for k in ("photo", "voice", "audio", "video", "video_note", "document", "sticker", "animation")
+            ):
+                send_telegram_message(
+                    bot_token, message["chat"]["id"],
+                    "I can only read text messages for now. Please type your question.",
+                )
+            return {"status": "ignored"}
+        if not message:
             return {"status": "ignored"}
 
         text = message["text"]
