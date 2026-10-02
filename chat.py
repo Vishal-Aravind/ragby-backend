@@ -177,8 +177,11 @@ def _host_on_allowlist(host: str, allowed_domains) -> bool:
 def _origin_allowed(request, allowed_domains) -> bool:
     """Check the browser-declared Origin against the merchant's allowlist.
 
-    Empty/unset allowlist means allow anywhere, so existing embeds are
-    unaffected until a merchant opts in.
+    An EMPTY allowlist matches nothing: the widget does not run until the
+    merchant has said which website it belongs on. It used to mean "allowed
+    anywhere", which left every embed open to anyone who copied the project
+    id out of the page source and ran the bot from their own site on the
+    merchant's message allowance.
 
     This is a cost control, not a security boundary: Origin is set by the
     browser and cannot be forged by a page, so it reliably stops someone
@@ -186,9 +189,6 @@ def _origin_allowed(request, allowed_domains) -> bool:
     can send whatever Origin it likes. The per-IP/session/project rate
     limits and the monthly quota are the backstop for that case.
     """
-    if not allowed_domains:
-        return True
-
     host = _request_host(request)
 
     # Our own hosted chat page (the Shareable Chat Link). Its requests reach
@@ -1833,7 +1833,21 @@ def public_chat(req: PublicChatRequest, request: Request):
     if settings.get("chat_enabled") is False:
         raise HTTPException(status_code=403, detail="This chat is not available.")
 
-    if not _origin_allowed(request, settings.get("allowed_domains")):
+    # The merchant's own websites, plus — for the Shopify storefront widget —
+    # the connected store's domain, so Shopify merchants' widgets keep working
+    # without having to list their myshopify.com address by hand. (A store on
+    # a custom domain adds that domain to the list like any other website.)
+    allowed_sites = list(settings.get("allowed_domains") or [])
+    if req.channel == "shopify":
+        shop = supabase.table("shopify_integrations") \
+            .select("shop_domain") \
+            .eq("project_id", req.projectId) \
+            .limit(1) \
+            .execute()
+        if shop.data and shop.data[0].get("shop_domain"):
+            allowed_sites.append(shop.data[0]["shop_domain"])
+
+    if not _origin_allowed(request, allowed_sites):
         raise HTTPException(
             status_code=403,
             detail="This assistant isn't available on this site.",
