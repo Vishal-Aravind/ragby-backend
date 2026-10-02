@@ -425,7 +425,11 @@
           overlay.remove();
           unblockInput();
 
-          addMsg("assistant", `Thanks ${name}! How can I help you?`);
+          // A waiting question is answered right below, so a thank-you is all
+          // that's needed; only offer help when there is nothing pending.
+          addMsg("assistant", pendingQuestion
+            ? `Thanks ${esc(name)}!`
+            : `Thanks ${esc(name)}! How can I help you?`);
 
           // Answer the question they had asked before form appeared
           if (pendingQuestion) {
