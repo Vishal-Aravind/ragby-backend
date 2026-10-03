@@ -339,6 +339,11 @@ SYSTEM_PROMPT = (
     "Rules:\n"
     "- No hallucination\n"
     "- No external knowledge\n"
+    "- Never agree with a customer's guess or assumption (currency, unit, size, quantity, date, location, name) "
+    "unless the context states it. If they suggest a detail the context doesn't give, politely say what the data "
+    "says and that it doesn't mention that detail - e.g. 'The price listed is 70; the currency isn't specified.' "
+    "If the context does give it and the guess is wrong, correct them plainly - e.g. 'No, it's ₹70.'\n"
+    "- Only use currency symbols and units that appear in the context - never add one yourself\n"
     "- Use previous conversation history for context when relevant"
 )
 
