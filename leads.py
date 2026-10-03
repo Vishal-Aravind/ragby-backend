@@ -108,6 +108,61 @@ def get_lead_config_public(project_id: str, request: Request):
 
 
 # -------------------------------------------------
+# PUBLIC WIDGET LOOK (name, logo, brand colour)
+# -------------------------------------------------
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_WIDGET_LOOK_TTL_SECONDS = 300
+_WIDGET_LOOK_CACHE_MAX = 1000
+_widget_look_cache: dict = {}
+
+
+@router.get("/public/widget-config/{project_id}")
+def get_widget_config_public(project_id: str, request: Request):
+    """What the website widget needs to dress itself in the merchant's brand:
+    project name, logo and brand colour. All of it is already public — the
+    hosted chat page shows the same three things to anyone with the link.
+
+    Every value is validated before it leaves: the colour must be a plain
+    #rrggbb and the logo an https URL, because the widget puts them into a
+    stylesheet and an image tag on the merchant's own website.
+
+    Cached for a few minutes: the widget calls this on every page view of
+    the merchant's site, and the look changes rarely.
+    """
+    if not _UUID_RE.match(project_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid project id")
+
+    if is_rate_limited(f"widgetcfg:{client_ip(request)}", limit=60, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many requests — please slow down.")
+
+    now = time.time()
+    hit = _widget_look_cache.get(project_id)
+    if hit and now - hit[0] < _WIDGET_LOOK_TTL_SECONDS:
+        return hit[1]
+
+    try:
+        res = supabase.table("projects")             .select("name, brand_color, logo_url")             .eq("id", project_id)             .maybe_single()             .execute()
+        row = (res.data if res else None) or {}
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return {"name": None, "brand_color": None, "logo_url": None}
+
+    color = (row.get("brand_color") or "").strip()
+    logo = (row.get("logo_url") or "").strip()
+    look = {
+        "name": (row.get("name") or "").strip()[:80] or None,
+        "brand_color": color if _HEX_COLOR_RE.match(color) else None,
+        "logo_url": logo if logo.startswith("https://") and len(logo) <= 500 else None,
+    }
+
+    if len(_widget_look_cache) >= _WIDGET_LOOK_CACHE_MAX:
+        oldest = min(_widget_look_cache, key=lambda k: _widget_look_cache[k][0])
+        _widget_look_cache.pop(oldest, None)
+    _widget_look_cache[project_id] = (now, look)
+    return look
+
+
+# -------------------------------------------------
 # PUBLIC LEAD SUBMISSION
 # -------------------------------------------------
 class LeadSubmitRequest(BaseModel):

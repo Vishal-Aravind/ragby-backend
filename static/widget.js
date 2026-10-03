@@ -116,89 +116,306 @@
       const res = await fetch(`${apiBase}/public/chat/history/${sessionId}?project_id=${encodeURIComponent(projectId)}`);
       const data = await res.json();
       for (const m of (data.messages || [])) {
-        addMsg(m.role === "user" ? "user" : "assistant", render(m.content || ""));
+        addMsg(m.role === "user" ? "user" : "assistant", render(m.content || ""), false);
       }
       if (data.messages && data.messages.length) userMessageCount = data.messages.filter(m => m.role === "user").length;
     } catch (e) {}
   }
 
   // ---------------- UI ----------------
-  const btn = document.createElement("div");
-  btn.innerHTML = "💬";
-  btn.style.cssText = `
-    position:fixed;bottom:20px;right:20px;
-    width:52px;height:52px;background:#000;color:#fff;
-    border-radius:50%;display:flex;align-items:center;
-    justify-content:center;cursor:pointer;z-index:999999;
-  `;
-  document.body.appendChild(btn);
+  // Everything lives in a shadow root. The host website's CSS can't restyle
+  // the widget (a site-wide `button {…}` or `input {…}` rule used to), the
+  // widget's styles can't leak into the site, and it can use a real
+  // stylesheet — hover, focus and @keyframes animation, none of which inline
+  // styles can express.
+  const STYLE = `
+    :host {
+      all: initial;
+      --c1: #6366f1; --c2: #8b5cf6; --c3: #d946ef;
+      --glow: rgba(99,102,241,.45); --ring: rgba(139,92,246,.2);
+      --grad: linear-gradient(135deg, var(--c1), var(--c2) 55%, var(--c3));
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    button, input { font: inherit; }
 
-  const box = document.createElement("div");
-  box.style.cssText = `
-    position:fixed;bottom:80px;right:20px;
-    width:340px;height:460px;background:#fff;
-    border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);
-    display:none;flex-direction:column;z-index:999999;
-    font-family:system-ui;overflow:hidden;
+    /* ---- launcher ---- */
+    .dock { position: fixed; right: 20px; bottom: 20px; width: 60px; height: 60px; z-index: 2147483000; }
+    .ring { position: absolute; inset: 0; border-radius: 50%; background: var(--grad);
+            animation: zv-ring 2.8s ease-out infinite; pointer-events: none; }
+    .dock.open .ring { display: none; }
+    .launcher { position: relative; width: 60px; height: 60px; border: none; border-radius: 50%; cursor: pointer;
+                color: #fff; display: flex; align-items: center; justify-content: center; padding: 0;
+                background: var(--grad); background-size: 200% 200%;
+                box-shadow: 0 10px 28px var(--glow), 0 2px 8px rgba(0,0,0,.16);
+                animation: zv-pop .55s cubic-bezier(.34,1.56,.64,1) .25s both, zv-flow 9s ease infinite;
+                transition: transform .3s cubic-bezier(.34,1.56,.64,1), box-shadow .3s; }
+    .launcher:hover { transform: scale(1.1) rotate(-6deg); box-shadow: 0 14px 34px var(--glow), 0 3px 10px rgba(0,0,0,.2); }
+    .launcher:active { transform: scale(.94); }
+    .launcher:focus-visible, .close:focus-visible, .send:focus-visible { outline: 3px solid #fff; outline-offset: 2px; box-shadow: 0 0 0 5px var(--c2); }
+    .launcher svg { position: absolute; width: 27px; height: 27px; transition: transform .4s cubic-bezier(.34,1.56,.64,1), opacity .2s; }
+    .ico-close { opacity: 0; transform: rotate(-90deg) scale(.4); }
+    .dock.open .ico-chat { opacity: 0; transform: rotate(90deg) scale(.4); }
+    .dock.open .ico-close { opacity: 1; transform: none; }
+
+    /* ---- panel ---- */
+    .panel { position: fixed; right: 20px; bottom: 92px; width: 380px; max-width: calc(100vw - 24px);
+             height: min(620px, calc(100vh - 116px)); height: min(620px, calc(100dvh - 116px));
+             display: flex; flex-direction: column; background: #fff; border-radius: 24px; overflow: hidden; z-index: 2147483000;
+             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+             color: #1f2937; -webkit-font-smoothing: antialiased;
+             box-shadow: 0 28px 80px rgba(49,46,129,.32), 0 4px 18px rgba(0,0,0,.08);
+             opacity: 0; visibility: hidden; pointer-events: none;
+             transform: translateY(18px) scale(.93); transform-origin: bottom right;
+             transition: opacity .25s ease, transform .4s cubic-bezier(.34,1.3,.64,1), visibility 0s linear .4s; }
+    .panel.open { opacity: 1; visibility: visible; pointer-events: auto; transform: none;
+                  transition: opacity .25s ease, transform .4s cubic-bezier(.34,1.3,.64,1), visibility 0s; }
+
+    /* ---- header ---- */
+    .head { position: relative; display: flex; align-items: center; gap: 12px; padding: 18px 16px 20px; color: #fff; overflow: hidden;
+            background: var(--grad); background-size: 200% 200%; animation: zv-flow 10s ease infinite; }
+    .head::before, .head::after { content: ""; position: absolute; border-radius: 50%; pointer-events: none; }
+    .head::before { width: 150px; height: 150px; right: -40px; top: -70px; background: rgba(255,255,255,.14); }
+    .head::after  { width: 90px; height: 90px; right: 70px; bottom: -55px; background: rgba(255,255,255,.1); }
+    .head > * { position: relative; z-index: 1; }
+    .avatar-wrap { position: relative; flex: none; }
+    .avatar { width: 44px; height: 44px; border-radius: 50%; overflow: hidden; display: flex; align-items: center; justify-content: center;
+              background: rgba(255,255,255,.22); border: 2px solid rgba(255,255,255,.6); }
+    .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .avatar svg { width: 22px; height: 22px; }
+    .live { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: #22c55e; border: 2px solid #fff; }
+    .live::after { content: ""; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid #22c55e; animation: zv-ping 2s ease-out infinite; }
+    .titles { flex: 1; min-width: 0; }
+    .title { font-weight: 650; font-size: 16px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sub { font-size: 12px; opacity: .9; margin-top: 3px; }
+    .close { flex: none; width: 34px; height: 34px; border: none; border-radius: 50%; cursor: pointer; padding: 0; color: #fff;
+             background: rgba(255,255,255,.2); display: flex; align-items: center; justify-content: center;
+             transition: background .2s, transform .3s cubic-bezier(.34,1.56,.64,1); }
+    .close:hover { background: rgba(255,255,255,.34); transform: rotate(90deg); }
+    .close svg { width: 16px; height: 16px; }
+
+    /* ---- messages ---- */
+    .msgs { position: relative; flex: 1; overflow-y: auto; padding: 18px 14px 8px; font-size: 14px; line-height: 1.5;
+            background: linear-gradient(180deg, #f3f0ff 0%, #f9f8ff 38%, #fff 100%); }
+    .msgs::-webkit-scrollbar { width: 6px; }
+    .msgs::-webkit-scrollbar-thumb { background: #d6d3ee; border-radius: 3px; }
+    .row { display: flex; margin-bottom: 10px; animation: zv-in .4s cubic-bezier(.22,1,.36,1) both; }
+    .row.still { animation: none; }
+    .row.user { justify-content: flex-end; }
+    .bubble { max-width: 84%; padding: 10px 14px; border-radius: 18px; overflow-wrap: anywhere; }
+    .row.assistant .bubble { background: #fff; color: #1f2937; border: 1px solid #ebe9f7; border-bottom-left-radius: 6px;
+                             box-shadow: 0 2px 8px rgba(79,70,229,.07); }
+    .row.user .bubble { background: var(--grad); color: #fff; border-bottom-right-radius: 6px;
+                        box-shadow: 0 6px 16px var(--glow); }
+    .row.user .bubble a { color: #fff !important; }
+    .typing .bubble { display: flex; align-items: center; gap: 5px; padding: 14px 16px; }
+    .typing .bubble i { width: 7px; height: 7px; border-radius: 50%; background: var(--grad); animation: zv-bounce 1.2s ease-in-out infinite; }
+    .typing .bubble i:nth-child(2) { animation-delay: .15s; }
+    .typing .bubble i:nth-child(3) { animation-delay: .3s; }
+
+    /* ---- composer ---- */
+    .composer { display: flex; align-items: center; gap: 10px; padding: 12px 14px 14px; background: #fff; border-top: 1px solid #efedf8; }
+    .field { flex: 1; min-width: 0; background: #f4f3fb; border: 1.5px solid transparent; border-radius: 26px; padding: 0 16px;
+             transition: border-color .2s, box-shadow .2s, background .2s; }
+    .field:focus-within { background: #fff; border-color: var(--c2); box-shadow: 0 0 0 4px var(--ring); }
+    .input { width: 100%; height: 42px; border: none; outline: none; background: transparent; font-size: 14px; color: #1f2937; }
+    .input::placeholder { color: #9ca3af; }
+    .input:disabled { cursor: not-allowed; }
+    .send { flex: none; width: 42px; height: 42px; border: none; border-radius: 50%; cursor: pointer; padding: 0; color: #fff;
+            display: flex; align-items: center; justify-content: center; background: var(--grad);
+            box-shadow: 0 6px 16px var(--glow);
+            transition: transform .25s cubic-bezier(.34,1.56,.64,1), box-shadow .25s, opacity .2s; }
+    .send:hover:not(:disabled) { transform: scale(1.1) rotate(-8deg); }
+    .send:active:not(:disabled) { transform: scale(.92); }
+    .send:disabled { cursor: not-allowed; box-shadow: none; }
+    .send svg { width: 19px; height: 19px; margin-left: -1px; }
+
+    /* ---- in-chat cards (lead form, password) ---- */
+    .bubble.card { width: 92%; max-width: 92%; padding: 16px; border-radius: 18px; }
+    .card-title { font-weight: 650; font-size: 14.5px; margin-bottom: 3px; }
+    .card-sub { font-size: 12.5px; color: #6b7280; margin-bottom: 12px; }
+    .fld { width: 100%; height: 40px; margin-bottom: 8px; padding: 0 13px; border: 1.5px solid #e5e3f3; border-radius: 12px;
+           background: #fafaff; color: #1f2937; font-size: 13.5px; outline: none; transition: border-color .2s, box-shadow .2s, background .2s; }
+    .fld:focus { background: #fff; border-color: var(--c2); box-shadow: 0 0 0 4px var(--ring); }
+    .err { color: #dc2626; font-size: 12px; margin: 0 0 8px; }
+    .cta { width: 100%; height: 42px; border: none; border-radius: 12px; cursor: pointer; color: #fff; font-weight: 600; font-size: 14px;
+           background: var(--grad); box-shadow: 0 6px 16px var(--glow);
+           transition: transform .2s cubic-bezier(.34,1.56,.64,1), box-shadow .2s, opacity .2s; }
+    .cta:hover:not(:disabled) { transform: translateY(-1px) scale(1.01); }
+    .cta:active:not(:disabled) { transform: scale(.98); }
+    .cta:disabled { opacity: .6; cursor: default; }
+
+    @keyframes zv-pop    { from { opacity: 0; transform: scale(0) rotate(-40deg); } to { opacity: 1; transform: none; } }
+    @keyframes zv-ring   { 0% { transform: scale(1); opacity: .5; } 100% { transform: scale(1.75); opacity: 0; } }
+    @keyframes zv-flow   { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+    @keyframes zv-in     { from { opacity: 0; transform: translateY(12px) scale(.96); } to { opacity: 1; transform: none; } }
+    @keyframes zv-ping   { 0% { transform: scale(1); opacity: .8; } 100% { transform: scale(2.1); opacity: 0; } }
+    @keyframes zv-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .45; } 30% { transform: translateY(-6px); opacity: 1; } }
+
+    @media (max-width: 480px) {
+      .dock { right: 14px; bottom: 14px; }
+      .panel { left: 12px; right: 12px; width: auto; max-width: none; bottom: 86px; border-radius: 20px;
+               height: min(620px, calc(100vh - 104px)); height: min(620px, calc(100dvh - 104px)); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition-duration: .01ms !important; }
+    }
   `;
 
-  box.innerHTML = `
-    <div style="padding:12px;border-bottom:1px solid #eee;font-weight:600">
-      Ask us
-    </div>
-    <div id="msgs" style="flex:1;padding:12px;overflow:auto;font-size:14px;position:relative"></div>
-    <form id="chatForm" style="display:flex;border-top:1px solid #eee">
-      <input id="chat-input" placeholder="Type your question..."
-        style="flex:1;padding:10px;border:none;outline:none"/>
-      <button id="send-btn" type="submit"
-        style="padding:10px 14px;border:none;background:#000;color:#fff;cursor:pointer">
-        Send
+  const host = document.createElement("div");
+  host.id = "zavo-chat-widget";
+  const root = host.attachShadow({ mode: "open" });
+
+  root.innerHTML = `
+    <style>${STYLE}</style>
+
+    <div class="dock" id="dock">
+      <span class="ring"></span>
+      <button class="launcher" id="launcher" type="button" aria-label="Open chat" aria-expanded="false" aria-controls="panel">
+        <svg class="ico-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z"/></svg>
+        <svg class="ico-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
-    </form>
+    </div>
+
+    <section class="panel" id="panel" role="dialog" aria-label="Chat" aria-hidden="true">
+      <header class="head">
+        <div class="avatar-wrap">
+          <div class="avatar" id="avatar">
+            <svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2l1.9 5.9L20 10l-6.1 2.1L12 18l-1.9-5.9L4 10l6.1-2.1z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z" opacity=".85"/></svg>
+          </div>
+          <span class="live"></span>
+        </div>
+        <div class="titles">
+          <div class="title" id="title">Chat with us</div>
+          <div class="sub">Online &middot; replies instantly</div>
+        </div>
+        <button class="close" id="closeBtn" type="button" aria-label="Close chat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </header>
+
+      <div class="msgs" id="msgs" role="log" aria-live="polite"></div>
+
+      <form class="composer" id="chatForm" autocomplete="off">
+        <div class="field">
+          <input class="input" id="chat-input" placeholder="Type your question..." maxlength="4000" autocomplete="off" aria-label="Your message"/>
+        </div>
+        <button class="send" id="send-btn" type="submit" aria-label="Send">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+        </button>
+      </form>
+    </section>
   `;
-  document.body.appendChild(box);
+  document.body.appendChild(host);
+
+  const dock = root.getElementById("dock");
+  const launcher = root.getElementById("launcher");
+  const box = root.getElementById("panel");
+  const closeBtn = root.getElementById("closeBtn");
+  const msgs = root.getElementById("msgs");
+  const form = root.getElementById("chatForm");
+  const input = root.getElementById("chat-input");
+  const sendBtn = root.getElementById("send-btn");
+
+  // ---- merchant branding (name, logo, brand colour) ----
+  // A brand colour becomes the gradient; near-black, near-white and grey
+  // colours would only make a dull one, so those keep the default palette.
+  function applyBrand(hex) {
+    if (!/^#[0-9a-f]{6}$/i.test(hex || "")) return;
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const g = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    const l = (max + min) / 2;
+    const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+    if (l < 0.12 || l > 0.9 || s < 0.12) return;
+    let h = 0;
+    if (d !== 0) {
+      if (max === r) h = ((g - b) / d) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h = (h * 60 + 360) % 360;
+    }
+    const hsl = (hh, ss, ll, a) =>
+      `hsl(${Math.round(hh)} ${Math.round(ss * 100)}% ${Math.round(ll * 100)}%${a == null ? "" : " / " + a})`;
+    host.style.setProperty("--c1", hsl(h, s, Math.max(l - 0.07, 0.18)));
+    host.style.setProperty("--c2", hsl(h, s, l));
+    host.style.setProperty("--c3", hsl((h + 32) % 360, Math.min(s + 0.05, 1), Math.min(l + 0.1, 0.72)));
+    host.style.setProperty("--glow", hsl(h, s, l, 0.45));
+    host.style.setProperty("--ring", hsl(h, s, l, 0.2));
+  }
+
+  async function fetchWidgetConfig() {
+    try {
+      const res = await fetch(`${apiBase}/public/widget-config/${projectId}`);
+      if (!res.ok) return;
+      const c = await res.json();
+      applyBrand(c.brand_color);
+      if (c.name) {
+        root.getElementById("title").textContent = c.name;
+        box.setAttribute("aria-label", "Chat with " + c.name);
+      }
+      // Set through .src on a created element, never innerHTML, and only for
+      // https: the value comes from the merchant's settings.
+      if (typeof c.logo_url === "string" && /^https:\/\//i.test(c.logo_url)) {
+        const img = document.createElement("img");
+        img.alt = "";
+        img.onload = () => { root.getElementById("avatar").replaceChildren(img); };
+        img.src = c.logo_url;
+      }
+    } catch (e) {}
+  }
 
   let hasOpened = false;
-  btn.onclick = () => {
-    box.style.display = box.style.display === "none" ? "flex" : "none";
+  function setOpen(open) {
+    dock.classList.toggle("open", open);
+    box.classList.toggle("open", open);
+    launcher.setAttribute("aria-expanded", String(open));
+    launcher.setAttribute("aria-label", open ? "Close chat" : "Open chat");
+    box.setAttribute("aria-hidden", String(!open));
+    if (!open) return;
     // Shown once, the first time the widget is opened — gives the visitor
     // a hint of what to ask instead of a blank box. Skipped if earlier
     // messages were just restored (see restoreHistory below), and not
     // shown again on later opens/closes so it doesn't repeat above real
     // conversation.
-    if (!hasOpened && box.style.display === "flex" && !msgs.children.length) {
-      addMsg("assistant", "👋 Hi! Ask me anything — I'm here to help.");
+    if (!hasOpened && !msgs.children.length) {
+      addMsg("assistant", "&#128075; Hi! Ask me anything &mdash; I'm here to help.");
     }
     hasOpened = true;
-  };
-
-  const msgs = box.querySelector("#msgs");
-  const form = box.querySelector("#chatForm");
-  const input = box.querySelector("#chat-input");
-  const sendBtn = box.querySelector("#send-btn");
-
-  function addMsg(role, html) {
-    const el = document.createElement("div");
-    el.style.marginBottom = "10px";
-    el.style.textAlign = role === "user" ? "right" : "left";
-    el.innerHTML = `
-      <div style="
-        display:inline-block;
-        background:${role === "user" ? "#000" : "#f4f4f5"};
-        color:${role === "user" ? "#fff" : "#000"};
-        padding:8px 10px;border-radius:8px;max-width:85%">
-        ${html}
-      </div>
-    `;
-    msgs.appendChild(el);
     msgs.scrollTop = msgs.scrollHeight;
+    // Focus only where there is a physical keyboard: on a phone it would pop
+    // the keyboard over the conversation the moment the panel opens.
+    if (window.matchMedia && window.matchMedia("(pointer: fine)").matches) {
+      setTimeout(() => { if (!input.disabled) input.focus(); }, 300);
+    }
+  }
+  launcher.onclick = () => setOpen(!box.classList.contains("open"));
+  closeBtn.onclick = () => { setOpen(false); launcher.focus(); };
+  root.addEventListener("keydown", (e) => { if (e.key === "Escape" && box.classList.contains("open")) setOpen(false); });
+
+  function scrollToEnd(animate) {
+    if (animate && msgs.scrollTo) msgs.scrollTo({ top: msgs.scrollHeight, behavior: "smooth" });
+    else msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  // `html` is already escaped by render() (or is one of our own strings).
+  // animate=false for restored history, so a long conversation doesn't
+  // replay its entrance animation all at once.
+  function addMsg(role, html, animate = true) {
+    const el = document.createElement("div");
+    el.className = "row " + (role === "user" ? "user" : "assistant") + (animate ? "" : " still");
+    el.innerHTML = `<div class="bubble">${html}</div>`;
+    msgs.appendChild(el);
+    scrollToEnd(animate);
   }
 
   function showTyping() {
     const el = document.createElement("div");
-    el.innerText = "...";
+    el.className = "row assistant typing";
+    el.setAttribute("aria-label", "Typing");
+    el.innerHTML = `<div class="bubble"><i></i><i></i><i></i></div>`;
     msgs.appendChild(el);
-    msgs.scrollTop = msgs.scrollHeight;
+    scrollToEnd(true);
     return el;
   }
 
@@ -214,7 +431,7 @@
     input.placeholder = "Type your question...";
     sendBtn.disabled = false;
     sendBtn.style.opacity = "1";
-    input.focus();
+    if (box.classList.contains("open") && window.matchMedia && window.matchMedia("(pointer: fine)").matches) input.focus();
   }
 
   // ---------------- LEAD FORM ----------------
@@ -223,40 +440,23 @@
   function showPasswordForm() {
     blockInput();
 
-    const existing = document.getElementById("pw-overlay");
+    const existing = root.getElementById("pw-overlay");
     if (existing) existing.remove();
 
     const overlay = document.createElement("div");
     overlay.id = "pw-overlay";
-    overlay.style.cssText = `
-      position:absolute;inset:0;
-      background:rgba(255,255,255,0.97);
-      display:flex;flex-direction:column;
-      align-items:center;justify-content:center;
-      padding:24px;z-index:10;
-    `;
-
+    overlay.className = "row assistant";
     overlay.innerHTML = `
-      <div style="width:100%;max-width:280px;text-align:center;">
-        <div style="font-size:22px;margin-bottom:8px;">&#128274;</div>
-        <h3 style="font-size:15px;font-weight:600;margin:0 0 6px;">This chat is protected</h3>
-        <p style="font-size:12px;color:#666;margin:0 0 18px;">Enter the password to continue.</p>
-        <div style="display:flex;flex-direction:column;gap:8px;text-align:left;">
-          <input id="pw-input" type="password" placeholder="Password" style="
-            border:1px solid #ddd;border-radius:8px;
-            padding:9px 11px;font-size:13px;outline:none;width:100%;box-sizing:border-box;
-          "/>
-          <div id="pw-error" style="display:none;color:#dc2626;font-size:11px;"></div>
-          <button id="pw-submit" style="
-            background:#111;color:#fff;border:none;border-radius:8px;
-            padding:10px;font-size:13px;font-weight:600;cursor:pointer;width:100%;
-          ">Unlock</button>
-        </div>
+      <div class="bubble card">
+        <div class="card-title">&#128274; This chat is protected</div>
+        <div class="card-sub">Enter the password to continue.</div>
+        <input id="pw-input" class="fld" type="password" placeholder="Password" autocomplete="current-password"/>
+        <div id="pw-error" class="err" style="display:none"></div>
+        <button id="pw-submit" class="cta" type="button">Unlock</button>
       </div>
     `;
-
-    msgs.style.position = "relative";
     msgs.appendChild(overlay);
+    scrollToEnd(true);
 
     const input = overlay.querySelector("#pw-input");
     const errorEl = overlay.querySelector("#pw-error");
@@ -323,7 +523,7 @@
 
     // Already showing: just bring it back into view rather than stacking a
     // second form.
-    const showing = document.getElementById("lead-form-card");
+    const showing = root.getElementById("lead-form-card");
     if (showing) {
       msgs.scrollTop = msgs.scrollHeight;
       return;
@@ -336,40 +536,22 @@
     // above the visible area.
     const overlay = document.createElement("div");
     overlay.id = "lead-form-card";
-    overlay.style.cssText = "margin-bottom:10px;text-align:left;";
-
-    const fieldStyle = `
-      border:1px solid #ddd;border-radius:8px;background:#fff;color:#000;
-      padding:8px 10px;font-size:13px;
-      width:100%;box-sizing:border-box;outline:none;
-    `;
+    overlay.className = "row assistant";
 
     overlay.innerHTML = `
-      <div style="
-        display:inline-block;background:#f4f4f5;color:#000;
-        padding:12px;border-radius:8px;width:85%;max-width:85%;box-sizing:border-box;">
-        <div style="font-size:13px;font-weight:600;margin:0 0 3px;">${title}</div>
-        <div style="font-size:12px;color:#666;margin:0 0 10px;">${subtitle}</div>
-
-        <div style="display:flex;flex-direction:column;gap:7px;">
-          <input id="lf-name" type="text" placeholder="Your name *" style="${fieldStyle}"/>
-          <input id="lf-email" type="email" placeholder="Email address *" style="${fieldStyle}"/>
-          <input id="lf-phone" type="tel" placeholder="Phone number *" style="${fieldStyle}"/>
-          <div id="lf-error" style="color:#e53e3e;font-size:11px;display:none;"></div>
-          <button id="lf-submit" style="
-            background:#000;color:#fff;border:none;
-            border-radius:8px;padding:9px;
-            font-size:13px;font-weight:500;
-            cursor:pointer;margin-top:2px;
-          ">
-            Continue chatting →
-          </button>
-        </div>
+      <div class="bubble card">
+        <div class="card-title">${title}</div>
+        <div class="card-sub">${subtitle}</div>
+        <input id="lf-name" class="fld" type="text" placeholder="Your name *" autocomplete="name"/>
+        <input id="lf-email" class="fld" type="email" placeholder="Email address *" autocomplete="email"/>
+        <input id="lf-phone" class="fld" type="tel" placeholder="Phone number *" autocomplete="tel"/>
+        <div id="lf-error" class="err" style="display:none"></div>
+        <button id="lf-submit" class="cta" type="button">Continue chatting &rarr;</button>
       </div>
     `;
 
     msgs.appendChild(overlay);
-    msgs.scrollTop = msgs.scrollHeight;
+    scrollToEnd(true);
 
     // Submit handler
     overlay.querySelector("#lf-submit").onclick = async () => {
@@ -437,7 +619,7 @@
             pendingQuestion = null;
           }
         } else {
-          submitBtn.textContent = "Continue chatting →";
+          submitBtn.textContent = "Continue chatting \u2192";
           submitBtn.disabled = false;
           // The server does real email/phone validation now, so show what it
           // actually said rather than a blanket "something went wrong" the
@@ -452,7 +634,7 @@
           errorEl.style.display = "block";
         }
       } catch (e) {
-        submitBtn.textContent = "Continue chatting →";
+        submitBtn.textContent = "Continue chatting \u2192";
         submitBtn.disabled = false;
         errorEl.textContent = "Network error. Please try again.";
         errorEl.style.display = "block";
@@ -557,5 +739,6 @@
 
   // ---------------- INIT ----------------
   fetchLeadConfig();
+  fetchWidgetConfig();
   restoreHistory();
 })();
