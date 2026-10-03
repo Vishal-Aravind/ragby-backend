@@ -1038,7 +1038,12 @@ def generate_razorpay_link(order: dict, config: dict) -> Optional[str]:
     accepting payments uninterrupted while they migrate to OAuth."""
     project_id = config.get("project_id") or order.get("project_id")
     payload = {
-        "amount": int(order["total"] * 100),
+        # round(), not int(): int() truncates, so a total like 19.99 became
+        # 1998 paise (19.99 * 100 == 1998.9999999999998). The customer was
+        # charged a paisa short, and the paid-amount check in the webhook
+        # (which rounds) then read it as an underpayment and never marked the
+        # order paid. About 1 in 22 totals was affected.
+        "amount": int(round(float(order["total"]) * 100)),
         # FIX: was hardcoded "INR" regardless of the store's real
         # currency — harmless for every existing (INR-only) store, but
         # would have silently charged a Shopify-sourced multi-currency
