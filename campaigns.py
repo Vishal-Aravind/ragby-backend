@@ -55,7 +55,7 @@ def _wa_integration(project_id: str) -> dict:
 
 def _fetch_approved_templates(waba_id: str, token: str) -> list:
     res = http.get(
-        f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
+        f"https://graph.facebook.com/v25.0/{waba_id}/message_templates",
         params={
             "fields": "name,status,components,language",
             "limit": 100,
@@ -539,7 +539,7 @@ def send_campaign_messages(
             # this used had NO timeout, so a slow Meta pinned the worker
             # indefinitely.
             res = http.post(
-                f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
+                f"https://graph.facebook.com/v25.0/{phone_number_id}/messages",
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",

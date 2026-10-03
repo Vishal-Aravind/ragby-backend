@@ -260,7 +260,7 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
     }
 
     res = http.post(
-        f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
+        f"https://graph.facebook.com/v25.0/{waba_id}/message_templates",
         headers={
             "Authorization": f"Bearer {wa['token']}",
             "Content-Type": "application/json",
@@ -300,7 +300,7 @@ def sync_templates_from_meta(project_id: str, user=Depends(verify_token)):
 
     # Fetch all templates from Meta, with the project's own token
     res = http.get(
-        f"https://graph.facebook.com/v19.0/{waba_id}/message_templates",
+        f"https://graph.facebook.com/v25.0/{waba_id}/message_templates",
         headers={"Authorization": f"Bearer {wa['token']}"},
         params={"fields": "name,status,category,language,components", "limit": 100},
     )

@@ -1201,7 +1201,7 @@ def _send_reminder_template(to: str, customer_name: str, date: str, time: str, p
     for every appointment in the run).
     """
     res = http.post(
-        f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
+        f"https://graph.facebook.com/v25.0/{phone_number_id}/messages",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
