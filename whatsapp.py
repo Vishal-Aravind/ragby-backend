@@ -528,7 +528,7 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: st
             "body": {"text": body},
             "action": {
                 "buttons": [
-                    {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"]}}
+                    {"type": "reply", "reply": {"id": btn["id"], "title": btn["title"][:20]}}
                     for btn in buttons[:3]
                 ]
             }
@@ -567,6 +567,23 @@ def send_whatsapp_media(to: str, media_type: str, media: dict, phone_number_id: 
 def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, phone_number_id: str, token: str):
     url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # WhatsApp rejects the ENTIRE list (the customer gets nothing) past 10
+    # rows in total, a row/section title over 24 chars, a button over 20, or
+    # a body over 1024. Lists saved before the editor enforced these still
+    # exist, so trim here rather than fail silently.
+    if len(body) > 1024:
+        body = body[:1021] + "..."
+    button_text = (button_text or "View Options")[:20]
+    trimmed, left = [], 10
+    for sec in sections:
+        rows = [{**r, "title": r["title"][:24]} for r in (sec.get("rows") or [])][:left]
+        if not rows:
+            continue
+        left -= len(rows)
+        trimmed.append({**sec, "title": (sec.get("title") or "")[:24], "rows": rows})
+        if left <= 0:
+            break
+    sections = trimmed
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
