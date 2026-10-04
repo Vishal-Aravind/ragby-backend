@@ -6,6 +6,7 @@ Interactive Message Flows for WhatsApp
 - "handoff" button ID → human handoff
 - Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
+import re
 import sentry_sdk
 import threading
 from datetime import datetime, timezone
@@ -23,6 +24,19 @@ from whatsapp import (
 RESERVED_ASK_AI   = "ask_a_question"
 RESERVED_BACK     = "back_to_menu"
 RESERVED_HANDOFF  = "talk_to_human"
+
+# A media node's URL must be a direct file. A YouTube/Drive/Instagram page
+# link is accepted by Meta at send time and then never delivered, so the
+# customer got nothing. Send those as text instead — WhatsApp shows the link
+# with a preview, which is what the merchant meant anyway.
+_PAGE_LINK = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com|instagram\.com|facebook\.com|fb\.watch|drive\.google\.com|dropbox\.com/s/)", re.I)
+
+
+def _send_page_link_as_text(url: str, body: str, to: str, phone_number_id: str, token: str) -> bool:
+    if not _PAGE_LINK.search(url or ""):
+        return False
+    send_whatsapp_message(to, f"{body}\n{url}" if body else url, phone_number_id, token)
+    return True
 
 
 # -------------------------------------------------
@@ -192,7 +206,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_media":
-        if c.get("media_url"):
+        if _send_page_link_as_text(c.get("media_url"), body, to, phone_number_id, token):
+            pass
+        elif c.get("media_url"):
             send_whatsapp_media(
                 to, "image",
                 {"link": c["media_url"], "caption": body},
@@ -202,7 +218,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_video":
-        if c.get("video_url"):
+        if _send_page_link_as_text(c.get("video_url"), body, to, phone_number_id, token):
+            pass
+        elif c.get("video_url"):
             send_whatsapp_media(
                 to, "video",
                 {"link": c["video_url"], "caption": body},
@@ -212,7 +230,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_document":
-        if c.get("document_url"):
+        if _send_page_link_as_text(c.get("document_url"), body, to, phone_number_id, token):
+            pass
+        elif c.get("document_url"):
             send_whatsapp_media(
                 to, "document",
                 {
@@ -233,7 +253,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             )
 
     elif t == "message_audio":
-        if c.get("audio_url"):
+        if _send_page_link_as_text(c.get("audio_url"), body, to, phone_number_id, token):
+            pass
+        elif c.get("audio_url"):
             send_whatsapp_media(
                 to, "audio", {"link": c["audio_url"]}, phone_number_id, token,
             )
