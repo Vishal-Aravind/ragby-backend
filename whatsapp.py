@@ -773,6 +773,13 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
         session = get_session(project_id, from_number)
         if session:
             handle_interactive(session, trigger, from_number, phone_number_id, token, project_id, chat_id)
+        else:
+            # A tap on an old menu after the session expired got no reply at
+            # all. Open the flow fresh instead, same as a first text message.
+            from flows import get_active_flow, start_flow
+            flow = get_active_flow(project_id)
+            if flow:
+                start_flow(flow, project_id, from_number, phone_number_id, token, chat_id)
         return {"status": "ok"}
 
     # ── Text message ──────────────────────────────────

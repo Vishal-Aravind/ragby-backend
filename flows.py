@@ -8,7 +8,7 @@ Interactive Message Flows for WhatsApp
 """
 import sentry_sdk
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from clients import supabase
 from config import FRONTEND_URL, MAX_FLOW_DELAY_THREADS
@@ -34,6 +34,22 @@ def _send_page_link_as_text(url: str, kind: str, body: str, to: str, phone_numbe
         return False
     send_whatsapp_message(to, f"{body}\n{url}" if body else url, phone_number_id, token)
     return True
+
+
+# Only these node types lead anywhere: buttons/list by the option tapped,
+# shop once payment is confirmed (time_delay advances on its own timer).
+# Every other node ends the flow — the editor gives them no outgoing handle,
+# and a "next" line left over from before is ignored rather than making the
+# node look mid-flow (which re-sent it on every message).
+_CONTINUING_TYPES = {"message_buttons", "buttons", "message_list", "list", "message_shop"}
+
+
+def _is_end_node(node: dict, flow_id: str) -> bool:
+    if node.get("type") not in _CONTINUING_TYPES:
+        return True
+    outgoing = supabase.table("flow_edges").select("id") \
+        .eq("flow_id", flow_id).eq("from_node_id", node["id"]).limit(1).execute()
+    return not outgoing.data
 
 
 # -------------------------------------------------
@@ -69,12 +85,29 @@ def get_session(project_id: str, phone_number: str) -> Optional[dict]:
         return None
 
 
+# A customer who goes quiet starts fresh next time (get_session drops an
+# expired session). 2 hours outlasts the 90-minute payment link, so nobody
+# is reset mid-payment.
+SESSION_IDLE_HOURS = 2
+
+
 def upsert_session(project_id: str, phone_number: str, data: dict):
     supabase.table("whatsapp_sessions").upsert({
         "project_id": project_id,
         "phone_number": phone_number,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=SESSION_IDLE_HOURS)).isoformat(),
         **data,
     }, on_conflict="project_id,phone_number").execute()
+
+
+def touch_session(project_id: str, phone_number: str):
+    """Push expiry out on any message, so an active chat is never reset."""
+    try:
+        supabase.table("whatsapp_sessions").update({
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=SESSION_IDLE_HOURS)).isoformat(),
+        }).eq("project_id", project_id).eq("phone_number", phone_number).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
 
 
 def delete_session(project_id: str, phone_number: str):
@@ -704,14 +737,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         if chat_id:
             save_message(chat_id, "assistant", next_node["content"].get("body", ""))
 
-        outgoing = supabase.table("flow_edges") \
-            .select("id") \
-            .eq("flow_id", flow_id) \
-            .eq("from_node_id", next_node["id"]) \
-            .limit(1) \
-            .execute()
-
-        if not outgoing.data:
+        if _is_end_node(next_node, flow_id):
             if next_node["type"] == "ask_a_question":
                 pass
             else:
@@ -719,19 +745,17 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
                 free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
 
                 if free_q:
+                    # End of the flow: switch to AI mode silently. The node
+                    # itself is the last thing the customer sees; AI only
+                    # answers once they type something (each answer carries
+                    # a Back to Menu button). An extra "Feel free to ask"
+                    # prompt here also overtook files — WhatsApp delivers
+                    # text instantly but downloads an image/PDF first.
                     upsert_session(project_id, phone_number, {
                         "flow_id": flow_id,
                         "current_node_id": next_node["id"],
                         "mode": "rag_question",
                     })
-                    msg = "💬 Feel free to ask me anything!"
-                    send_whatsapp_buttons(
-                        phone_number, msg,
-                        [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
-                        phone_number_id, token
-                    )
-                    if chat_id:
-                        save_message(chat_id, "assistant", msg)
                 else:
                     upsert_session(project_id, phone_number, {
                         "flow_id": flow_id,
@@ -747,6 +771,9 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     if chat_id:
         save_message(chat_id, "user", text)
+
+    if session:
+        touch_session(project_id, phone_number)
 
     if session and session.get("mode") == "appointment_confirmed":
         # Only unambiguous BUTTON taps (Reschedule/Cancel — handled in
@@ -931,7 +958,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
             send_whatsapp_message(
                 phone_number,
-                "No problem, your order has been cancelled. Feel free to ask me anything else! 😊",
+                "No problem, your order has been cancelled. 😊",
                 phone_number_id, token,
             )
             # Fully clear the session (not just its mode) so the next
@@ -965,12 +992,14 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         return
 
     if not session:
+        # No session = a new customer, or one quiet long enough that their
+        # session expired. With a flow active, any first message opens the
+        # start node (not only the trigger keyword) — AI is then reached
+        # through the flow itself: free questions or an Ask a Question node.
         flow = get_active_flow(project_id)
         if flow:
-            keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
-            if text.lower().strip() in keywords:
-                start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
-                return
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
+            return
         _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
         return
 
@@ -997,11 +1026,11 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     current_node = get_node(current_node_id, flow_id=flow_id) if current_node_id else None
 
     if not current_node:
+        # The node they were on was deleted or edited away — restart rather
+        # than leave them with no reply at all.
         flow = get_active_flow(project_id)
         if flow:
-            keywords = [k.lower() for k in (flow.get("trigger_keywords") or [])]
-            if text.lower().strip() in keywords:
-                start_flow(flow, project_id, phone_number, phone_number_id, token)
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
         return
 
     flow = supabase.table("flows").select("free_questions, trigger_keywords").eq("id", flow_id).single().execute()
@@ -1064,26 +1093,14 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
             increment_usage(project_id)
         else:
-            outgoing = supabase.table("flow_edges").select("id") \
-                .eq("flow_id", flow_id).eq("from_node_id", current_node_id).limit(1).execute()
-            if outgoing.data:
+            if not _is_end_node(current_node, flow_id):
+                # Still waiting on a choice (buttons/list) — show it again.
                 send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
-            else:
-                # The flow has ended (last node, nothing after it) and free
-                # questions are off. Re-sending that last node on every
-                # message looked like a stuck bot; point them back to the
-                # menu instead (the keyword itself was checked above and
-                # restarts the flow). With no keyword to offer, end the flow
-                # and answer normally.
-                keywords = (flow_data or {}).get("trigger_keywords") or []
-                if keywords:
-                    msg = f"Type *{keywords[0]}* to see the menu again."
-                    send_whatsapp_message(phone_number, msg, phone_number_id, token)
-                    if chat_id:
-                        save_message(chat_id, "assistant", msg)
-                else:
-                    delete_session(project_id, phone_number)
-                    _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
+            elif flow_data:
+                # The flow has ended and free questions are off: any message
+                # opens the start menu again. (Re-sending the last node on
+                # every message looked like a stuck bot.)
+                start_flow(flow_data, project_id, phone_number, phone_number_id, token, chat_id)
 
 
 def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
