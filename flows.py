@@ -532,7 +532,6 @@ def _resolve_delay_seconds(content: dict) -> int:
 
 def _schedule_delayed_advance(flow_id, from_node_id, project_id, phone_number,
                               phone_number_id, token, chat_id, delay_secs):
-    from chat import save_message
     global _delay_threads_active
 
     def advance():
@@ -546,14 +545,7 @@ def _schedule_delayed_advance(flow_id, from_node_id, project_id, phone_number,
         current = get_session(project_id, phone_number)
         if not current or current.get("current_node_id") != from_node_id:
             return
-        upsert_session(project_id, phone_number, {
-            "flow_id": flow_id,
-            "current_node_id": after_node["id"],
-            "mode": "flow",
-        })
-        send_node(after_node, phone_number, phone_number_id, token, project_id=project_id)
-        if chat_id:
-            save_message(chat_id, "assistant", (after_node.get("content") or {}).get("body", ""))
+        _enter_node(flow_id, after_node, project_id, phone_number, phone_number_id, token, chat_id)
 
     if delay_secs <= 0:
         advance()
@@ -581,6 +573,66 @@ def _schedule_delayed_advance(flow_id, from_node_id, project_id, phone_number,
                 _delay_threads_active -= 1
 
     threading.Thread(target=delayed_advance, daemon=True).start()
+
+
+def _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, token, chat_id=None):
+    """Move the customer onto next_node and send it. Shared by a button/list
+    tap and a finished Time Delay, so a node behaves the same either way —
+    the delay path used to skip all of this (Talk to Human didn't silence the
+    bot, Back to Menu sent nothing, end-of-flow AI mode never switched on)."""
+    from chat import save_message
+    upsert_session(project_id, phone_number, {
+        "flow_id": flow_id,
+        "current_node_id": next_node["id"],
+        "mode": "human" if next_node["type"] in ("handoff", "talk_to_human") else
+                "rag_question" if next_node["type"] == "ask_a_question" else "flow",
+    })
+
+    if next_node["type"] in ("handoff", "talk_to_human"):
+        msg = next_node["content"].get("body", "Connecting you to our team...")
+        send_whatsapp_message(phone_number, msg, phone_number_id, token)
+        if chat_id:
+            save_message(chat_id, "assistant", msg)
+    elif next_node["type"] == "back_to_menu":
+        flow = get_active_flow(project_id)
+        if flow:
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
+    elif next_node["type"] == "time_delay":
+        delay_secs = _resolve_delay_seconds(next_node.get("content") or {})
+        _schedule_delayed_advance(
+            flow_id, next_node["id"], project_id, phone_number,
+            phone_number_id, token, chat_id, delay_secs,
+        )
+    else:
+        send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
+        if chat_id:
+            save_message(chat_id, "assistant", next_node["content"].get("body", ""))
+
+        if _is_end_node(next_node, flow_id):
+            if next_node["type"] == "ask_a_question":
+                pass
+            else:
+                flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
+                free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
+
+                if free_q:
+                    # End of the flow: switch to AI mode silently. The node
+                    # itself is the last thing the customer sees; AI only
+                    # answers once they type something (each answer carries
+                    # a Back to Menu button). An extra "Feel free to ask"
+                    # prompt here also overtook files — WhatsApp delivers
+                    # text instantly but downloads an image/PDF first.
+                    upsert_session(project_id, phone_number, {
+                        "flow_id": flow_id,
+                        "current_node_id": next_node["id"],
+                        "mode": "rag_question",
+                    })
+                else:
+                    upsert_session(project_id, phone_number, {
+                        "flow_id": flow_id,
+                        "current_node_id": next_node["id"],
+                        "mode": "flow",
+                    })
 
 
 def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str, chat_id: str = None):
@@ -710,58 +762,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
                 save_message(chat_id, "assistant", (current_node.get("content") or {}).get("body", ""))
         return
 
-    upsert_session(project_id, phone_number, {
-        "flow_id": flow_id,
-        "current_node_id": next_node["id"],
-        "mode": "human" if next_node["type"] in ("handoff", "talk_to_human") else
-                "rag_question" if next_node["type"] == "ask_a_question" else "flow",
-    })
-
-    if next_node["type"] in ("handoff", "talk_to_human"):
-        msg = next_node["content"].get("body", "Connecting you to our team...")
-        send_whatsapp_message(phone_number, msg, phone_number_id, token)
-        if chat_id:
-            save_message(chat_id, "assistant", msg)
-    elif next_node["type"] == "back_to_menu":
-        flow = get_active_flow(project_id)
-        if flow:
-            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
-    elif next_node["type"] == "time_delay":
-        delay_secs = _resolve_delay_seconds(next_node.get("content") or {})
-        _schedule_delayed_advance(
-            flow_id, next_node["id"], project_id, phone_number,
-            phone_number_id, token, chat_id, delay_secs,
-        )
-    else:
-        send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
-        if chat_id:
-            save_message(chat_id, "assistant", next_node["content"].get("body", ""))
-
-        if _is_end_node(next_node, flow_id):
-            if next_node["type"] == "ask_a_question":
-                pass
-            else:
-                flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
-                free_q = flow_row.data.get("free_questions", False) if flow_row.data else False
-
-                if free_q:
-                    # End of the flow: switch to AI mode silently. The node
-                    # itself is the last thing the customer sees; AI only
-                    # answers once they type something (each answer carries
-                    # a Back to Menu button). An extra "Feel free to ask"
-                    # prompt here also overtook files — WhatsApp delivers
-                    # text instantly but downloads an image/PDF first.
-                    upsert_session(project_id, phone_number, {
-                        "flow_id": flow_id,
-                        "current_node_id": next_node["id"],
-                        "mode": "rag_question",
-                    })
-                else:
-                    upsert_session(project_id, phone_number, {
-                        "flow_id": flow_id,
-                        "current_node_id": next_node["id"],
-                        "mode": "flow",
-                    })
+    _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, token, chat_id)
 
 
 def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: str, phone_number: str, phone_number_id: str, token: str):
