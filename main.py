@@ -47,6 +47,7 @@ from content_gaps import router as content_gaps_router
 from auth import router as auth_router
 from shopify_oauth import router as shopify_router
 from razorpay_oauth import router as razorpay_oauth_router
+from media_check import router as media_check_router
 
 
 # -------------------------------------------------
@@ -359,6 +360,7 @@ app.include_router(content_gaps_router)
 app.include_router(auth_router)
 app.include_router(shopify_router)
 app.include_router(razorpay_oauth_router)
+app.include_router(media_check_router)
 
 
 # -------------------------------------------------
