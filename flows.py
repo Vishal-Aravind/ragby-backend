@@ -1064,7 +1064,18 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             send_back_to_menu_button(phone_number, result["answer"], phone_number_id, token)
             increment_usage(project_id)
         else:
-            send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
+            outgoing = supabase.table("flow_edges").select("id") \
+                .eq("flow_id", flow_id).eq("from_node_id", current_node_id).limit(1).execute()
+            if outgoing.data:
+                send_node(current_node, phone_number, phone_number_id, token, project_id=project_id)
+            else:
+                # The flow has ended (last node, nothing after it). Re-sending
+                # that last node on every message looked like a stuck bot.
+                # Treat the customer like anyone not in a flow: clear the
+                # session and answer normally (a trigger keyword was already
+                # checked above and restarts the flow).
+                delete_session(project_id, phone_number)
+                _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token)
 
 
 def _rag_reply(project_id, chat_id, text, phone_number, phone_number_id, token):
