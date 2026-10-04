@@ -552,6 +552,9 @@ def send_whatsapp_media(to: str, media_type: str, media: dict, phone_number_id: 
     """
     url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # A caption over 1024 chars makes WhatsApp reject the whole message.
+    if isinstance(media, dict) and len(media.get("caption") or "") > 1024:
+        media = {**media, "caption": media["caption"][:1021] + "..."}
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -603,6 +606,12 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
 def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, phone_number_id: str, token: str):
     url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    link = (url_link or "").replace("{{phone_number}}", to)
+    # WhatsApp rejects the whole message for an empty body, a body over 1024
+    # chars or a button over 20 — trim to its limits instead.
+    body = (body or "Tap the button below.")
+    if len(body) > 1024:
+        body = body[:1021] + "..."
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -613,8 +622,8 @@ def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, p
             "action": {
                 "name": "cta_url",
                 "parameters": {
-                    "display_text": button_text,
-                    "url": url_link.replace("{{phone_number}}", to)
+                    "display_text": (button_text or "Open")[:20],
+                    "url": link,
                 }
             }
         }
@@ -622,6 +631,10 @@ def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, p
     res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp CTA send error: {res.text}")
+        # Still rejected (e.g. a tel: link — the button only takes web
+        # links): send the same thing as plain text so the customer gets it.
+        shown = link[4:] if link.startswith("tel:") else link
+        return send_whatsapp_message(to, f"{body}\n\n{shown}", phone_number_id, token)
     return res
 
 

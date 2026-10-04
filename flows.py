@@ -258,23 +258,33 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             )
 
     elif t == "message_location":
-        if c.get("latitude") and c.get("longitude"):
-            send_whatsapp_media(
+        # Typed into text boxes, so they arrive as strings; WhatsApp wants
+        # numbers in range and rejects the whole pin otherwise.
+        try:
+            lat, lng = float(c.get("latitude")), float(c.get("longitude"))
+            valid = -90 <= lat <= 90 and -180 <= lng <= 180
+        except (TypeError, ValueError):
+            valid = False
+        sent = False
+        if valid:
+            res = send_whatsapp_media(
                 to, "location",
-                {
-                    "latitude": c["latitude"],
-                    "longitude": c["longitude"],
-                    "name": c.get("name", ""),
-                    "address": c.get("address", ""),
-                },
+                {"latitude": lat, "longitude": lng, "name": c.get("name", ""), "address": c.get("address", "")},
                 phone_number_id, token,
             )
+            sent = bool(res is not None and res.ok)
+        if not sent:
+            place = ", ".join(x for x in (c.get("name"), c.get("address")) if x)
+            maps = f"https://maps.google.com/?q={lat},{lng}" if valid else ""
+            fallback = "\n".join(x for x in (f"📍 {place}" if place else "", maps) if x)
+            if fallback:
+                send_whatsapp_message(to, fallback, phone_number_id, token)
         if body:
             send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "message_contact":
         if c.get("contact_name") and c.get("contact_phone"):
-            send_whatsapp_media(
+            res = send_whatsapp_media(
                 to, "contacts",
                 [{
                     "name": {"formatted_name": c["contact_name"], "first_name": c["contact_name"]},
@@ -282,6 +292,8 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
                 }],
                 phone_number_id, token,
             )
+            if res is not None and not res.ok:
+                send_whatsapp_message(to, f"👤 {c['contact_name']}\n📞 {c['contact_phone']}", phone_number_id, token)
 
     elif t == "ask_a_question":
         if project_id:
@@ -325,7 +337,8 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         reg_url = f"{FRONTEND_URL}/event/{event_id}"
 
         # Send rich card — image + body + Register button (+ optional Call button)
-        if c.get("banner_url"):
+        from media_check import check_media_link
+        if c.get("banner_url") and check_media_link(c["banner_url"], "image")["ok"]:
             send_whatsapp_media(
                 to, "image",
                 {"link": c["banner_url"], "caption": body},
