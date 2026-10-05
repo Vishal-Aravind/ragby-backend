@@ -78,6 +78,13 @@ def _engine(project_id: str) -> Engine:
 _TRIGGER_TYPES = {"time_on_page", "url_match", "exit_intent", "scroll_depth"}
 
 
+def _int_or(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _clean_settings(raw) -> dict:
     """Only the fields the widget needs, bounded."""
     raw = raw if isinstance(raw, dict) else {}
@@ -87,8 +94,8 @@ def _clean_settings(raw) -> dict:
             continue
         triggers.append({
             "type": t["type"],
-            "seconds": max(1, min(int(t.get("seconds") or 10), 600)) if t["type"] == "time_on_page" else None,
-            "percent": max(10, min(int(t.get("percent") or 50), 100)) if t["type"] == "scroll_depth" else None,
+            "seconds": max(1, min(_int_or(t.get("seconds"), 10), 600)) if t["type"] == "time_on_page" else None,
+            "percent": max(10, min(_int_or(t.get("percent"), 50), 100)) if t["type"] == "scroll_depth" else None,
             "match": t.get("match") if t.get("match") in ("contains", "equals", "starts_with") else "contains",
             "value": str(t.get("value") or "")[:300],
         })
@@ -96,8 +103,9 @@ def _clean_settings(raw) -> dict:
         "startOnOpen": raw.get("start_on_open", True) is not False,
         "teaser": str(raw.get("teaser") or "")[:140],
         "display": raw.get("display") if raw.get("display") in ("open", "teaser") else "open",
-        "cooldownHours": max(0, min(int(raw.get("cooldown_hours") or 24), 24 * 30)),
-        "suppressDays": max(0, min(int(raw.get("suppress_days") or 7), 90)),
+        # 0 is a real choice ("no cooldown"); only a missing value defaults.
+        "cooldownHours": max(0, min(_int_or(raw.get("cooldown_hours"), 24), 24 * 30)),
+        "suppressDays": max(0, min(_int_or(raw.get("suppress_days"), 7), 90)),
         "triggers": triggers,
     }
 
@@ -318,6 +326,9 @@ def web_flow_preview(req: PreviewReq, user=Depends(verify_token)):
     if prior and prior.get("flow") == req.flowId and prior.get("uid") == user.id and req.action is not None:
         store.session = prior["session"]
         sess = prior["session"]
+        if (req.action or {}).get("type") == "continue":
+            # The tester asked to skip the wait; a visitor can't do this.
+            store.session["resume_at"] = None
         env = engine.step(req.projectId, sess["chat_id"], visitor, sess["seq"], req.nodeId, req.action)
     else:
         env = engine.start(req.projectId, None, visitor, "preview")
