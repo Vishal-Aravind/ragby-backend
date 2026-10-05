@@ -1,7 +1,7 @@
 """{{variable}} templating for website flows. Pure functions, no I/O.
 
 Merchants write "Thanks {{name}}!" or "Hi {{name|there}}" in node text. The
-values come from visitors (form answers, webhook responses), so the rules
+values come from visitors (form answers), so the rules
 are strict:
   - one pass, never re-expanded: a visitor typing "{{email}}" as their name
     gets "{{email}}" back, not someone else's data;
@@ -22,7 +22,7 @@ MAX_VALUE_LEN = 1000
 MAX_VARIABLES = 50
 
 # Filled in by the engine; merchants can read them but not set them.
-SYSTEM_VARS = {"page_url", "page_path", "page_title", "webhook_status"}
+SYSTEM_VARS = {"page_url", "page_path", "page_title"}
 
 
 def is_valid_var_name(name) -> bool:

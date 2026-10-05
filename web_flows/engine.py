@@ -13,36 +13,36 @@ Store:   get_active_web_flow(project_id) -> flow | None
          save_session(session)
 Effects: record(session, entries, visitor_acted)   (transcript / chats rows)
          upsert_lead(project_id, visitor_id, fields, custom) -> lead_id | None
-         webhook(content, variables) -> {ok, status, assign, ...}
          log_events(events)
          now() -> aware datetime ; today() -> date ; random() -> float in [0,1)
 
 One request = claim the session, apply the visitor's action to the node that
 was waiting for it, then auto-advance until a node needs input again, the
-flow ends, or a long delay starts. Hard caps per request (25 nodes, 3
-webhooks) stop a merchant's A->B->A loop from spinning forever.
+flow ends, or a long delay starts. A hard cap per request (25 nodes) stops
+a merchant's A->B->A loop from spinning forever.
 
 Everything returned to the browser is built here from an explicit public
-projection of each node, so webhook URLs/headers can never leak.
+projection of each node, so internal settings never leak.
 """
 import uuid
 from datetime import timedelta
 from urllib.parse import quote, urlsplit
 
 from flow_common import option_id
-from .conditions import evaluate as evaluate_conditions
 from .templating import render_text, set_variable
 from .validation import check_value, check_rating, INPUT_TYPES, FIELD_TYPES
 
 SESSION_HOURS = 3            # matches the widget's 3h chat session
 MAX_AUTO_STEPS = 25
-MAX_WEBHOOKS = 3
 MAX_OPTIONS = 50
 MAX_CARDS = 10
 MAX_CARD_BUTTONS = 3
 MAX_FORM_FIELDS = 10
 INLINE_DELAY_MAX_S = 10      # up to this: a typing pause, no round trip
 MAX_DELAY_S = 600            # web delays are capped at 10 minutes
+
+# Removed from the product; may still sit in an old saved flow.
+REMOVED_TYPES = {"condition", "set_variable", "random_split", "webhook"}
 
 INPUT_NODE_TYPES = {"message_buttons", "quick_replies", "message_list", "carousel",
                     "ask_input", "form", "rating"}
@@ -102,7 +102,6 @@ class Ctx:
         self.transcript = []    # [{"role", "content"}] saved to the chat
         self.events = []
         self.steps = 0
-        self.webhooks = 0
         self.continue_after_ms = None
         self.error = None
 
@@ -400,40 +399,12 @@ class Engine:
                     self._say(ctx, body)
                 self._wait_on(sess, ctx, node)
                 return
-            if t == "condition":
-                node = self._next(ctx, node, evaluate_conditions(c.get("rules"), variables))
-                continue
-            if t == "set_variable":
-                for a in (c.get("assignments") or [])[:20]:
-                    set_variable(variables, (a or {}).get("var"), render_text((a or {}).get("value"), variables, 1000))
-                node = self._next(ctx, node, "next")
-                continue
-            if t == "random_split":
-                node = self._next(ctx, node, self._pick_branch(c))
-                continue
-            if t == "webhook":
-                ctx.webhooks += 1
-                if ctx.webhooks > MAX_WEBHOOKS:
-                    ctx.events.append(("loop_guard", node["id"], {"webhooks": ctx.webhooks}))
-                    self._end(sess, ctx, node)
-                    return
-                if c.get("waiting_text"):
-                    self._say(ctx, render_text(c.get("waiting_text"), variables))
-                result = self.fx.webhook(c, dict(variables)) or {}
-                variables["webhook_status"] = result.get("status") or 0
-                for var, value in (result.get("assign") or {}).items():
-                    set_variable(variables, var, value)
-                ok = bool(result.get("ok"))
-                ctx.events.append(("webhook_ok" if ok else "webhook_fail", node["id"], {"status": result.get("status")}))
-                nxt = self._next(ctx, node, "success" if ok else "failure")
-                if nxt is None and not ok:
-                    ctx.events.append(("dead_end", node["id"], {}))
-                    self._say(ctx, "Sorry, something went wrong. Please try again later.")
-                node = nxt
-                if node is None:
-                    self._end(sess, ctx, None)
-                    return
-                continue
+            if t in REMOVED_TYPES:
+                # Condition / set variable / random split / webhook were
+                # removed from the product. A test flow saved with one ends
+                # here quietly instead of showing its raw settings.
+                self._end(sess, ctx, node)
+                return
             if t == "time_delay":
                 secs = self._delay_seconds(c)
                 if secs <= INLINE_DELAY_MAX_S:
@@ -484,24 +455,6 @@ class Engine:
         sess["current_node_id"] = node["id"]
         sess["mode"] = "flow"
         ctx.nodes[node["id"]] = node
-
-    def _pick_branch(self, c):
-        branches = [b for b in (c.get("branches") or [])[:5] if b.get("id")]
-        weights = []
-        for b in branches:
-            try:
-                weights.append(max(0.0, float(b.get("weight") or 0)))
-            except (TypeError, ValueError):
-                weights.append(0.0)
-        total = sum(weights)
-        if not branches or total <= 0:
-            return branches[0]["id"] if branches else "next"
-        r = self.fx.random() * total
-        for b, w in zip(branches, weights):
-            if r < w:
-                return b["id"]
-            r -= w
-        return branches[-1]["id"]
 
     @staticmethod
     def _delay_seconds(c):

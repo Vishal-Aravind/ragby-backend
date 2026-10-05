@@ -5,13 +5,10 @@ Run from backend/:  python -m unittest tests.test_web_flows -v
 import copy
 import json
 import unittest
-from datetime import date, datetime, timedelta, timezone
-from unittest import mock
+from datetime import datetime, timedelta, timezone
 
 from web_flows.templating import render_text, render_url, set_variable, to_decimal
-from web_flows.conditions import evaluate
 from web_flows.engine import Engine, MAX_AUTO_STEPS
-from web_flows import webhook as wh
 from flow_common import option_id
 
 PID = "11111111-1111-1111-1111-111111111111"
@@ -62,8 +59,7 @@ class FakeStore:
 
 class FakeEffects:
     def __init__(self):
-        self.records, self.leads, self.events, self.webhook_calls = [], [], [], []
-        self.webhook_result = {"ok": True, "status": 200, "assign": {}}
+        self.records, self.leads, self.events = [], [], []
         self.rand = 0.0
         self.clock = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
 
@@ -73,10 +69,6 @@ class FakeEffects:
     def upsert_lead(self, project_id, visitor_id, fields, custom):
         self.leads.append((visitor_id, fields, custom))
         return "lead-1"
-
-    def webhook(self, content, variables):
-        self.webhook_calls.append((content, variables))
-        return self.webhook_result
 
     def log_events(self, events):
         self.events.extend(events)
@@ -126,25 +118,6 @@ class TemplatingTests(unittest.TestCase):
         self.assertFalse(set_variable(v, "page_url", "x"))
         self.assertFalse(set_variable(v, "Bad-Name", "x"))
         self.assertEqual(to_decimal("Rs 1,50,000"), 150000)
-
-
-class ConditionTests(unittest.TestCase):
-    RULES = [
-        {"id": "big", "match": "all", "rows": [{"var": "budget", "op": "gt", "value": "50"}]},
-        {"id": "veg", "match": "any", "rows": [{"var": "diet", "op": "equals", "value": "Veg"},
-                                               {"var": "diet", "op": "contains", "value": "plant"}]},
-    ]
-
-    def test_first_match_and_else(self):
-        self.assertEqual(evaluate(self.RULES, {"budget": "80"}), "big")
-        self.assertEqual(evaluate(self.RULES, {"budget": "10", "diet": "veg"}), "veg")
-        self.assertEqual(evaluate(self.RULES, {"budget": "abc"}), "else")   # non-numeric -> false
-        self.assertEqual(evaluate(self.RULES, {}), "else")                   # missing -> ""
-
-    def test_empty_ops(self):
-        rules = [{"id": "r", "match": "all", "rows": [{"var": "email", "op": "is_empty"}]}]
-        self.assertEqual(evaluate(rules, {}), "r")
-        self.assertEqual(evaluate(rules, {"email": "a@b.co"}), "else")
 
 
 # --------------------------------------------------------------------------- #
@@ -250,48 +223,17 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any(e["event"] == "loop_guard" for e in fx.events))
         self.assertEqual(env["status"], "ended")
 
-    def test_condition_webhook_and_variables(self):
-        nodes = [
-            node("s", "ask_input", {"body": "Budget?", "input_type": "number", "var": "budget"}, start=True),
-            node("c", "condition", {"rules": [{"id": "r_big", "match": "all",
-                                               "rows": [{"var": "budget", "op": "gte", "value": "50"}]}]}),
-            node("w", "webhook", {"url": "https://hooks.example/x"}),
-            node("ok", "message", {"body": "Tier {{tier}}"}),
-            node("bad", "message", {"body": "Webhook failed"}),
-            node("small", "message", {"body": "Small budget"}),
-        ]
-        edges = [edge("s", "next", "c"), edge("c", "r_big", "w"), edge("c", "else", "small"),
-                 edge("w", "success", "ok"), edge("w", "failure", "bad")]
-        eng, store, fx = make(nodes, edges)
-        fx.webhook_result = {"ok": True, "status": 200, "assign": {"tier": "gold"}}
+    def test_removed_node_types_end_quietly(self):
+        # Condition / set variable / random split / webhook were removed; an
+        # old saved flow with one must neither crash nor show its settings.
+        nodes = [node("a", "message", {"body": "Hi"}, start=True),
+                 node("w", "webhook", {"url": "https://hooks.example/secret-path",
+                                       "body": [{"key": "k", "value": "v"}]})]
+        eng, store, fx = make(nodes, [edge("a", "next", "w")])
         env = eng.start(PID, None, VID, "open")
-        self.assertEqual(env["input"]["type"], "number")
-        bad = eng.step(PID, env["sessionId"], VID, env["seq"], "s", {"type": "field", "value": "lots"})
-        self.assertEqual(bad["error"]["code"], "invalid")
-        env = eng.step(PID, env["sessionId"], VID, bad["seq"], "s", {"type": "field", "value": "75"})
-        self.assertEqual(env["messages"][-1]["text"], "Tier gold")
-        self.assertEqual(fx.webhook_calls[0][1]["budget"], 75)
-
-        eng, store, fx = make(nodes, edges)
-        fx.webhook_result = {"ok": False, "status": 500, "assign": {}}
-        env = eng.start(PID, None, VID, "open")
-        env = eng.step(PID, env["sessionId"], VID, env["seq"], "s", {"type": "field", "value": "75"})
-        self.assertEqual(env["messages"][-1]["text"], "Webhook failed")
-
-        eng, store, fx = make(nodes, edges)
-        env = eng.start(PID, None, VID, "open")
-        env = eng.step(PID, env["sessionId"], VID, env["seq"], "s", {"type": "field", "value": "10"})
-        self.assertEqual(env["messages"][-1]["text"], "Small budget")
-
-    def test_envelope_never_leaks_webhook_config(self):
-        secret_url = "https://hooks.example/secret-path"
-        nodes = [node("w", "webhook", {"url": secret_url, "headers": [{"key": "Authorization", "value": "Bearer SECRET"}]}, start=True),
-                 node("m", "quick_replies", {"body": "ok", "options": [{"id": "o", "label": "x"}]})]
-        eng, store, fx = make(nodes, [edge("w", "success", "m")])
-        env = eng.start(PID, None, VID, "open")
-        blob = json.dumps(env)
-        self.assertNotIn("secret-path", blob)
-        self.assertNotIn("SECRET", blob)
+        self.assertEqual([m["text"] for m in env["messages"]], ["Hi"])
+        self.assertEqual(env["status"], "ended")
+        self.assertNotIn("secret-path", json.dumps(env))
 
     def test_delays(self):
         nodes = [node("a", "message", {"body": "A"}, start=True),
@@ -348,16 +290,6 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(env["messages"][2]["url"], "tel:+919876543210")
         self.assertEqual(env["input"]["cards"][0]["buttons"], [{"label": "Choose", "id": "c1"}])
 
-    def test_random_split_and_set_variable(self):
-        nodes = [node("s", "set_variable", {"assignments": [{"var": "greet", "value": "Hey {{page_title}}"}]}, start=True),
-                 node("r", "random_split", {"branches": [{"id": "b1", "weight": 30}, {"id": "b2", "weight": 70}]}),
-                 node("x", "message", {"body": "{{greet}} A"}), node("y", "message", {"body": "{{greet}} B"})]
-        edges = [edge("s", "next", "r"), edge("r", "b1", "x"), edge("r", "b2", "y")]
-        eng, store, fx = make(nodes, edges)
-        fx.rand = 0.5
-        env = eng.start(PID, None, VID, "open", {"title": "Shop"})
-        self.assertEqual(env["messages"][0]["text"], "Hey Shop B")
-
     def test_human_mode_saves_text_without_reply(self):
         nodes = [node("h", "talk_to_human", {"body": "Connecting..."}, start=True)]
         eng, store, fx = make(nodes, [])
@@ -367,71 +299,6 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(out["messages"], [])
         self.assertEqual(fx.records[-1][1], [{"role": "user", "content": "hello?"}])
 
-
-# --------------------------------------------------------------------------- #
-# Webhook caller
-# --------------------------------------------------------------------------- #
-class FakeResponse:
-    def __init__(self, status, body=b"", headers=None):
-        self.status_code = status
-        self._body = body
-        self.headers = headers or {}
-
-    def iter_content(self, n):
-        for i in range(0, len(self._body), n):
-            yield self._body[i:i + n]
-
-    def close(self):
-        pass
-
-
-class WebhookTests(unittest.TestCase):
-    def run_call(self, responses, content=None, variables=None):
-        calls = []
-
-        def transport(method, url, **kw):
-            calls.append((method, url, kw))
-            return responses.pop(0)
-
-        with mock.patch.object(wh, "assert_public_http_url", side_effect=self.guard):
-            result = wh.call(content or {"method": "POST", "url": "https://ok.example/hook",
-                                         "body": [{"key": "email", "value": "{{email}}"}],
-                                         "mappings": [{"path": "data.tier", "var": "tier"}]},
-                             variables or {"email": 'a"b@x.com'}, transport=transport)
-        return result, calls
-
-    @staticmethod
-    def guard(url):
-        if "127.0.0.1" in url or "169.254" in url:
-            raise ValueError("internal address")
-
-    def test_success_maps_json(self):
-        res, calls = self.run_call([FakeResponse(200, b'{"data": {"tier": "gold"}}')])
-        self.assertTrue(res["ok"])
-        self.assertEqual(res["assign"], {"tier": "gold"})
-        self.assertEqual(json.loads(calls[0][2]["data"]), {"email": 'a"b@x.com'})   # no JSON injection
-
-    def test_failure_and_redirects(self):
-        res, _ = self.run_call([FakeResponse(500, b"oops")])
-        self.assertFalse(res["ok"])
-        res, _ = self.run_call([FakeResponse(302, headers={"Location": "https://127.0.0.1/x"})],
-                               content={"method": "GET", "url": "https://ok.example/x"})
-        self.assertFalse(res["ok"])
-        self.assertIn("internal", res["reason"])
-        res, _ = self.run_call([FakeResponse(307, headers={"Location": "https://ok.example/y"})])
-        self.assertFalse(res["ok"])          # POST never follows redirects
-
-    def test_oversize_and_http_refused(self):
-        res, _ = self.run_call([FakeResponse(200, b"x" * (wh.MAX_RESPONSE_BYTES + 10))])
-        self.assertFalse(res["ok"])
-        res, calls = self.run_call([], content={"method": "POST", "url": "http://ok.example/x"})
-        self.assertFalse(res["ok"])
-        self.assertEqual(calls, [])
-
-    def test_real_guard_blocks_metadata(self):
-        res = wh.call({"method": "GET", "url": "https://169.254.169.254/latest"}, {},
-                      transport=lambda *a, **k: FakeResponse(200, b"{}"))
-        self.assertFalse(res["ok"])
 
 
 class OptionIdGoldenTests(unittest.TestCase):

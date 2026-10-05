@@ -6,7 +6,7 @@ the project's Allowed websites list (empty = refused), suspension, and
 rate limits. Flow steps don't use the monthly message allowance — only AI
 answers do, and those still go through the unchanged /public/chat.
 
-Authenticated (editor): preview, test-webhook, agent reply on a website chat.
+Authenticated (editor): preview, agent reply on a website chat.
 """
 import base64
 import hashlib
@@ -17,7 +17,6 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from auth import verify_token, require_project_access
@@ -26,7 +25,6 @@ from config import FRONTEND_URL
 from ratelimit import is_rate_limited, client_ip
 from .engine import Engine
 from .store import SupabaseStore, LiveEffects
-from . import webhook as webhook_mod
 
 router = APIRouter()
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -281,9 +279,6 @@ class PreviewStore(SupabaseStore):
 
 
 class PreviewEffects(LiveEffects):
-    def __init__(self, project_id, real_webhooks):
-        super().__init__(project_id)
-        self.real_webhooks = real_webhooks
 
     def record(self, sess, entries, visitor_acted):
         pass
@@ -294,10 +289,6 @@ class PreviewEffects(LiveEffects):
     def log_events(self, events):
         pass
 
-    def webhook(self, content, variables):
-        if self.real_webhooks:
-            return super().webhook(content, variables)
-        return {"ok": True, "status": 200, "assign": {}, "simulated": True}
 
 
 class PreviewReq(BaseModel):
@@ -306,7 +297,6 @@ class PreviewReq(BaseModel):
     token: Optional[str] = Field(default=None, max_length=100000)
     action: Optional[dict] = None     # None = (re)start
     nodeId: Optional[str] = None
-    realWebhooks: bool = False
 
 
 @router.post("/web-flows/preview")
@@ -319,7 +309,7 @@ def web_flow_preview(req: PreviewReq, user=Depends(verify_token)):
     if not flow or flow[0]["project_id"] != req.projectId or flow[0].get("channel") != "web":
         raise HTTPException(status_code=404, detail="Flow not found")
     store = PreviewStore({"id": flow[0]["id"], "free_questions": flow[0].get("free_questions")})
-    engine = Engine(store, PreviewEffects(req.projectId, req.realWebhooks), FRONTEND_URL)
+    engine = Engine(store, PreviewEffects(req.projectId), FRONTEND_URL)
     visitor = f"preview:{user.id}"[:64]
 
     prior = _unsign(req.token) if req.token else None
@@ -339,22 +329,6 @@ def web_flow_preview(req: PreviewReq, user=Depends(verify_token)):
     env["debug"] = {"variables": sess.get("variables") or {}, "currentNodeId": sess.get("current_node_id"),
                     "mode": sess.get("mode")}
     return env
-
-
-class TestWebhookReq(BaseModel):
-    projectId: str
-    content: dict
-    variables: dict = {}
-
-
-@router.post("/web-flows/test-webhook")
-async def web_flow_test_webhook(req: TestWebhookReq, user=Depends(verify_token)):
-    require_project_access(user.id, req.projectId, tab="flows")
-    if is_rate_limited(f"wf-testhook:{user.id}", 10):
-        raise HTTPException(status_code=429, detail="Slow down a little.")
-    result = await run_in_threadpool(webhook_mod.call, req.content, {str(k)[:32]: v for k, v in list(req.variables.items())[:50]})
-    return {"ok": result["ok"], "status": result.get("status"), "reason": result.get("reason"),
-            "assign": result.get("assign"), "preview": result.get("preview", "")[:2000]}
 
 
 # --------------------------------------------------------------------------- #

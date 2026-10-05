@@ -5,8 +5,6 @@ from datetime import datetime, timedelta, timezone
 import sentry_sdk
 
 from clients import supabase
-from ratelimit import is_rate_limited
-from . import webhook as webhook_mod
 
 MAX_PENDING_TRANSCRIPT = 40
 _SESSION_COLUMNS = ("flow_id", "current_node_id", "mode", "awaiting", "variables", "seq",
@@ -75,7 +73,7 @@ class SupabaseStore:
 
     def claim(self, chat_id, seq):
         # Compare-and-swap: only one request per seq value wins, so a double
-        # tap or a second tab can't run a node (or a webhook) twice.
+        # tap or a second tab can't run a node twice.
         res = supabase.table("web_flow_sessions").update({
             "seq": seq + 1, "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("chat_id", chat_id).eq("seq", seq).execute()
@@ -135,13 +133,6 @@ class LiveEffects:
         except Exception as e:
             sentry_sdk.capture_exception(e)
             return None
-
-    def webhook(self, content, variables):
-        # Per-project cap, separate from the visitor limits: one busy flow
-        # can't turn us into a request cannon against the merchant's server.
-        if is_rate_limited(f"webflow-hook:{self.project_id}", 30):
-            return {"ok": False, "status": None, "reason": "rate limited", "assign": {}}
-        return webhook_mod.call(content, variables or {})
 
     def log_events(self, events):
         try:
