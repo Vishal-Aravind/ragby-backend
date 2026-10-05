@@ -486,7 +486,7 @@ def _token_for(row: Optional[dict]) -> str:
     return ((row or {}).get("access_token")) or WHATSAPP_TOKEN
 
 
-def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None):
+def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None, preview_url: bool = False):
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
     url = f"https://graph.facebook.com/v25.0/{pid}/messages"
@@ -502,7 +502,9 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
             "messaging_product": "whatsapp",
             "to": to,
             "type": "text",
-            "text": {"body": part},
+            # preview_url shows the link card (YouTube thumbnail etc.); the
+            # Cloud API sends links as plain text unless it is set.
+            "text": {"body": part, "preview_url": preview_url},
         }
         res = http.post(url, headers=headers, json=payload)
         if not res.ok:

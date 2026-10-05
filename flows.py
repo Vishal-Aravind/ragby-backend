@@ -33,7 +33,7 @@ def _send_page_link_as_text(url: str, kind: str, body: str, to: str, phone_numbe
     from media_check import check_media_link
     if not url or check_media_link(url, kind)["ok"]:
         return False
-    send_whatsapp_message(to, f"{body}\n{url}" if body else url, phone_number_id, token)
+    send_whatsapp_message(to, f"{body}\n{url}" if body else url, phone_number_id, token, preview_url=True)
     return True
 
 
