@@ -230,11 +230,11 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             btn_id = btn.get("id") or option_id(label)
             if label:
                 btns.append({"id": btn_id, "title": label})
-        # WhatsApp rejects an interactive message with no buttons and one
-        # with an empty body, so fall back to plain text rather than
-        # sending a request we know will fail.
-        if btns and body:
-            send_whatsapp_buttons(to, body, btns, phone_number_id, token)
+        # WhatsApp rejects an interactive message with an empty body. That
+        # used to mean nothing was sent at all — the customer tapped and got
+        # silence — so an empty body gets a default prompt instead.
+        if btns:
+            send_whatsapp_buttons(to, body or "Please choose an option:", btns, phone_number_id, token)
         elif body:
             send_whatsapp_message(to, body, phone_number_id, token)
 
@@ -249,9 +249,9 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
                     rows.append({"id": row_id, "title": label})
             if rows:
                 sections.append({"title": section.get("title", ""), "rows": rows})
-        if sections and body:
+        if sections:
             send_whatsapp_list(
-                to, body, c.get("button_text", "View Options"),
+                to, body or "Please choose an option:", c.get("button_text", "View Options"),
                 sections, phone_number_id, token
             )
         elif body:

@@ -585,9 +585,17 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
         if not rows:
             continue
         left -= len(rows)
-        trimmed.append({**sec, "title": (sec.get("title") or "")[:24], "rows": rows})
+        entry = {"rows": rows}
+        title = (sec.get("title") or "").strip()[:24]
+        if title:
+            entry["title"] = title
+        trimmed.append(entry)
         if left <= 0:
             break
+    # A title is optional for one section but required once there are two.
+    if len(trimmed) > 1:
+        for i, entry in enumerate(trimmed, 1):
+            entry.setdefault("title", f"Options {i}")
     sections = trimmed
     payload = {
         "messaging_product": "whatsapp",
