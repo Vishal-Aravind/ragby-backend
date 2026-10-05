@@ -6,6 +6,7 @@ Interactive Message Flows for WhatsApp
 - "handoff" button ID → human handoff
 - Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
+import re
 import sentry_sdk
 import threading
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,27 @@ def _is_end_node(node: dict, flow_id: str) -> bool:
     outgoing = supabase.table("flow_edges").select("id") \
         .eq("flow_id", flow_id).eq("from_node_id", node["id"]).limit(1).execute()
     return not outgoing.data
+
+
+def option_id(label: str) -> str:
+    """The id a button/list option is sent with — MUST match optionId() in
+    the editor's nodeRegistry.js, which saves each connection under it. They
+    used to differ ("Price?" -> "price?" here, "price" there), so tapping
+    such an option found no connection and nothing happened."""
+    text = (label or "").strip()
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    if slug:
+        return slug
+    h = 5381
+    for b in text.encode("utf-8"):
+        h = ((h * 33) ^ b) & 0xFFFFFFFF
+    digits, out = "0123456789abcdefghijklmnopqrstuvwxyz", ""
+    while True:
+        h, r = divmod(h, 36)
+        out = digits[r] + out
+        if not h:
+            break
+    return "opt_" + out
 
 
 # -------------------------------------------------
@@ -205,7 +227,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         btns = []
         for btn in c.get("buttons", []) or []:
             label = btn.get("title") or btn.get("label", "")
-            btn_id = btn.get("id") or label.strip().lower().replace(" ", "_")
+            btn_id = btn.get("id") or option_id(label)
             if label:
                 btns.append({"id": btn_id, "title": label})
         # WhatsApp rejects an interactive message with no buttons and one
@@ -222,7 +244,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             rows = []
             for row in section.get("rows", []) or []:
                 label = row.get("title") or row.get("label", "")
-                row_id = row.get("id") or label.strip().lower().replace(" ", "_")
+                row_id = row.get("id") or option_id(label)
                 if label:
                     rows.append({"id": row_id, "title": label})
             if rows:
