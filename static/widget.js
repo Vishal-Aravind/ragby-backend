@@ -111,7 +111,7 @@
   // above) — without this, reopening the bubble or reloading the page
   // showed an empty box even though the backend recalled everything.
   async function restoreHistory() {
-    if (!sessionId) return;
+    if (!sessionId) { markRestored(); return; }
     try {
       const res = await fetch(`${apiBase}/public/chat/history/${sessionId}?project_id=${encodeURIComponent(projectId)}`);
       const data = await res.json();
@@ -120,6 +120,7 @@
       }
       if (data.messages && data.messages.length) userMessageCount = data.messages.filter(m => m.role === "user").length;
     } catch (e) {}
+    markRestored();
   }
 
   // ---------------- UI ----------------
@@ -372,13 +373,18 @@
     launcher.setAttribute("aria-expanded", String(open));
     launcher.setAttribute("aria-label", open ? "Close chat" : "Open chat");
     box.setAttribute("aria-hidden", String(!open));
-    if (!open) return;
+    if (!open) {
+      if (flowHost.plugin) flowHost.plugin.onClose();
+      return;
+    }
     // Shown once, the first time the widget is opened — gives the visitor
     // a hint of what to ask instead of a blank box. Skipped if earlier
     // messages were just restored (see restoreHistory below), and not
     // shown again on later opens/closes so it doesn't repeat above real
     // conversation.
-    if (!hasOpened && !msgs.children.length) {
+    // A website flow, when one is active, opens with its own first message
+    // instead of this generic greeting.
+    if (!hasOpened && !msgs.children.length && !(flowHost.plugin && flowHost.plugin.onOpen())) {
       addMsg("assistant", "&#128075; Hi! Ask me anything &mdash; I'm here to help.");
     }
     hasOpened = true;
@@ -728,6 +734,11 @@
     addMsg("user", render(text));
     userMessageCount++;
 
+    // While a website flow is running it decides what typed text means (an
+    // answer, a question for the AI, ...). Returns false when it isn't
+    // involved, and the message goes to the AI exactly as before.
+    if (flowHost.plugin && flowHost.plugin.onUserText(text)) return;
+
     // The gate used to be decided here, entirely in the browser — which meant
     // it could be skipped, and which broke outright at trigger_after_messages
     // = 1: the form appeared before any message had been sent, so no chat
@@ -737,8 +748,56 @@
     await askBot(text);
   };
 
+  // ---------------- WEBSITE FLOWS (optional plugin) ----------------
+  // When the merchant has an active website flow, widget-flows.js is loaded
+  // and attaches itself through flowHost. Without one, nothing below does
+  // anything beyond a single small GET: the widget behaves exactly as before.
+  var restoredDone = false;
+  var restoredWaiters = [];
+  function markRestored() {
+    restoredDone = true;
+    restoredWaiters.splice(0).forEach(function (cb) { try { cb(); } catch (e) {} });
+  }
+
+  var flowHost = {
+    plugin: null,
+    config: null,
+    api: {
+      version: 1,
+      root: root, host: host, dock: dock, msgs: msgs, input: input, sendBtn: sendBtn, form: form,
+      apiBase: apiBase, projectId: projectId, userId: userId,
+      addMsg: addMsg, render: render, esc: esc, showTyping: showTyping,
+      blockInput: blockInput, unblockInput: unblockInput, scrollToEnd: scrollToEnd,
+      askBot: askBot, setOpen: setOpen,
+      isOpen: function () { return box.classList.contains("open"); },
+      getSessionId: function () { return sessionId; },
+      saveSessionId: saveSessionId,
+      isAwaitingLead: function () { return awaitingLead; },
+      userMessageCount: function () { return userMessageCount; },
+      whenRestored: function (cb) { if (restoredDone) cb(); else restoredWaiters.push(cb); },
+    },
+  };
+
+  function loadFlows() {
+    fetch(`${apiBase}/public/flow-config/${projectId}`)
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (cfg) {
+        if (!cfg || !cfg.active) return;
+        flowHost.config = cfg;
+        window.__zavoFlowHosts = window.__zavoFlowHosts || {};
+        window.__zavoFlowHosts[projectId] = flowHost;
+        var s = document.createElement("script");
+        s.src = `${apiBase}/static/widget-flows.js?v=1`;
+        s.async = true;
+        s.setAttribute("data-project", projectId);
+        document.head.appendChild(s);
+      })
+      .catch(function () {});
+  }
+
   // ---------------- INIT ----------------
   fetchLeadConfig();
   fetchWidgetConfig();
   restoreHistory();
+  loadFlows();
 })();

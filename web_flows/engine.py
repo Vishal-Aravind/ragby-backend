@@ -354,8 +354,10 @@ class Engine:
             self.store.save_session(sess)
             return self._envelope(sess, ctx, status="flow", delegate="ai", input=self._public_input(sess, node))
         ctx.transcript.append({"role": "user", "content": text})
-        ctx.messages.append({"kind": "text", "text": REPROMPT})
-        ctx.transcript.append({"role": "assistant", "content": REPROMPT})
+        prompt = {"form": "Please fill in the form above.",
+                  "rating": "Please pick a rating above."}.get(aw.get("kind"), REPROMPT)
+        ctx.messages.append({"kind": "text", "text": prompt})
+        ctx.transcript.append({"role": "assistant", "content": prompt})
         self._wait_on(sess, ctx, node)
         return self._finish_request(sess, ctx, visitor_acted=True)
 
