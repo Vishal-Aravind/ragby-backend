@@ -48,6 +48,7 @@ from auth import router as auth_router
 from shopify_oauth import router as shopify_router
 from razorpay_oauth import router as razorpay_oauth_router
 from media_check import router as media_check_router
+from web_flows.routes import router as web_flows_router
 
 
 # -------------------------------------------------
@@ -254,6 +255,12 @@ def run_whatsapp_sync_monitor():
         _record_job_run("whatsapp_sync_monitor", started_at, "failure", {"error": str(e)})
 
 
+def run_web_flow_prune():
+    """Daily: drop finished website-flow sessions and analytics older than 90 days."""
+    from web_flows.store import prune_expired
+    prune_expired()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Start scheduler on app startup
@@ -265,6 +272,7 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_shopify_reconciliation, 'interval', hours=6, id='shopify_reconciliation')
         scheduler.add_job(run_release_expired_holds, 'interval', minutes=2, id='appointment_hold_release')
         scheduler.add_job(run_whatsapp_sync_monitor, 'interval', minutes=30, id='whatsapp_sync_monitor')
+        scheduler.add_job(run_web_flow_prune, 'interval', hours=24, id='web_flow_prune')
         scheduler.start()
         print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h, appointment hold release every 2m, WhatsApp sync monitor every 30m")
     except Exception as e:
@@ -297,7 +305,10 @@ async def lifespan(app: FastAPI):
 # -------------------------------------------------
 app = FastAPI(lifespan=lifespan)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Gzip for the widget scripts only (widget.js / widget-flows.js). API
+# responses are left as they were.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+app.mount("/static", GZipMiddleware(StaticFiles(directory="static"), minimum_size=1000), name="static")
 
 # CORS is scoped by path rather than applied globally. The only routes ever
 # called by real cross-origin browser JS are under /public/* (the embeddable
@@ -361,6 +372,7 @@ app.include_router(auth_router)
 app.include_router(shopify_router)
 app.include_router(razorpay_oauth_router)
 app.include_router(media_check_router)
+app.include_router(web_flows_router)
 
 
 # -------------------------------------------------

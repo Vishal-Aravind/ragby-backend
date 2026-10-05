@@ -25,7 +25,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$")
 # browser on each page load.
 _LEAD_COLUMNS = (
     "id, project_id, name, email, phone, source, channel, "
-    "whatsapp_number, tags, last_seen_at, created_at"
+    "whatsapp_number, tags, custom_fields, last_seen_at, created_at"
 )
 
 LEADS_PAGE_SIZE = 200
@@ -318,6 +318,73 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
             return {"status": "already_captured"}
 
     return {"status": "captured"}
+
+
+def upsert_web_flow_lead(project_id: str, visitor_id: str, fields: dict, custom: dict):
+    """Save a website-flow Form node's answers as a lead. Returns the lead id
+    or None. Called by web_flows (never from a public route directly).
+
+    Differs from submit_lead on purpose: the merchant switching on "Save to
+    Leads" on the form node is the opt-in (lead_capture_config isn't
+    required), only one of email/phone is needed, and a repeat submit fills
+    gaps and merges custom answers instead of being ignored. Same dedup key
+    (the browser's visitor id), so it also satisfies the chat lead gate.
+    """
+    name = str(fields.get("name") or "").strip()[:120]
+    email = str(fields.get("email") or "").strip()[:254]
+    phone = str(fields.get("phone") or "").strip()[:32]
+    if email and not _EMAIL_RE.match(email):
+        email = ""
+    if phone and len(re.sub(r"\D", "", phone)) < 7:
+        phone = ""
+    if not (email or phone) or not visitor_id:
+        return None
+    custom = {str(k)[:40]: v for k, v in list((custom or {}).items())[:30]}
+
+    existing = supabase.table("leads").select("id, name, email, phone, custom_fields") \
+        .eq("project_id", project_id).eq("session_id", visitor_id).limit(1).execute()
+    if existing.data:
+        lead = existing.data[0]
+        update = {"last_seen_at": "now()",
+                  "custom_fields": {**(lead.get("custom_fields") or {}), **custom}}
+        for key, value in (("name", name), ("email", email), ("phone", phone)):
+            if value and not (lead.get(key) or "").strip():
+                update[key] = value
+        try:
+            supabase.table("leads").update(update).eq("id", lead["id"]).execute()
+        except Exception as e:
+            if not _is_duplicate_error(e):
+                raise
+            # The phone already belongs to another contact: keep the rest.
+            update.pop("phone", None)
+            supabase.table("leads").update(update).eq("id", lead["id"]).execute()
+        return lead["id"]
+
+    if phone and _attach_to_existing_contact(project_id, visitor_id, name, email, phone):
+        row = supabase.table("leads").select("id, custom_fields").eq("project_id", project_id) \
+            .eq("phone", phone).limit(1).execute()
+        if row.data:
+            supabase.table("leads").update({
+                "custom_fields": {**(row.data[0].get("custom_fields") or {}), **custom}
+            }).eq("id", row.data[0]["id"]).execute()
+            return row.data[0]["id"]
+        return None
+
+    count_res = supabase.table("leads").select("id", count="exact").eq("project_id", project_id).limit(1).execute()
+    if (count_res.count or 0) >= MAX_LEADS_PER_PROJECT:
+        return None
+    try:
+        res = supabase.table("leads").insert({
+            "project_id": project_id, "session_id": visitor_id,
+            "name": name or None, "email": email or None, "phone": phone or None,
+            "source": "web_flow", "channel": "web", "custom_fields": custom,
+            "last_seen_at": "now()",
+        }).execute()
+        return res.data[0]["id"] if res.data else None
+    except Exception as e:
+        if not _is_duplicate_error(e):
+            sentry_sdk.capture_exception(e)
+        return None
 
 
 class LeadConfigRequest(BaseModel):

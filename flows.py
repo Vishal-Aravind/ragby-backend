@@ -6,7 +6,6 @@ Interactive Message Flows for WhatsApp
 - "handoff" button ID → human handoff
 - Free questions toggle → if ON, text on buttons node → RAG + resend buttons
 """
-import re
 import sentry_sdk
 import threading
 from datetime import datetime, timedelta, timezone
@@ -53,25 +52,9 @@ def _is_end_node(node: dict, flow_id: str) -> bool:
     return not outgoing.data
 
 
-def option_id(label: str) -> str:
-    """The id a button/list option is sent with — MUST match optionId() in
-    the editor's nodeRegistry.js, which saves each connection under it. They
-    used to differ ("Price?" -> "price?" here, "price" there), so tapping
-    such an option found no connection and nothing happened."""
-    text = (label or "").strip()
-    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-    if slug:
-        return slug
-    h = 5381
-    for b in text.encode("utf-8"):
-        h = ((h * 33) ^ b) & 0xFFFFFFFF
-    digits, out = "0123456789abcdefghijklmnopqrstuvwxyz", ""
-    while True:
-        h, r = divmod(h, 36)
-        out = digits[r] + out
-        if not h:
-            break
-    return "opt_" + out
+# Shared with the website flow engine; re-exported here so existing
+# `from flows import option_id` imports keep working.
+from flow_common import option_id  # noqa: E402,F401
 
 
 # -------------------------------------------------
@@ -145,14 +128,28 @@ def delete_session(project_id: str, phone_number: str):
 # -------------------------------------------------
 def get_active_flow(project_id: str) -> Optional[dict]:
     try:
+        # WhatsApp only: a project can also have an active website flow
+        # (flows.channel = 'web'), which this bot must never run.
         res = supabase.table("flows") \
             .select("*") \
             .eq("project_id", project_id) \
             .eq("is_active", True) \
+            .eq("channel", "whatsapp") \
             .limit(1) \
             .execute()
         return res.data[0] if res.data else None
     except Exception as e:
+        # Rollout safety: if this backend runs before the migration that adds
+        # flows.channel, the filter errors. Fall back to the old query (every
+        # flow was WhatsApp then) instead of silencing the bot.
+        if "channel" in str(e):
+            sentry_sdk.capture_exception(e)
+            try:
+                res = supabase.table("flows").select("*").eq("project_id", project_id) \
+                    .eq("is_active", True).limit(1).execute()
+                return res.data[0] if res.data else None
+            except Exception as e2:
+                e = e2
         sentry_sdk.capture_exception(e)
         print(f"get_active_flow error: {e}")
         return None
