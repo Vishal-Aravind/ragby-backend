@@ -724,13 +724,18 @@ def _answer_question(session, text, project_id, chat_id, phone_number, phone_num
     set_variable(variables, var, value)
     upsert_session(project_id, phone_number, {"variables": variables})
 
-    # A typed name or email is worth keeping on the contact too.
-    if var in ("name", "email") and value:
-        try:
-            supabase.table("leads").update({var: value}).eq("project_id", project_id) \
-                .eq("phone", phone_number).execute()
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
+    # Keep the answer on the contact as well, so it outlives the 2-hour
+    # session and shows in Conversations > Details and in Leads: name/email
+    # fill those fields, anything else goes into custom_fields.
+    try:
+        lead = supabase.table("leads").select("id, custom_fields").eq("project_id", project_id) \
+            .eq("phone", phone_number).limit(1).execute()
+        if lead.data and value not in ("", None):
+            update = {var: value} if var in ("name", "email") else {
+                "custom_fields": {**(lead.data[0].get("custom_fields") or {}), var: value}}
+            supabase.table("leads").update(update).eq("id", lead.data[0]["id"]).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
 
     nxt = get_next_node(flow_id, node["id"], "next")
     if nxt:
