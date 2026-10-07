@@ -41,7 +41,30 @@ def _send_page_link_as_text(url: str, kind: str, body: str, to: str, phone_numbe
 # Every other node ends the flow — the editor gives them no outgoing handle,
 # and a "next" line left over from before is ignored rather than making the
 # node look mid-flow (which re-sent it on every message).
-_CONTINUING_TYPES = {"message_buttons", "buttons", "message_list", "list", "message_shop"}
+_CONTINUING_TYPES = {"message_buttons", "buttons", "message_list", "list", "message_shop", "ask_input"}
+
+# Answer types an "Ask a question" node accepts on WhatsApp. No date: people
+# type dates every which way in a chat ("12/10", "next Monday").
+_WA_INPUT_TYPES = {"text", "email", "phone", "number"}
+
+
+def flow_vars(project_id: str, phone: str) -> dict:
+    """Variables for {{...}} in WhatsApp messages: the customer's WhatsApp
+    profile name and number, plus answers saved by "Ask a question" nodes
+    (an answer saved as `name` wins over the profile name)."""
+    variables = {"phone": phone}
+    try:
+        lead = supabase.table("leads").select("name").eq("project_id", project_id) \
+            .eq("phone", phone).limit(1).execute()
+        if lead.data and (lead.data[0].get("name") or "").strip():
+            variables["name"] = lead.data[0]["name"].strip()
+        sess = supabase.table("whatsapp_sessions").select("variables").eq("project_id", project_id) \
+            .eq("phone_number", phone).limit(1).execute()
+        if sess.data:
+            variables.update(sess.data[0].get("variables") or {})
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+    return variables
 
 
 def _is_end_node(node: dict, flow_id: str) -> bool:
@@ -55,6 +78,8 @@ def _is_end_node(node: dict, flow_id: str) -> bool:
 # Shared with the website flow engine; re-exported here so existing
 # `from flows import option_id` imports keep working.
 from flow_common import option_id  # noqa: E402,F401
+from web_flows.templating import render_text, set_variable  # noqa: E402
+from web_flows.validation import check_value  # noqa: E402
 
 
 # -------------------------------------------------
@@ -214,11 +239,18 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
     # node saved without a body raised KeyError INSIDE the webhook handler,
     # which killed that customer's conversation mid-flow with no way back.
     c = node.get("content") or {}
+    # {{name}}, {{phone}} and answers to "Ask a question" nodes. Only looked
+    # up when the text actually uses a variable, so plain flows cost nothing.
+    if project_id and "{{" in str(c.get("body") or ""):
+        c = {**c, "body": render_text(c.get("body"), flow_vars(project_id, to))}
     body = c.get("body") or ""
 
     if t in ("text", "message"):
         if body:
             send_whatsapp_message(to, body, phone_number_id, token)
+
+    elif t == "ask_input":
+        send_whatsapp_message(to, body or "Please type your answer:", phone_number_id, token)
 
     elif t in ("buttons", "message_buttons"):
         btns = []
@@ -491,7 +523,8 @@ def start_flow(flow: dict, project_id: str, phone_number: str, phone_number_id: 
     upsert_session(project_id, phone_number, {
         "flow_id": flow["id"],
         "current_node_id": start_node["id"],
-        "mode": "flow",
+        # A flow may open with a question ("What's your name?").
+        "mode": "awaiting_input" if start_node["type"] == "ask_input" else "flow",
     })
 
     body = start_node["content"].get("body", "")
@@ -609,6 +642,8 @@ def _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, t
 
     if next_node["type"] in ("handoff", "talk_to_human"):
         msg = next_node["content"].get("body", "Connecting you to our team...")
+        if "{{" in (msg or ""):
+            msg = render_text(msg, flow_vars(project_id, phone_number))
         send_whatsapp_message(phone_number, msg, phone_number_id, token)
         if chat_id:
             save_message(chat_id, "assistant", msg)
@@ -626,6 +661,13 @@ def _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, t
         send_node(next_node, phone_number, phone_number_id, token, project_id=project_id)
         if chat_id:
             save_message(chat_id, "assistant", next_node["content"].get("body", ""))
+
+        if next_node["type"] == "ask_input":
+            # Wait for the customer's typed answer (handle_text).
+            upsert_session(project_id, phone_number, {
+                "flow_id": flow_id, "current_node_id": next_node["id"], "mode": "awaiting_input",
+            })
+            return
 
         if _is_end_node(next_node, flow_id):
             if next_node["type"] == "ask_a_question":
@@ -652,6 +694,53 @@ def _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, t
                         "current_node_id": next_node["id"],
                         "mode": "flow",
                     })
+
+
+def _answer_question(session, text, project_id, chat_id, phone_number, phone_number_id, token):
+    """The customer typed a reply to an "Ask a question" node: check it,
+    save it as the node's variable, then continue to the next node."""
+    flow_id = session.get("flow_id")
+    node = get_node(session.get("current_node_id"), flow_id=flow_id)
+    flow = get_active_flow(project_id)
+    if not node or node.get("type") != "ask_input" or not flow:
+        if flow:
+            start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
+        return
+    # The menu keyword still restarts the flow from a question.
+    if text.lower().strip() in [k.lower() for k in (flow.get("trigger_keywords") or [])]:
+        start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
+        return
+
+    c = node.get("content") or {}
+    input_type = c.get("input_type") if c.get("input_type") in _WA_INPUT_TYPES else "text"
+    today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
+    ok, value, error = check_value(input_type, text, {**c, "required": True}, today)
+    if not ok:
+        send_whatsapp_message(phone_number, error, phone_number_id, token)
+        return
+
+    variables = dict(session.get("variables") or {})
+    var = c.get("var") or "answer"
+    set_variable(variables, var, value)
+    upsert_session(project_id, phone_number, {"variables": variables})
+
+    # A typed name or email is worth keeping on the contact too.
+    if var in ("name", "email") and value:
+        try:
+            supabase.table("leads").update({var: value}).eq("project_id", project_id) \
+                .eq("phone", phone_number).execute()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+
+    nxt = get_next_node(flow_id, node["id"], "next")
+    if nxt:
+        _enter_node(flow_id, nxt, project_id, phone_number, phone_number_id, token, chat_id)
+        return
+    # Last node of the flow: same rule as every other end node.
+    upsert_session(project_id, phone_number, {
+        "flow_id": flow_id, "current_node_id": node["id"],
+        "mode": "rag_question" if flow.get("free_questions") else "flow",
+    })
 
 
 def handle_interactive(session: dict, trigger: str, phone_number: str, phone_number_id: str, token: str, project_id: str, chat_id: str = None):
@@ -1026,6 +1115,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     mode = session.get("mode", "flow")
 
     if mode == "human":
+        return
+
+    if mode == "awaiting_input":
+        _answer_question(session, text, project_id, chat_id, phone_number, phone_number_id, token)
         return
 
     if mode == "rag_question":
