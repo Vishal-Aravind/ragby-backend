@@ -348,12 +348,15 @@ def web_flow_reply(req: WebReplyReq, user=Depends(verify_token)):
     chat = supabase.table("chats").select("id, project_id, channel").eq("id", req.chat_id).limit(1).execute().data
     if not chat or chat[0]["project_id"] != req.project_id or chat[0]["channel"] != "public":
         raise HTTPException(status_code=404, detail="Conversation not found")
-    sess = supabase.table("web_flow_sessions").select("chat_id").eq("chat_id", req.chat_id).limit(1).execute().data
-    if not sess:
-        raise HTTPException(status_code=400, detail="This website chat isn't in a flow, so replies can't reach the visitor.")
+    # Any website chat (flow or plain AI): the widget / hosted page polls for
+    # "[Human]" messages while the chat is in human mode. Replying puts the
+    # chat in human mode so the bot doesn't answer over the person.
     supabase.table("chat_messages").insert({
         "chat_id": req.chat_id, "role": "assistant", "content": f"[Human] {req.message.strip()}",
     }).execute()
+    supabase.table("chats").update({
+        "human_mode": True, "last_agent_msg_at": "now()",
+    }).eq("id", req.chat_id).execute()
     supabase.table("web_flow_sessions").update({
         "mode": "human", "last_agent_msg_at": "now()",
     }).eq("chat_id", req.chat_id).execute()

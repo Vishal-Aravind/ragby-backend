@@ -53,7 +53,7 @@ _config_cache: dict[str, tuple[float, dict]] = {}
 
 def _fetch_lead_config(project_id: str) -> dict:
     res = supabase.table("lead_capture_config") \
-        .select("enabled, trigger_after_messages, form_title, form_subtitle") \
+        .select("enabled, mode, trigger_after_messages, form_title, form_subtitle") \
         .eq("project_id", project_id) \
         .limit(1) \
         .execute()
@@ -398,6 +398,9 @@ class LeadConfigRequest(BaseModel):
     formSubtitle: Optional[str] = Field(
         default="Please share your details to keep chatting.", max_length=240
     )
+    # When to ask: before the first answer, after N messages, or only when
+    # the visitor asks to talk to a person.
+    mode: Optional[str] = Field(default="after_n", pattern="^(before|after_n|on_handoff)$")
 
 
 @router.put("/lead-config")
@@ -412,6 +415,7 @@ def save_lead_config(req: LeadConfigRequest, user=Depends(verify_token)):
         "trigger_after_messages": req.triggerAfterMessages,
         "form_title": req.formTitle,
         "form_subtitle": req.formSubtitle,
+        "mode": req.mode or "after_n",
     }, on_conflict="project_id").execute()
     invalidate_lead_config(req.projectId)
     return {"status": "saved"}

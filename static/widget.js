@@ -116,9 +116,15 @@
       const res = await fetch(`${apiBase}/public/chat/history/${sessionId}?project_id=${encodeURIComponent(projectId)}`);
       const data = await res.json();
       for (const m of (data.messages || [])) {
-        addMsg(m.role === "user" ? "user" : "assistant", render(m.content || ""), false);
+        var text = m.content || "";
+        if (text.indexOf("[Human] ") === 0) text = text.slice(8);  // team reply marker
+        addMsg(m.role === "user" ? "user" : "assistant", render(text), false);
       }
       if (data.messages && data.messages.length) userMessageCount = data.messages.filter(m => m.role === "user").length;
+      // Reloaded while a person was handling the chat: keep listening for
+      // their replies.
+      if (data.messages && data.messages.some(m => (m.content || "").indexOf("[Human] ") === 0 ||
+          (m.content || "").indexOf("Connecting you to our team") === 0)) startHumanPoll();
     } catch (e) {}
     markRestored();
   }
@@ -714,6 +720,14 @@
         return;
       }
 
+      // A person is handling this chat: the message was delivered to them,
+      // there may be no bot answer, and their replies arrive by polling.
+      if (data.status === "human") {
+        if (data.answer) addMsg("assistant", render(data.answer));
+        startHumanPoll();
+        return;
+      }
+
       addMsg("assistant", render(data.answer || "Sorry, something went wrong. Please try again."));
     } catch (e) {
       typing.remove();
@@ -747,6 +761,40 @@
     // an answer, before spending anything on OpenAI.
     await askBot(text);
   };
+
+  // ---------------- TEAM REPLIES ----------------
+  // While a person from the merchant's team is handling this chat, check for
+  // their replies: every 5s with the panel open, 20s otherwise, for up to 30
+  // minutes. Stops as soon as the chat is handed back to the bot.
+  var humanPoll = { timer: null, cursor: null, started: 0 };
+  function startHumanPoll() {
+    if (humanPoll.timer || !sessionId) return;
+    humanPoll.started = humanPoll.started || Date.now();
+    humanPoll.cursor = humanPoll.cursor || new Date().toISOString();
+    function tick() {
+      humanPoll.timer = null;
+      if (Date.now() - humanPoll.started > 30 * 60 * 1000) return;
+      fetch(`${apiBase}/public/chat/poll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: projectId, sessionId: sessionId, after: humanPoll.cursor }),
+      })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (d) {
+          if (!d) return;
+          (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
+          if (d.cursor) humanPoll.cursor = d.cursor;
+          if (d.status === "human") {
+            var open = document.visibilityState === "visible" && box.classList.contains("open");
+            humanPoll.timer = setTimeout(tick, open ? 5000 : 20000);
+          } else {
+            humanPoll.started = 0;
+          }
+        })
+        .catch(function () { humanPoll.timer = setTimeout(tick, 20000); });
+    }
+    humanPoll.timer = setTimeout(tick, 5000);
+  }
 
   // ---------------- WEBSITE FLOWS (optional plugin) ----------------
   // When the merchant has an active website flow, widget-flows.js is loaded
