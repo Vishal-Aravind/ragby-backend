@@ -32,7 +32,7 @@ from flow_common import option_id
 from .templating import render_text, set_variable
 from .validation import check_value, check_rating, INPUT_TYPES, FIELD_TYPES
 
-SESSION_HOURS = 3            # matches the widget's 3h chat session
+SESSION_HOURS = 7 * 24        # matches the widget's 7-day chat session
 MAX_AUTO_STEPS = 25
 MAX_OPTIONS = 50
 MAX_CARDS = 10

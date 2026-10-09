@@ -21,7 +21,7 @@
   // a brand-new, memoryless chat. Persisted here the same way
   // PublicChatClient.js's shareable-link chat already does (3-hour TTL),
   // and sent back on every call from here on.
-  const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
+  const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days since the last message
   let sessionId = null;
   try {
     const stored = JSON.parse(localStorage.getItem(`chat_session_${projectId}`) || "null");
