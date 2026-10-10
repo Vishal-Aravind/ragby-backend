@@ -156,6 +156,8 @@ class StartReq(BaseModel):
     visitorId: str = Field(min_length=1, max_length=64)
     via: str = Field(default="open", max_length=40)
     page: Optional[Page] = None
+    # The visitor's message that opened the flow (saved like on WhatsApp).
+    text: Optional[str] = Field(default=None, max_length=4000)
 
 
 class StepReq(BaseModel):
@@ -185,7 +187,7 @@ def _page(p: Optional[Page]):
 @router.post("/public/flow/start")
 def flow_start(req: StartReq, request: Request):
     _gate(request, req.projectId, req.sessionId, "start")
-    return _engine(req.projectId).start(req.projectId, req.sessionId, req.visitorId, req.via, _page(req.page))
+    return _engine(req.projectId).start(req.projectId, req.sessionId, req.visitorId, req.via, _page(req.page), req.text)
 
 
 @router.post("/public/flow/step")

@@ -374,7 +374,10 @@
     // conversation.
     // A website flow, when one is active, opens with its own first message
     // instead of this generic greeting.
-    if (!hasOpened && !msgs.children.length && !(flowHost.plugin && flowHost.plugin.onOpen())) {
+    // The flow plugin decides first: a new visitor, or one back after a
+    // couple of hours, gets the flow's menu (like WhatsApp).
+    var flowOpened = !hasOpened && flowHost.plugin && flowHost.plugin.onOpen();
+    if (!hasOpened && !msgs.children.length && !flowOpened) {
       addMsg("assistant", "&#128075; Hi! Ask me anything &mdash; I'm here to help.");
     }
     hasOpened = true;
@@ -766,6 +769,14 @@
       saveSessionId: saveSessionId,
       isAwaitingLead: function () { return awaitingLead; },
       userMessageCount: function () { return userMessageCount; },
+      // When this chat last had a message (the 7-day memory clock), 0 if none.
+      lastActivityAt: function () {
+        try {
+          var st = JSON.parse(localStorage.getItem(`chat_session_${projectId}`) || "null");
+          return st && st.expiresAt ? st.expiresAt - SESSION_TTL_MS : 0;
+        } catch (e) { return 0; }
+      },
+      isTeamHandling: function () { return teamPoll.human; },
       whenRestored: function (cb) { if (restoredDone) cb(); else restoredWaiters.push(cb); },
     },
   };
@@ -779,7 +790,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=3`;
+        s.src = `${apiBase}/static/widget-flows.js?v=4`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);

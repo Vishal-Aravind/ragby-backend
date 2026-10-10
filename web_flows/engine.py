@@ -25,7 +25,7 @@ Everything returned to the browser is built here from an explicit public
 projection of each node, so internal settings never leak.
 """
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlsplit
 
 from flow_common import option_id
@@ -38,6 +38,7 @@ MAX_OPTIONS = 50
 MAX_CARDS = 10
 MAX_CARD_BUTTONS = 3
 MAX_FORM_FIELDS = 10
+IDLE_RESTART_HOURS = 2       # like WhatsApp: quiet this long -> next message opens the menu
 INLINE_DELAY_MAX_S = 10      # up to this: a typing pause, no round trip
 MAX_DELAY_S = 600            # web delays are capped at 10 minutes
 
@@ -115,7 +116,7 @@ class Engine:
     # ------------------------------------------------------------------ #
     # Public entry points
     # ------------------------------------------------------------------ #
-    def start(self, project_id, chat_id, visitor_id, via="open", page=None):
+    def start(self, project_id, chat_id, visitor_id, via="open", page=None, text=None):
         flow = self.store.get_active_web_flow(project_id)
         if not flow:
             return self._bare(chat_id, 0, "inactive")
@@ -137,8 +138,12 @@ class Engine:
         self._set_page(sess, page)
         ctx = Ctx(flow)
         ctx.events.append(("start", None, {"via": str(via or "open")[:40]}))
+        text = str(text or "").strip()[:4000]
+        if text:
+            # Their message opened the flow: keep it in the conversation.
+            ctx.transcript.append({"role": "user", "content": text})
         self._restart(sess, ctx)
-        return self._finish_request(sess, ctx, visitor_acted=False)
+        return self._finish_request(sess, ctx, visitor_acted=bool(text))
 
     def resume(self, project_id, chat_id, visitor_id):
         sess = self._load_owned(project_id, chat_id, visitor_id)
@@ -183,6 +188,14 @@ class Engine:
 
         action = action if isinstance(action, dict) else {}
         kind = action.get("type")
+        # Like WhatsApp: after 2 hours of quiet (visitor and team), the next
+        # message or tap starts the flow again - whatever mode it was in.
+        if kind != "continue" and self._idle(loaded):
+            if kind == "text" and str(action.get("text") or "").strip():
+                ctx.transcript.append({"role": "user", "content": str(action["text"]).strip()[:4000]})
+            ctx.events.append(("idle_restart", None, {}))
+            self._restart(sess, ctx)
+            return self._finish_request(sess, ctx, visitor_acted=True)
         if kind == "menu":
             ctx.transcript.append({"role": "user", "content": "Menu"})
             self._restart(sess, ctx)
@@ -305,6 +318,14 @@ class Engine:
         mode = sess.get("mode")
         free = bool(ctx.flow.get("free_questions"))
 
+        # Like WhatsApp: a menu keyword ("hi", "menu", ...) starts the flow
+        # again - except while a person is handling the chat, and unless it
+        # is exactly one of the options currently on screen.
+        if mode != "human" and self._is_keyword(ctx, text) and not self._matches_option(sess, ctx, text):
+            ctx.transcript.append({"role": "user", "content": text})
+            self._restart(sess, ctx)
+            return self._finish_request(sess, ctx, visitor_acted=True)
+
         if mode == "human":
             ctx.transcript.append({"role": "user", "content": text})
             self.store.save_session(sess)
@@ -363,6 +384,35 @@ class Engine:
     # ------------------------------------------------------------------ #
     # Running nodes
     # ------------------------------------------------------------------ #
+    def _idle(self, sess):
+        """True when neither the visitor nor the team has done anything for
+        IDLE_RESTART_HOURS (updated_at moves on every visitor action)."""
+        latest = None
+        for key in ("updated_at", "last_agent_msg_at"):
+            value = sess.get(key)
+            if not value:
+                continue
+            try:
+                when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            latest = when if latest is None or when > latest else latest
+        return latest is not None and self.fx.now() - latest > timedelta(hours=IDLE_RESTART_HOURS)
+
+    @staticmethod
+    def _is_keyword(ctx, text):
+        words = [str(k).strip().lower() for k in (ctx.flow.get("trigger_keywords") or []) if str(k).strip()]
+        return text.strip().lower() in words
+
+    def _matches_option(self, sess, ctx, text):
+        aw = sess.get("awaiting") or {}
+        if aw.get("kind") not in ("choices", "carousel"):
+            return False
+        node = self._node(ctx, aw.get("node_id"))
+        return bool(node) and any(o["label"].lower() == text.strip().lower() for o in _options(node))
+
     def _restart(self, sess, ctx):
         sess.update({"flow_id": ctx.flow["id"], "mode": "flow", "awaiting": None,
                      "current_node_id": None, "resume_at": None})

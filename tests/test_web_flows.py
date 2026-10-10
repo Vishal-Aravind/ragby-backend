@@ -301,6 +301,68 @@ class EngineTests(unittest.TestCase):
 
 
 
+class WhatsAppParityTests(unittest.TestCase):
+    """Idle restart and menu keywords behave like WhatsApp flows."""
+    def flow(self, free=True):
+        nodes = [
+            node("n1", "quick_replies", {"body": "Menu", "options": [
+                {"id": "o_a", "label": "Hi"}, {"id": "o_b", "label": "Prices"}]}, start=True),
+            node("n2", "ask_a_question", {"body": "Ask away"}),
+        ]
+        eng, store, fx = make(nodes, [edge("n1", "o_b", "n2")], free)
+        store.flow["trigger_keywords"] = ["hi", "menu"]
+        return eng, store, fx
+
+    def to_ai(self, eng):
+        env = eng.start(PID, None, VID, "open")
+        return eng.step(PID, env["sessionId"], VID, env["seq"], "n1", {"type": "choice", "id": "o_b"})
+
+    def test_idle_two_hours_restarts_menu(self):
+        eng, store, fx = self.flow()
+        env = self.to_ai(eng)
+        self.assertEqual(env["status"], "ai")
+        sid = env["sessionId"]
+        store.sessions[sid]["updated_at"] = (fx.clock - timedelta(hours=1)).isoformat()
+        self.assertEqual(eng.step(PID, sid, VID, env["seq"], None, {"type": "text", "text": "price?"})["delegate"], "ai")
+        env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "price?"})
+        store.sessions[sid]["updated_at"] = (fx.clock - timedelta(hours=3)).isoformat()
+        env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "price?"})
+        self.assertEqual(env["messages"][0]["text"], "Menu")
+        self.assertEqual(env["input"]["kind"], "choices")
+
+    def test_opening_message_is_saved(self):
+        eng, store, fx = self.flow()
+        env = eng.start(PID, None, VID, "text", None, "do you deliver?")
+        self.assertEqual(env["messages"][0]["text"], "Menu")
+        chat, entries, acted = fx.records[-1]
+        self.assertTrue(acted)
+        self.assertEqual(entries[0], {"role": "user", "content": "do you deliver?"})
+
+    def test_recent_team_reply_is_not_idle(self):
+        eng, store, fx = self.flow()
+        env = self.to_ai(eng)
+        sid = env["sessionId"]
+        store.sessions[sid].update(mode="human",
+                                   updated_at=(fx.clock - timedelta(hours=5)).isoformat(),
+                                   last_agent_msg_at=(fx.clock - timedelta(minutes=10)).isoformat())
+        out = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "thanks"})
+        self.assertEqual(out["status"], "human")
+
+    def test_keyword_restarts_but_not_over_an_option_or_a_person(self):
+        eng, store, fx = self.flow()
+        env = self.to_ai(eng)
+        sid = env["sessionId"]
+        env = eng.step(PID, sid, VID, env["seq"], None, {"type": "text", "text": " MENU "})
+        self.assertEqual(env["messages"][0]["text"], "Menu")
+        # "Hi" is also an option on screen: it's a tap, not a restart
+        env = eng.step(PID, sid, VID, env["seq"], None, {"type": "text", "text": "hi"})
+        self.assertNotIn("Menu", [m.get("text") for m in env["messages"]])
+        self.assertEqual(env["status"], "ai")   # "Hi" led nowhere: flow ended, AI on
+        store.sessions[sid]["mode"] = "human"
+        out = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "menu"})
+        self.assertEqual(out["status"], "human")
+
+
 class OptionIdGoldenTests(unittest.TestCase):
     def test_unchanged(self):
         gold = {"Veg Meals": "veg_meals", "Price?": "price", "": "opt_45h", "A": "a",

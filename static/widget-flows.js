@@ -139,13 +139,13 @@
   }
 
   // ------------------------------------------------------------- lifecycle
-  function startFlow(via) {
+  function startFlow(via, text) {
     if (state.disabled || state.busy) return Promise.resolve();
     state.busy = true;
     var typing = api.showTyping();
     return call("/public/flow/start", {
       projectId: pid, sessionId: api.getSessionId() || null, visitorId: api.userId,
-      via: via || "open", page: page(),
+      via: via || "open", page: page(), text: text || null,
     }).then(function (env) {
       typing.remove();
       state.busy = false;
@@ -189,7 +189,7 @@
       lsDel(FLOW_KEY);
       state.sessionId = null;
       api.addMsg("assistant", api.esc("Let's start again."));
-      return startFlow("restart");
+      return startFlow("restart", action && action.type === "text" ? action.text : null);
     }
     if (env.sessionId) {
       state.sessionId = env.sessionId;
@@ -676,10 +676,26 @@
     return msgs.querySelector(".row.user") != null;
   }
 
+  // Like WhatsApp: quiet for this long, and the flow's menu comes back.
+  var IDLE_MS = 2 * 60 * 60 * 1000;
+  function idleTooLong() {
+    var last = api.lastActivityAt ? api.lastActivityAt() : 0;
+    return last > 0 && Date.now() - last > IDLE_MS;
+  }
+  function teamHandling() {
+    return !!(api.isTeamHandling && api.isTeamHandling());
+  }
+
   var plugin = {
     onOpen: function () {
-      if (state.disabled || state.sessionId || cfg.startOnOpen === false) return false;
-      if (hasConversation() || msgs.children.length) return false;
+      if (state.disabled || cfg.startOnOpen === false || teamHandling()) return false;
+      var idle = idleTooLong();
+      if (state.sessionId) {
+        // Back after a while, mid-flow or chatting with the AI: show the menu.
+        if (idle && state.seq && state.status !== "human") { retireLive(); step({ type: "menu" }, null); return true; }
+        return false;
+      }
+      if ((hasConversation() || msgs.children.length) && !idle) return false;
       startFlow(state.proactiveVia || "open");
       state.proactiveVia = null;
       return true;
@@ -699,11 +715,11 @@
         step({ type: "text", text: text }, state.nodeId);
         return true;
       }
-      // No flow yet. A visitor with an earlier AI conversation keeps it;
-      // a fresh visitor starts the flow (their first message opens it, as
-      // on WhatsApp).
-      if (msgs.querySelectorAll(".row.user").length > 1) return false;
-      startFlow("text");
+      // Not in the flow yet (new visitor, or one who was chatting with the
+      // AI before the flow was switched on): like WhatsApp, their message
+      // opens the flow. A chat a team member is handling stays with them.
+      if (teamHandling()) return false;
+      startFlow("text", text);
       return true;
     },
   };
