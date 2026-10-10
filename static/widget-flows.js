@@ -61,11 +61,20 @@
   css.textContent = [
     ".zf-row { display: flex; margin: -2px 0 12px; }",
     ".zf-opts { display: flex; flex-wrap: wrap; gap: 8px; max-width: 100%; }",
-    ".zf-opts.stack { flex-direction: column; align-items: stretch; width: 84%; }",
+    ".zf-opts.stack { flex-direction: column; align-items: stretch; width: 84%; gap: 6px; }",
     ".zf-chip { border: 1.5px solid var(--c2); background: #fff; color: var(--c1); border-radius: 999px; padding: 8px 14px;",
     "  font-size: 13.5px; font-weight: 600; cursor: pointer; line-height: 1.2; text-align: center;",
     "  transition: background .15s, color .15s, transform .15s; }",
-    ".zf-opts.stack .zf-chip { border-radius: 12px; }",
+    ".zf-opts.stack .zf-chip { display: flex; align-items: center; gap: 10px; text-align: left; border-radius: 14px;",
+    "  border: 1px solid #e6e3f8; background: #fff; color: #1f2937; font-weight: 550; padding: 8px 14px 8px 8px;",
+    "  box-shadow: 0 1px 2px rgba(79,70,229,.06); transition: border-color .15s, background .15s, transform .15s, box-shadow .15s; }",
+    ".zf-opts.stack .zf-chip:hover:not(:disabled) { background: #f7f5ff; color: #1f2937; border-color: var(--c2);",
+    "  transform: translateX(2px); box-shadow: 0 3px 10px rgba(79,70,229,.12); }",
+    ".zf-opts.stack .zf-chip[aria-pressed=true] { background: var(--grad); color: #fff; border-color: transparent; }",
+    ".zf-ico { flex: 0 0 26px; width: 26px; height: 26px; border-radius: 50%; background: var(--grad);",
+    "  display: flex; align-items: center; justify-content: center; }",
+    ".zf-ico svg { width: 13px; height: 13px; fill: #fff; margin-left: 1px; }",
+    ".zf-opts.stack .zf-chip[aria-pressed=true] .zf-ico { background: rgba(255,255,255,.25); }",
     ".zf-chip:hover:not(:disabled) { background: var(--c2); color: #fff; transform: translateY(-1px); }",
     ".zf-chip:focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }",
     ".zf-chip:disabled { opacity: .45; cursor: default; }",
@@ -405,7 +414,8 @@
     group.setAttribute("aria-label", "Options");
     var options = inp.options || [];
     var buttons = options.map(function (o) {
-      var b = el("button", "zf-chip", o.label);
+      var b = el("button", "zf-chip", stack ? null : o.label);
+      if (stack) { b.appendChild(sendIcon()); b.appendChild(el("span", null, o.label)); }
       b.type = "button";
       b.setAttribute("aria-pressed", "false");
       b.onclick = function () {
@@ -441,6 +451,20 @@
     }
     row.replaceChildren(wrap);
     api.scrollToEnd(true);
+  }
+
+  // Small paper-plane mark at the start of each stacked button.
+  function sendIcon() {
+    var NS = "http://www.w3.org/2000/svg";
+    var wrap = el("span", "zf-ico");
+    wrap.setAttribute("aria-hidden", "true");
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    var path = document.createElementNS(NS, "path");
+    path.setAttribute("d", "M2.5 20.5 22 12 2.5 3.5 2.5 10.2 16 12 2.5 13.8z");
+    svg.appendChild(path);
+    wrap.appendChild(svg);
+    return wrap;
   }
 
   function renderCarousel(inp, nodeId) {
