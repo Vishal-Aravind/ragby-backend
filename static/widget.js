@@ -661,76 +661,83 @@
   };
 
   // ---------------- TEAM REPLIES ----------------
-  // While a person from the merchant's team is handling this chat, check for
-  // their replies: every 5s with the panel open, 20s otherwise, for up to 30
-  // minutes. Stops as soon as the chat is handed back to the bot.
+  // ONE checker, never two requests at once (two loops used to overlap on
+  // close/reopen and show every team reply two or three times).
+  //  - "human" (a person is handling the chat): every 5s with the panel
+  //    open, 20s otherwise, for up to 30 minutes.
+  //  - otherwise, only while the panel is open and the page visible: every
+  //    15s, so a takeover is noticed before the visitor types anything.
   // Cursor from page load: anything older is drawn by restoreHistory, and a
   // reply sent while the panel was still closed is picked up on opening.
-  var humanPoll = { timer: null, cursor: new Date().toISOString(), started: 0 };
-  function startHumanPoll() {
-    if (humanPoll.timer || !sessionId) return;
-    humanPoll.started = humanPoll.started || Date.now();
-    humanPoll.cursor = humanPoll.cursor || new Date().toISOString();
-    function tick() {
-      humanPoll.timer = null;
-      if (Date.now() - humanPoll.started > 30 * 60 * 1000) return;
-      fetch(`${apiBase}/public/chat/poll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: projectId, sessionId: sessionId, after: humanPoll.cursor }),
-      })
-        .then(function (res) { return res.ok ? res.json() : null; })
-        .then(function (d) {
-          if (!d) return;
-          (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
-          if ((d.messages || []).length) saveSessionId(sessionId);
-          if (d.cursor) humanPoll.cursor = d.cursor;
-          if (d.status === "human") {
-            var open = document.visibilityState === "visible" && box.classList.contains("open");
-            humanPoll.timer = setTimeout(tick, open ? 5000 : 20000);
-          } else {
-            humanPoll.started = 0;
-            startWatch();
-          }
-        })
-        .catch(function () { humanPoll.timer = setTimeout(tick, 20000); });
-    }
-    humanPoll.timer = setTimeout(tick, 5000);
+  var teamPoll = { timer: null, busy: false, human: false, started: 0, cursor: new Date().toISOString() };
+
+  function panelVisible() {
+    return document.visibilityState === "visible" && box.classList.contains("open");
   }
 
-  // A team member can take over (or just reply) before the visitor sends
-  // anything, so nothing above would be listening yet. While the panel is
-  // open and the page visible, check every 15s; the moment a person is on
-  // the chat, hand over to the 5s loop above.
-  var watch = { timer: null };
-  function startWatch(delay) {
-    if (watch.timer || humanPoll.timer || !sessionId) return;
-    watch.timer = setTimeout(watchTick, delay || 15000);
+  function schedulePoll(ms) {
+    if (teamPoll.timer) clearTimeout(teamPoll.timer);
+    teamPoll.timer = setTimeout(pollTick, ms);
   }
-  function watchTick() {
-    watch.timer = null;
-    if (humanPoll.timer || !sessionId) return;
-    if (document.visibilityState !== "visible" || !box.classList.contains("open")) return;
+
+  function scheduleNextPoll() {
+    if (teamPoll.human && Date.now() - teamPoll.started > 30 * 60 * 1000) teamPoll.human = false;
+    if (teamPoll.human) schedulePoll(panelVisible() ? 5000 : 20000);
+    else if (panelVisible()) schedulePoll(15000);
+  }
+
+  function pollTick() {
+    teamPoll.timer = null;
+    if (teamPoll.busy || !sessionId) return;
+    if (!teamPoll.human && !panelVisible()) return;
+    teamPoll.busy = true;
     fetch(`${apiBase}/public/chat/poll`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: projectId, sessionId: sessionId, after: humanPoll.cursor }),
+      body: JSON.stringify({ projectId: projectId, sessionId: sessionId, after: teamPoll.cursor }),
     })
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (d) {
-        if (humanPoll.timer) return;
+        teamPoll.busy = false;
         if (d) {
           (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
-          if ((d.messages || []).length) saveSessionId(sessionId);
-          if (d.cursor) humanPoll.cursor = d.cursor;
-          if (d.status === "human") { humanPoll.started = 0; startHumanPoll(); return; }
+          if (d.cursor) teamPoll.cursor = d.cursor;
+          if (d.status === "human") {
+            if (!teamPoll.human) teamPoll.started = Date.now();
+            teamPoll.human = true;
+          } else {
+            teamPoll.human = false;
+          }
+          if ((d.messages || []).length) saveSessionId(sessionId);  // restarts the 7-day memory
         }
-        startWatch();
+        scheduleNextPoll();
       })
-      .catch(function () { startWatch(); });
+      .catch(function () {
+        teamPoll.busy = false;
+        if (teamPoll.human) schedulePoll(20000);
+        else scheduleNextPoll();
+      });
   }
+
+  // A person is now handling the chat (handoff reply, flow Talk to Human, or
+  // a reload mid-handoff).
+  function startHumanPoll() {
+    if (!sessionId) return;
+    if (!teamPoll.human) teamPoll.started = Date.now();
+    teamPoll.human = true;
+    if (!teamPoll.busy && !teamPoll.timer) schedulePoll(5000);
+  }
+
+  // Panel opened / page shown / chat started: check soon. Never adds a
+  // second request - a running one schedules the next itself.
+  function startWatch(delay) {
+    if (!sessionId || teamPoll.busy) return;
+    if (teamPoll.timer && !delay) return;
+    schedulePoll(delay || 15000);
+  }
+
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible" && box.classList.contains("open")) startWatch(1000);
+    if (panelVisible()) startWatch(1000);
   });
 
   // ---------------- WEBSITE FLOWS (optional plugin) ----------------
