@@ -108,7 +108,7 @@
       // Reloaded while a person was handling the chat: keep listening for
       // their replies.
       if (data.messages && data.messages.some(m => (m.content || "").indexOf("[Human] ") === 0 ||
-          (m.content || "").indexOf("Connecting you to our team") === 0)) startHumanPoll();
+          (m.content || "").indexOf("Connecting you to our team") === 0)) startHumanPoll(false);
     } catch (e) {}
     markRestored();
   }
@@ -672,7 +672,9 @@
   //    15s, so a takeover is noticed before the visitor types anything.
   // Cursor from page load: anything older is drawn by restoreHistory, and a
   // reply sent while the panel was still closed is picked up on opening.
-  var teamPoll = { timer: null, busy: false, human: false, started: 0, cursor: new Date().toISOString() };
+  // confirmed: the server said a person is on this chat (not just a guess
+  // from old messages after a reload - that guess must not hold back a flow).
+  var teamPoll = { timer: null, busy: false, human: false, confirmed: false, started: 0, cursor: new Date().toISOString() };
 
   function panelVisible() {
     return document.visibilityState === "visible" && box.classList.contains("open");
@@ -711,6 +713,7 @@
           } else {
             teamPoll.human = false;
           }
+          teamPoll.confirmed = teamPoll.human;
           if ((d.messages || []).length) saveSessionId(sessionId);  // restarts the 7-day memory
         }
         scheduleNextPoll();
@@ -722,12 +725,14 @@
       });
   }
 
-  // A person is now handling the chat (handoff reply, flow Talk to Human, or
-  // a reload mid-handoff).
-  function startHumanPoll() {
+  // A person is now handling the chat (handoff reply, flow Talk to Human), or
+  // may be (a reload with team messages in the history: confirmed=false
+  // until the server says so).
+  function startHumanPoll(confirmed) {
     if (!sessionId) return;
     if (!teamPoll.human) teamPoll.started = Date.now();
     teamPoll.human = true;
+    if (confirmed !== false) teamPoll.confirmed = true;
     if (!teamPoll.busy && !teamPoll.timer) schedulePoll(5000);
   }
 
@@ -776,7 +781,7 @@
           return st && st.expiresAt ? st.expiresAt - SESSION_TTL_MS : 0;
         } catch (e) { return 0; }
       },
-      isTeamHandling: function () { return teamPoll.human; },
+      isTeamHandling: function () { return teamPoll.human && teamPoll.confirmed; },
       whenRestored: function (cb) { if (restoredDone) cb(); else restoredWaiters.push(cb); },
     },
   };
