@@ -378,7 +378,7 @@
       addMsg("assistant", "&#128075; Hi! Ask me anything &mdash; I'm here to help.");
     }
     hasOpened = true;
-    startWatch();
+    startWatch(1000);
     msgs.scrollTop = msgs.scrollHeight;
     // Focus only where there is a physical keyboard: on a phone it would pop
     // the keyboard over the conversation the moment the panel opens.
@@ -664,7 +664,9 @@
   // While a person from the merchant's team is handling this chat, check for
   // their replies: every 5s with the panel open, 20s otherwise, for up to 30
   // minutes. Stops as soon as the chat is handed back to the bot.
-  var humanPoll = { timer: null, cursor: null, started: 0 };
+  // Cursor from page load: anything older is drawn by restoreHistory, and a
+  // reply sent while the panel was still closed is picked up on opening.
+  var humanPoll = { timer: null, cursor: new Date().toISOString(), started: 0 };
   function startHumanPoll() {
     if (humanPoll.timer || !sessionId) return;
     humanPoll.started = humanPoll.started || Date.now();
@@ -700,10 +702,9 @@
   // open and the page visible, check every 15s; the moment a person is on
   // the chat, hand over to the 5s loop above.
   var watch = { timer: null };
-  function startWatch() {
+  function startWatch(delay) {
     if (watch.timer || humanPoll.timer || !sessionId) return;
-    humanPoll.cursor = humanPoll.cursor || new Date().toISOString();
-    watch.timer = setTimeout(watchTick, 15000);
+    watch.timer = setTimeout(watchTick, delay || 15000);
   }
   function watchTick() {
     watch.timer = null;
@@ -727,7 +728,7 @@
       .catch(function () { startWatch(); });
   }
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible" && box.classList.contains("open")) startWatch();
+    if (document.visibilityState === "visible" && box.classList.contains("open")) startWatch(1000);
   });
 
   // ---------------- WEBSITE FLOWS (optional plugin) ----------------
