@@ -790,7 +790,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=4`;
+        s.src = `${apiBase}/static/widget-flows.js?v=5`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);

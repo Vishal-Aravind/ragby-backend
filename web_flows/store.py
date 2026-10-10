@@ -23,7 +23,7 @@ def _parse_ts(value):
 
 class SupabaseStore:
     def get_active_web_flow(self, project_id):
-        res = supabase.table("flows").select("id, free_questions, revision, web_settings, trigger_keywords") \
+        res = supabase.table("flows").select("id, free_questions, revision, web_settings") \
             .eq("project_id", project_id).eq("is_active", True).eq("channel", "web") \
             .limit(1).execute()
         return res.data[0] if res.data else None

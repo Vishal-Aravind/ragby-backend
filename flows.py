@@ -250,7 +250,12 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
             send_whatsapp_message(to, body, phone_number_id, token)
 
     elif t == "ask_input":
-        send_whatsapp_message(to, body or "Please type your answer:", phone_number_id, token)
+        # Typed answer expected; the button is the way out (no keywords).
+        send_whatsapp_buttons(
+            to, (body or "Please type your answer:")[:1024],
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+            phone_number_id, token
+        )
 
     elif t in ("buttons", "message_buttons"):
         btns = []
@@ -706,11 +711,6 @@ def _answer_question(session, text, project_id, chat_id, phone_number, phone_num
         if flow:
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
         return
-    # The menu keyword still restarts the flow from a question.
-    if text.lower().strip() in [k.lower() for k in (flow.get("trigger_keywords") or [])]:
-        start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
-        return
-
     c = node.get("content") or {}
     input_type = c.get("input_type") if c.get("input_type") in _WA_INPUT_TYPES else "text"
     today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
@@ -957,7 +957,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         else:
             send_whatsapp_buttons(
                 phone_number,
-                "Please choose one of the options below, or type *menu* to start over.",
+                "Please choose one of the options below.",
                 [
                     {"id": "cart_continue", "title": "Continue ➡️"},
                     {"id": "cart_add_more", "title": "Add More 🛍️"},
@@ -1082,7 +1082,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         else:
             send_whatsapp_buttons(
                 phone_number,
-                "Please tap *Confirm & Pay* to proceed, *Change Order* to edit it, *Cancel* to cancel, or type *menu* to start over.",
+                "Please tap *Confirm & Pay* to proceed, *Change Order* to edit it, or *Cancel* to cancel.",
                 [
                     {"id": "confirm_and_pay", "title": "Confirm & Pay"},
                     {"id": "change_order", "title": "✏️ Change Order"},
@@ -1093,14 +1093,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         return
 
     if session and session.get("mode") == "awaiting_payment":
-        flow_check = get_active_flow(project_id)
-        keywords = [k.lower() for k in (flow_check.get("trigger_keywords") or [])] if flow_check else []
-        if text.lower().strip() in keywords and flow_check:
-            start_flow(flow_check, project_id, phone_number, phone_number_id, token, chat_id)
-            return
-        send_whatsapp_message(
+        send_whatsapp_buttons(
             phone_number,
-            "⏳ Please complete your payment using the link we sent. Tap *Pay Now* to proceed, or type *menu* to start a new order.",
+            "⏳ Please complete your payment using the link we sent (tap *Pay Now*), or go back to the menu to start a new order.",
+            [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
             phone_number_id, token,
         )
         return
@@ -1151,7 +1147,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             start_flow(flow, project_id, phone_number, phone_number_id, token, chat_id)
         return
 
-    flow = supabase.table("flows").select("free_questions, trigger_keywords").eq("id", flow_id).single().execute()
+    flow = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
     free_questions = flow.data.get("free_questions", False) if flow.data else False
 
     if current_node["type"] in ("buttons", "list"):
@@ -1192,11 +1188,6 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     else:
         flow_data = get_active_flow(project_id)
-        if flow_data:
-            keywords = [k.lower() for k in (flow_data.get("trigger_keywords") or [])]
-            if text.lower().strip() in keywords:
-                start_flow(flow_data, project_id, phone_number, phone_number_id, token, chat_id)
-                return
 
         flow_row = supabase.table("flows").select("free_questions").eq("id", flow_id).single().execute()
         free_q = flow_row.data.get("free_questions", False) if flow_row.data else False

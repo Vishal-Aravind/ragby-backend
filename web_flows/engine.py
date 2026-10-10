@@ -318,14 +318,6 @@ class Engine:
         mode = sess.get("mode")
         free = bool(ctx.flow.get("free_questions"))
 
-        # Like WhatsApp: a menu keyword ("hi", "menu", ...) starts the flow
-        # again - except while a person is handling the chat, and unless it
-        # is exactly one of the options currently on screen.
-        if mode != "human" and self._is_keyword(ctx, text) and not self._matches_option(sess, ctx, text):
-            ctx.transcript.append({"role": "user", "content": text})
-            self._restart(sess, ctx)
-            return self._finish_request(sess, ctx, visitor_acted=True)
-
         if mode == "human":
             ctx.transcript.append({"role": "user", "content": text})
             self.store.save_session(sess)
@@ -400,18 +392,6 @@ class Engine:
                 when = when.replace(tzinfo=timezone.utc)
             latest = when if latest is None or when > latest else latest
         return latest is not None and self.fx.now() - latest > timedelta(hours=IDLE_RESTART_HOURS)
-
-    @staticmethod
-    def _is_keyword(ctx, text):
-        words = [str(k).strip().lower() for k in (ctx.flow.get("trigger_keywords") or []) if str(k).strip()]
-        return text.strip().lower() in words
-
-    def _matches_option(self, sess, ctx, text):
-        aw = sess.get("awaiting") or {}
-        if aw.get("kind") not in ("choices", "carousel"):
-            return False
-        node = self._node(ctx, aw.get("node_id"))
-        return bool(node) and any(o["label"].lower() == text.strip().lower() for o in _options(node))
 
     def _restart(self, sess, ctx):
         sess.update({"flow_id": ctx.flow["id"], "mode": "flow", "awaiting": None,
@@ -725,7 +705,7 @@ class Engine:
             "nodeId": aw.get("node_id"), "messages": ctx.messages if ctx else [],
             "input": input, "continueAfterMs": ctx.continue_after_ms if ctx else None,
             "delegate": delegate, "error": ctx.error if ctx else None,
-            "menuChip": sess.get("mode") == "ai",
+            "menuChip": sess.get("mode") == "ai" or (aw.get("kind") == "field"),
         }
 
     def _resync(self, sess, saved=False):

@@ -323,6 +323,7 @@
   }
 
   function retireLive() {
+    if (state.menuRow) { state.menuRow.remove(); state.menuRow = null; }
     if (state.liveInput) {
       state.liveInput.querySelectorAll("button, input, select").forEach(function (x) { x.disabled = true; });
       if (state.liveInput.getAttribute("data-temp") === "1") state.liveInput.remove();
@@ -356,7 +357,28 @@
     if (inp.kind === "carousel") return renderCarousel(inp, nodeId);
     if (inp.kind === "form") return renderForm(inp, nodeId);
     if (inp.kind === "rating") return renderRating(inp, nodeId);
-    if (inp.kind === "field") return renderField(inp, nodeId);
+    if (inp.kind === "field") {
+      renderField(inp, nodeId);
+      // A typed answer is expected; this is the way out without typing.
+      if (env.menuChip) renderMenuChip();
+      return;
+    }
+  }
+
+  function renderMenuChip() {
+    var row = el("div", "zf-row");
+    var b = el("button", "zf-chip", "Back to menu");
+    b.type = "button";
+    b.onclick = function () {
+      if (state.busy) return;
+      b.disabled = true;
+      api.addMsg("user", api.render("Back to menu"));
+      step({ type: "menu" }, null);
+    };
+    row.appendChild(b);
+    msgs.appendChild(row);
+    state.menuRow = row;
+    api.scrollToEnd(true);
   }
 
   function inputRow(temp) {

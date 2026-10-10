@@ -302,7 +302,7 @@ class EngineTests(unittest.TestCase):
 
 
 class WhatsAppParityTests(unittest.TestCase):
-    """Idle restart and menu keywords behave like WhatsApp flows."""
+    """Idle restart and the way back to the menu behave like WhatsApp flows."""
     def flow(self, free=True):
         nodes = [
             node("n1", "quick_replies", {"body": "Menu", "options": [
@@ -310,7 +310,6 @@ class WhatsAppParityTests(unittest.TestCase):
             node("n2", "ask_a_question", {"body": "Ask away"}),
         ]
         eng, store, fx = make(nodes, [edge("n1", "o_b", "n2")], free)
-        store.flow["trigger_keywords"] = ["hi", "menu"]
         return eng, store, fx
 
     def to_ai(self, eng):
@@ -348,19 +347,24 @@ class WhatsAppParityTests(unittest.TestCase):
         out = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "thanks"})
         self.assertEqual(out["status"], "human")
 
-    def test_keyword_restarts_but_not_over_an_option_or_a_person(self):
-        eng, store, fx = self.flow()
-        env = self.to_ai(eng)
+    def test_question_offers_back_to_menu_instead_of_keywords(self):
+        nodes = [
+            node("n1", "quick_replies", {"body": "Menu", "options": [{"id": "o_a", "label": "Book"}]}, start=True),
+            node("n2", "ask_input", {"body": "Your city?", "var": "city"}),
+        ]
+        eng, store, fx = make(nodes, [edge("n1", "o_a", "n2")])
+        env = eng.start(PID, None, VID, "open")
+        self.assertFalse(env["menuChip"])                      # buttons on screen: no extra chip
+        env = eng.step(PID, env["sessionId"], VID, env["seq"], "n1", {"type": "choice", "id": "o_a"})
+        self.assertEqual(env["input"]["kind"], "field")
+        self.assertTrue(env["menuChip"])                       # the way out of a question
+        # typing "menu" is just an answer now - no keywords
+        env = eng.step(PID, env["sessionId"], VID, env["seq"], None, {"type": "text", "text": "menu"})
+        self.assertEqual(store.sessions[env["sessionId"]]["variables"]["city"], "menu")
+        # the chip itself restarts the flow
         sid = env["sessionId"]
-        env = eng.step(PID, sid, VID, env["seq"], None, {"type": "text", "text": " MENU "})
+        env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "menu"})
         self.assertEqual(env["messages"][0]["text"], "Menu")
-        # "Hi" is also an option on screen: it's a tap, not a restart
-        env = eng.step(PID, sid, VID, env["seq"], None, {"type": "text", "text": "hi"})
-        self.assertNotIn("Menu", [m.get("text") for m in env["messages"]])
-        self.assertEqual(env["status"], "ai")   # "Hi" led nowhere: flow ended, AI on
-        store.sessions[sid]["mode"] = "human"
-        out = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "menu"})
-        self.assertEqual(out["status"], "human")
 
 
 class OptionIdGoldenTests(unittest.TestCase):
