@@ -178,26 +178,51 @@ class LeadSubmitRequest(BaseModel):
     phone: str = Field(max_length=32)
 
 
-def _attach_to_existing_contact(project_id: str, session_id: str, name: str, email: str, phone: str) -> bool:
+def _link_chats(project_id: str, lead_id: str, visitor_id: str = None, chat_id: str = None):
+    """Remember on website chats which contact they belong to (chats.lead_id),
+    so they keep the contact's name and details in Conversations even after
+    the contact moves to another browser. Never overwrites an existing link.
+    Best effort: a failure here must not fail the lead itself."""
+    if not lead_id:
+        return
+    try:
+        if visitor_id:
+            supabase.table("chats").update({"lead_id": lead_id}) \
+                .eq("project_id", project_id).eq("visitor_id", visitor_id) \
+                .is_("lead_id", "null").execute()
+        if chat_id:
+            supabase.table("chats").update({"lead_id": lead_id}) \
+                .eq("project_id", project_id).eq("id", chat_id) \
+                .is_("lead_id", "null").execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
+
+def _attach_to_existing_contact(project_id: str, session_id: str, name: str, email: str, phone: str):
     """Link this browser to an existing contact with the same phone.
 
-    Returns True if a row was claimed. session_id is overwritten rather than
+    Returns the contact's id if a row was claimed, else None. session_id is overwritten rather than
     only filled when empty: it is what the chat gate matches on, so the
     browser currently chatting has to be the one it points at, or that visitor
     stays blocked. Name and email only fill gaps, so a WhatsApp profile name
     already on file isn't clobbered by whatever was typed into the form.
     """
     row = supabase.table("leads") \
-        .select("id, name, email") \
+        .select("id, name, email, session_id") \
         .eq("project_id", project_id) \
         .eq("phone", phone) \
         .limit(1) \
         .execute()
 
     if not row.data:
-        return False
+        return None
 
     contact = row.data[0]
+    # The contact is about to move to this browser: its chats from the
+    # previous browser keep pointing at it.
+    old_visitor = contact.get("session_id")
+    if old_visitor and old_visitor != session_id:
+        _link_chats(project_id, contact["id"], visitor_id=old_visitor)
     update = {"session_id": session_id, "last_seen_at": "now()"}
     if not (contact.get("name") or "").strip():
         update["name"] = name
@@ -205,7 +230,7 @@ def _attach_to_existing_contact(project_id: str, session_id: str, name: str, ema
         update["email"] = email
 
     supabase.table("leads").update(update).eq("id", contact["id"]).execute()
-    return True
+    return contact["id"]
 
 
 @router.post("/public/leads")
@@ -266,6 +291,7 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
         .execute()
 
     if existing.data:
+        _link_chats(req.project_id, existing.data[0]["id"], req.session_id, req.chat_session_id)
         return {"status": "already_captured"}
 
     # This same person may already exist as a WhatsApp contact under the same
@@ -274,7 +300,9 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
     # insert anyway, and — more importantly — chat.py's gate looks a lead up
     # by session_id, so leaving this browser unlinked would lock the visitor
     # out of the chat permanently after they'd just handed over their details.
-    if _attach_to_existing_contact(req.project_id, req.session_id, name, email, phone):
+    claimed = _attach_to_existing_contact(req.project_id, req.session_id, name, email, phone)
+    if claimed:
+        _link_chats(req.project_id, claimed, req.session_id, req.chat_session_id)
         return {"status": "captured"}
 
     # Hard ceiling on every plan. Nothing bounded this table at all before —
@@ -292,7 +320,7 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
         )
 
     try:
-        supabase.table("leads").insert({
+        inserted = supabase.table("leads").insert({
             "project_id": req.project_id,
             "session_id": req.session_id,
             "name": name,
@@ -314,9 +342,14 @@ def submit_lead(req: LeadSubmitRequest, request: Request):
             raise
         # Whoever won may have been an upsert_contact for the same phone, so
         # try once more to claim it rather than stranding this visitor.
-        if not _attach_to_existing_contact(req.project_id, req.session_id, name, email, phone):
+        claimed = _attach_to_existing_contact(req.project_id, req.session_id, name, email, phone)
+        if not claimed:
             return {"status": "already_captured"}
+        _link_chats(req.project_id, claimed, req.session_id, req.chat_session_id)
+        return {"status": "captured"}
 
+    if inserted.data:
+        _link_chats(req.project_id, inserted.data[0]["id"], req.session_id, req.chat_session_id)
     return {"status": "captured"}
 
 
@@ -358,6 +391,7 @@ def upsert_web_flow_lead(project_id: str, visitor_id: str, fields: dict, custom:
             # The phone already belongs to another contact: keep the rest.
             update.pop("phone", None)
             supabase.table("leads").update(update).eq("id", lead["id"]).execute()
+        _link_chats(project_id, lead["id"], visitor_id)
         return lead["id"]
 
     if phone and _attach_to_existing_contact(project_id, visitor_id, name, email, phone):
@@ -367,6 +401,7 @@ def upsert_web_flow_lead(project_id: str, visitor_id: str, fields: dict, custom:
             supabase.table("leads").update({
                 "custom_fields": {**(row.data[0].get("custom_fields") or {}), **custom}
             }).eq("id", row.data[0]["id"]).execute()
+            _link_chats(project_id, row.data[0]["id"], visitor_id)
             return row.data[0]["id"]
         return None
 
@@ -380,7 +415,9 @@ def upsert_web_flow_lead(project_id: str, visitor_id: str, fields: dict, custom:
             "source": "web_flow", "channel": "web", "custom_fields": custom,
             "last_seen_at": "now()",
         }).execute()
-        return res.data[0]["id"] if res.data else None
+        lead_id = res.data[0]["id"] if res.data else None
+        _link_chats(project_id, lead_id, visitor_id)
+        return lead_id
     except Exception as e:
         if not _is_duplicate_error(e):
             sentry_sdk.capture_exception(e)
