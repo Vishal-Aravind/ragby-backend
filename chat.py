@@ -1677,6 +1677,16 @@ def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[
     if not config.get("enabled"):
         return None
 
+    # An active website flow decides when to collect details (its Form /
+    # Ask a question blocks), so lead capture stays out of the way - with or
+    # without a form in the flow. Cached for a minute, like the widget's.
+    try:
+        from web_flows.routes import _cached_config
+        if _cached_config(project_id).get("flow"):
+            return None
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
     # Already gave their details? Keyed on the durable visitor id, so the
     # 3-hour session TTL doesn't re-prompt someone who already converted.
     if visitor_id:
