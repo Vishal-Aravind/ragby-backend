@@ -158,8 +158,13 @@
     }).then(function (env) {
       typing.remove();
       state.busy = false;
-      if (!env || env.status === "inactive") { disable(); return; }
-      return apply(env);
+      if (!env || env.status === "inactive") {
+        disable();
+        // The flow was switched off meanwhile: their message goes to the AI.
+        if (text) return api.askBot(text);
+        return;
+      }
+      return apply(env, text ? { type: "text", text: text } : { type: "start" });
     });
   }
 
@@ -202,7 +207,9 @@
     }
     if (env.sessionId) {
       state.sessionId = env.sessionId;
-      api.saveSessionId(env.sessionId);  // also restarts the 7-day memory clock
+      // Something the visitor did restarts the 7-day memory clock; a resume
+      // on page load is not activity (it would also hide a 2-hour gap).
+      if (action || api.getSessionId() !== env.sessionId) api.saveSessionId(env.sessionId);
       lsSet(FLOW_KEY, env.sessionId);
     }
     var prevNode = state.nodeId;
