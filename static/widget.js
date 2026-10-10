@@ -34,6 +34,7 @@
       value: id,
       expiresAt: Date.now() + SESSION_TTL_MS,
     }));
+    if (box.classList.contains("open")) startWatch();
   }
 
   // Lead state
@@ -377,6 +378,7 @@
       addMsg("assistant", "&#128075; Hi! Ask me anything &mdash; I'm here to help.");
     }
     hasOpened = true;
+    startWatch();
     msgs.scrollTop = msgs.scrollHeight;
     // Focus only where there is a physical keyboard: on a phone it would pop
     // the keyboard over the conversation the moment the panel opens.
@@ -685,12 +687,48 @@
             humanPoll.timer = setTimeout(tick, open ? 5000 : 20000);
           } else {
             humanPoll.started = 0;
+            startWatch();
           }
         })
         .catch(function () { humanPoll.timer = setTimeout(tick, 20000); });
     }
     humanPoll.timer = setTimeout(tick, 5000);
   }
+
+  // A team member can take over (or just reply) before the visitor sends
+  // anything, so nothing above would be listening yet. While the panel is
+  // open and the page visible, check every 15s; the moment a person is on
+  // the chat, hand over to the 5s loop above.
+  var watch = { timer: null };
+  function startWatch() {
+    if (watch.timer || humanPoll.timer || !sessionId) return;
+    humanPoll.cursor = humanPoll.cursor || new Date().toISOString();
+    watch.timer = setTimeout(watchTick, 15000);
+  }
+  function watchTick() {
+    watch.timer = null;
+    if (humanPoll.timer || !sessionId) return;
+    if (document.visibilityState !== "visible" || !box.classList.contains("open")) return;
+    fetch(`${apiBase}/public/chat/poll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: projectId, sessionId: sessionId, after: humanPoll.cursor }),
+    })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (d) {
+        if (humanPoll.timer) return;
+        if (d) {
+          (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
+          if (d.cursor) humanPoll.cursor = d.cursor;
+          if (d.status === "human") { humanPoll.started = 0; startHumanPoll(); return; }
+        }
+        startWatch();
+      })
+      .catch(function () { startWatch(); });
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && box.classList.contains("open")) startWatch();
+  });
 
   // ---------------- WEBSITE FLOWS (optional plugin) ----------------
   // When the merchant has an active website flow, widget-flows.js is loaded
@@ -712,7 +750,7 @@
       apiBase: apiBase, projectId: projectId, userId: userId,
       addMsg: addMsg, render: render, esc: esc, showTyping: showTyping,
       blockInput: blockInput, unblockInput: unblockInput, scrollToEnd: scrollToEnd,
-      askBot: askBot, setOpen: setOpen,
+      askBot: askBot, setOpen: setOpen, startHumanPoll: startHumanPoll,
       isOpen: function () { return box.classList.contains("open"); },
       getSessionId: function () { return sessionId; },
       saveSessionId: saveSessionId,
@@ -731,7 +769,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=1`;
+        s.src = `${apiBase}/static/widget-flows.js?v=2`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);

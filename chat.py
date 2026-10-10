@@ -1586,8 +1586,14 @@ def public_chat_poll(req: ChatPollRequest, request: Request):
     if req.after:
         q = q.gt("created_at", req.after)
     rows = q.execute().data or []
+    human = bool(chat.data[0].get("human_mode"))
+    if not human:
+        # A website flow's Talk to Human node sets only the flow session.
+        sess = supabase.table("web_flow_sessions").select("mode").eq("chat_id", req.sessionId) \
+            .eq("project_id", req.projectId).limit(1).execute()
+        human = bool(sess.data and sess.data[0].get("mode") == "human")
     return {
-        "status": "human" if chat.data[0].get("human_mode") else "bot",
+        "status": "human" if human else "bot",
         "messages": [{"text": r["content"][len("[Human] "):]} for r in rows],
         "cursor": rows[-1]["created_at"] if rows else req.after,
     }

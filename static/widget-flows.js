@@ -646,6 +646,9 @@
   // ------------------------------------------------------------ human mode
   function startPolling() {
     if (state.pollTimer || state.disabled) return;
+    // One poller for the whole widget (it also notices takeovers): newer
+    // widget.js does it, so replies are never shown twice.
+    if (api.startHumanPoll) { api.startHumanPoll(); return; }
     state.pollStarted = state.pollStarted || Date.now();
     var tick = function () {
       state.pollTimer = null;
