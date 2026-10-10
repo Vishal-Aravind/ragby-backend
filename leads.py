@@ -398,9 +398,8 @@ class LeadConfigRequest(BaseModel):
     formSubtitle: Optional[str] = Field(
         default="Please share your details to keep chatting.", max_length=240
     )
-    # When to ask: before the first answer, after N messages, or only when
-    # the visitor asks to talk to a person.
-    mode: Optional[str] = Field(default="after_n", pattern="^(before|after_n|on_handoff)$")
+    # When to ask: before the first answer, or after N messages.
+    mode: Optional[str] = Field(default="after_n", pattern="^(before|after_n)$")
 
 
 @router.put("/lead-config")

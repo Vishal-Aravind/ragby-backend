@@ -1647,26 +1647,12 @@ def public_chat_history(session_id: str, request: Request, project_id: Optional[
         return {"messages": []}
 
 
-# "I want a person" — kept deliberately narrow (whole phrases, not words like
-# "agent" or "help") so ordinary questions are never mistaken for a handoff.
-_HUMAN_PHRASES = (
-    "talk to a human", "talk to human", "speak to a human", "speak to human",
-    "talk to a person", "speak to a person", "talk to someone", "speak to someone",
-    "real person", "human agent", "live agent", "talk to an agent", "speak to an agent",
-    "customer care", "customer support", "connect me to", "call me back", "callback",
-)
-
-# A handoff nobody answers must not leave the visitor talking to a wall: if
-# the team hasn't replied for this long, the AI answers again.
+# A takeover nobody follows up must not leave the visitor talking to a wall:
+# if the team hasn't replied for this long, the AI answers again.
 HUMAN_MODE_IDLE_MINUTES = 30
 
 
-def _wants_human(message: str) -> bool:
-    msg = " ".join((message or "").lower().split())
-    return any(p in msg for p in _HUMAN_PHRASES)
-
-
-def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[str], wants_human: bool = False):
+def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[str]):
     """Server-side enforcement of the lead-capture gate.
 
     NOT an endpoint. This function was inserted directly beneath the
@@ -1703,12 +1689,11 @@ def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[
         if lead.data:
             return None
 
-    # When to ask (lead_capture_config.mode): before the first answer, after
-    # N messages (the original behaviour), or only when they ask for a person.
+    # When to ask (lead_capture_config.mode): before the first answer, or
+    # after N messages (the original behaviour). A retired "on_handoff" value
+    # still saved on a project behaves like after_n.
     mode = config.get("mode") or "after_n"
-    if mode == "on_handoff" and not wants_human:
-        return None
-    if mode in ("before", "on_handoff"):
+    if mode == "before":
         threshold = 1
     else:
         threshold = config.get("trigger_after_messages") or 2
@@ -1733,11 +1718,7 @@ def _lead_capture_blocks(project_id: str, session_id: str, visitor_id: Optional[
         "sources": [],
         "leadForm": {
             "form_title": config.get("form_title") or "Before we continue...",
-            "form_subtitle": (
-                "Share your details so our team can get back to you."
-                if wants_human else
-                config.get("form_subtitle") or "Please share your details to keep chatting."
-            ),
+            "form_subtitle": config.get("form_subtitle") or "Please share your details to keep chatting.",
         },
     }
 
@@ -1849,8 +1830,8 @@ def public_chat(req: PublicChatRequest, request: Request):
     elif req.visitorId and not chat_row.get("visitor_id"):
         supabase.table("chats").update({"visitor_id": req.visitorId}).eq("id", session_id).execute()
 
-    # A person is handling this chat (they took over, or the visitor asked
-    # for one): save the message for them and don't let the AI talk over
+    # A person is handling this chat (the team took over or replied from
+    # Conversations): save the message for them and don't let the AI talk over
     # them. Not billed — no AI call. If the team stays silent too long, the
     # AI picks the chat back up so the visitor isn't left with no reply.
     if req.channel != "shopify" and chat_row.get("human_mode"):
@@ -1867,8 +1848,6 @@ def public_chat(req: PublicChatRequest, request: Request):
             return {"answer": "", "status": "human", "sessionId": session_id, "sources": []}
         supabase.table("chats").update({"human_mode": False}).eq("id", session_id).execute()
 
-    wants_human = req.channel != "shopify" and _wants_human(req.message)
-
     # Before run_chat, so a gated request never reaches OpenAI.
     #
     # Deliberately NOT applied to the Shopify storefront widget. That surface
@@ -1878,21 +1857,9 @@ def public_chat(req: PublicChatRequest, request: Request):
     # as a web-widget feature; this keeps it to the two surfaces that have the
     # form (the embeddable widget and the shareable link).
     if req.channel != "shopify":
-        gate = _lead_capture_blocks(req.projectId, session_id, req.visitorId, wants_human)
+        gate = _lead_capture_blocks(req.projectId, session_id, req.visitorId)
         if gate:
             return gate
-
-    # "Can I talk to a person?" — hand the chat to the team (it appears under
-    # Needs reply in Conversations) instead of letting the AI answer.
-    if wants_human:
-        now = datetime.utcnow().isoformat()
-        supabase.table("chats").update({
-            "human_mode": True, "human_since": now, "last_agent_msg_at": None,
-        }).eq("id", session_id).execute()
-        save_message(session_id, "user", req.message)
-        reply = "Connecting you to our team - someone will reply here shortly."
-        save_message(session_id, "assistant", reply)
-        return {"answer": reply, "status": "human", "sessionId": session_id, "sources": []}
 
     history = get_history(session_id, limit=7) if req.sessionId else []
     # Billed even when the turn fails — a generic failure inside run_chat
