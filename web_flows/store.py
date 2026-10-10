@@ -68,8 +68,10 @@ class SupabaseStore:
             else:
                 import uuid
                 sess["chat_id"] = str(uuid.uuid4())
-        supabase.table("web_flow_sessions").upsert(sess, on_conflict="chat_id").execute()
-        return sess
+        sess.setdefault("chat_materialized", False)
+        res = supabase.table("web_flow_sessions").upsert(sess, on_conflict="chat_id").execute()
+        # The stored row carries the database defaults too.
+        return {**(res.data[0] if res.data else {}), **sess}
 
     def claim(self, chat_id, seq):
         # Compare-and-swap: only one request per seq value wins, so a double
@@ -80,8 +82,10 @@ class SupabaseStore:
         return res.data[0] if res.data else None
 
     def save_session(self, sess):
+        # Only fields the session actually has: a missing key used to be sent
+        # as null, which a NOT NULL column (chat_materialized) refuses.
         supabase.table("web_flow_sessions").update(
-            {**{k: sess.get(k) for k in _SESSION_COLUMNS},
+            {**{k: sess[k] for k in _SESSION_COLUMNS if k in sess},
              "updated_at": datetime.now(timezone.utc).isoformat()}
         ).eq("chat_id", sess["chat_id"]).execute()
 
