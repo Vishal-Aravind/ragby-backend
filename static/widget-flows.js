@@ -193,7 +193,7 @@
     }
     if (env.sessionId) {
       state.sessionId = env.sessionId;
-      if (api.getSessionId() !== env.sessionId) api.saveSessionId(env.sessionId);
+      api.saveSessionId(env.sessionId);  // also restarts the 7-day memory clock
       lsSet(FLOW_KEY, env.sessionId);
     }
     var prevNode = state.nodeId;

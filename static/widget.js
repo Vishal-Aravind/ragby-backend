@@ -683,6 +683,7 @@
         .then(function (d) {
           if (!d) return;
           (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
+          if ((d.messages || []).length) saveSessionId(sessionId);
           if (d.cursor) humanPoll.cursor = d.cursor;
           if (d.status === "human") {
             var open = document.visibilityState === "visible" && box.classList.contains("open");
@@ -720,6 +721,7 @@
         if (humanPoll.timer) return;
         if (d) {
           (d.messages || []).forEach(function (m) { addMsg("assistant", render(m.text)); });
+          if ((d.messages || []).length) saveSessionId(sessionId);
           if (d.cursor) humanPoll.cursor = d.cursor;
           if (d.status === "human") { humanPoll.started = 0; startHumanPoll(); return; }
         }
@@ -770,7 +772,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=2`;
+        s.src = `${apiBase}/static/widget-flows.js?v=3`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);
