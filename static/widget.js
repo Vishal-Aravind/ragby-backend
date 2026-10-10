@@ -45,23 +45,6 @@
   // Lead capture config (fetched from backend)
   let leadConfig = null;
 
-  // Password-protected projects mint a short-lived access token on
-  // verification. The widget had no password flow at all: it never sent a
-  // token, so a protected project answered 401 to every message and the
-  // visitor saw a generic error forever with no way to unlock. The
-  // shareable-link page has had this flow all along.
-  const ACCESS_KEY = `chat_access_${projectId}`;
-  let accessToken = null;
-  try { accessToken = localStorage.getItem(ACCESS_KEY); } catch (e) {}
-
-  function saveAccessToken(token) {
-    accessToken = token || null;
-    try {
-      if (token) localStorage.setItem(ACCESS_KEY, token);
-      else localStorage.removeItem(ACCESS_KEY);
-    } catch (e) {}
-  }
-
   const history = [];
 
   // Quotes matter as much as angle brackets here: the linkifier below puts
@@ -447,82 +430,6 @@
   }
 
   // ---------------- LEAD FORM ----------------
-  // Password unlock. Mirrors the shareable-link page's flow: verify once,
-  // keep the returned short-lived token, replay it on every message.
-  function showPasswordForm() {
-    blockInput();
-
-    const existing = root.getElementById("pw-overlay");
-    if (existing) existing.remove();
-
-    const overlay = document.createElement("div");
-    overlay.id = "pw-overlay";
-    overlay.className = "row assistant";
-    overlay.innerHTML = `
-      <div class="bubble card">
-        <div class="card-title">&#128274; This chat is protected</div>
-        <div class="card-sub">Enter the password to continue.</div>
-        <input id="pw-input" class="fld" type="password" placeholder="Password" autocomplete="current-password"/>
-        <div id="pw-error" class="err" style="display:none"></div>
-        <button id="pw-submit" class="cta" type="button">Unlock</button>
-      </div>
-    `;
-    msgs.appendChild(overlay);
-    scrollToEnd(true);
-
-    const input = overlay.querySelector("#pw-input");
-    const errorEl = overlay.querySelector("#pw-error");
-    const submitBtn = overlay.querySelector("#pw-submit");
-
-    input.focus();
-
-    async function submit() {
-      const password = input.value;
-      if (!password) return;
-
-      errorEl.style.display = "none";
-      submitBtn.textContent = "Checking...";
-      submitBtn.disabled = true;
-
-      try {
-        const res = await fetch(`${apiBase}/public/chat/verify-password`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectId, password }),
-        });
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok || !data.accessToken) {
-          // One message for a wrong password and for a rate limit, so this
-          // is not an oracle for whether a password is set.
-          errorEl.textContent = res.status === 429
-            ? "Too many attempts. Please wait a moment."
-            : "Incorrect password.";
-          errorEl.style.display = "block";
-          submitBtn.textContent = "Unlock";
-          submitBtn.disabled = false;
-          return;
-        }
-
-        saveAccessToken(data.accessToken);
-        overlay.remove();
-        unblockInput();
-
-        const q = pendingQuestion;
-        pendingQuestion = null;
-        if (q) askBot(q);
-      } catch (e) {
-        errorEl.textContent = "Could not reach the server. Please try again.";
-        errorEl.style.display = "block";
-        submitBtn.textContent = "Unlock";
-        submitBtn.disabled = false;
-      }
-    }
-
-    submitBtn.addEventListener("click", submit);
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-  }
-
   function showLeadForm() {
     awaitingLead = true;
     blockInput();
@@ -679,19 +586,8 @@
           // this, not on sessionId, so a visitor who already gave their
           // details isn't asked again when their 3-hour session rolls over.
           visitorId: userId,
-          accessToken,
         }),
       });
-
-      if (res.status === 401) {
-        // Either this project just turned on a password, or our token
-        // expired. Ask for it and retry the same question once unlocked.
-        typing.remove();
-        saveAccessToken(null);
-        pendingQuestion = question;
-        showPasswordForm();
-        return;
-      }
 
       if (res.status === 403) {
         // Refused: this website isn't on the project's Allowed websites list

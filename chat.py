@@ -1,9 +1,5 @@
-import base64
-import hashlib
-import hmac
 from urllib.parse import urlparse
 import re
-import time
 import uuid
 import sentry_sdk
 from datetime import datetime, timedelta
@@ -12,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
 
 from clients import supabase, openai_client, embeddings, qdrant
-from config import QDRANT_COLLECTION, FRONTEND_URL, SUPABASE_SERVICE_ROLE_KEY, INTERNAL_PROXY_SECRET
+from config import QDRANT_COLLECTION, FRONTEND_URL, SUPABASE_SERVICE_ROLE_KEY
 from auth import verify_token, require_project_role
 from usage import check_rate_limit, increment_usage
 from ratelimit import is_rate_limited, client_ip
@@ -93,63 +89,20 @@ def _resolve_verified_phone(channel: str, external_id: str):
 
 
 # -------------------------------------------------
-# PASSWORD-PROTECTED PUBLIC CHAT
+# SIGNING SECRET
 # -------------------------------------------------
-# The password gate used to be decorative: verify-password returned
-# {"success": true} and the client simply set a React state flag, while
-# /public/chat checked nothing at all. Anyone could POST straight to
-# /public/chat, or flip the flag in devtools, and use a protected bot at
-# the merchant's expense. Verification now mints a short-lived signed
-# token that /public/chat requires.
-_CHAT_ACCESS_TTL_SECONDS = 12 * 60 * 60
-
-
 def _chat_access_secret() -> bytes:
-    # Server-side only; never shipped anywhere near the browser.
-    #
-    # Fails closed. This used to fall back to b"" when the key was unset,
-    # which makes every access token forgeable by anyone who notices — an
-    # empty HMAC key is a valid HMAC key.
+    """Server-side secret used to sign short-lived tokens (the website-flow
+    editor's Test panel). Never shipped to the browser.
+
+    Fails closed: an unset key would make every token forgeable (an empty
+    HMAC key is a valid HMAC key)."""
     if not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(
             status_code=503,
             detail="Chat is temporarily unavailable. Please try again shortly.",
         )
     return SUPABASE_SERVICE_ROLE_KEY.encode()
-
-
-def _password_fingerprint(stored_hash: str) -> str:
-    """A short, one-way marker of the CURRENT password hash. Mixed into the
-    access token so changing or removing the password invalidates every
-    token issued under the old one. The token used to depend only on the
-    project and an expiry, so someone who had unlocked the chat kept access
-    for up to 12 hours after the merchant changed the password — which is
-    usually done precisely because it leaked. Not the hash itself, so the
-    secret still never sits in memory on a public request."""
-    return hashlib.sha256((stored_hash or "").encode()).hexdigest()[:16]
-
-
-def _issue_chat_access_token(project_id: str, password_fp: str = "") -> str:
-    expires = int(time.time()) + _CHAT_ACCESS_TTL_SECONDS
-    payload = f"{project_id}:{expires}:{password_fp}"
-    sig = hmac.new(_chat_access_secret(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{expires}.{sig}"
-
-
-def _chat_access_token_valid(project_id: str, token: str, password_fp: str = "") -> bool:
-    if not token or "." not in token:
-        return False
-    expires_str, _, sig = token.partition(".")
-    try:
-        expires = int(expires_str)
-    except ValueError:
-        return False
-    if expires < time.time():
-        return False
-    expected = hmac.new(
-        _chat_access_secret(), f"{project_id}:{expires}:{password_fp}".encode(), hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, sig)
 
 
 def _request_host(request) -> str:
@@ -174,32 +127,6 @@ def _host_on_allowlist(host: str, allowed_domains) -> bool:
     return False
 
 
-def _is_hosted_page_request(request) -> bool:
-    """True when the request comes from our own hosted chat page (the
-    Shareable Chat Link) rather than from a website widget.
-
-    The two are separate products with separate rules: the link has its own
-    on/off switch and password; the widget has only the Allowed websites
-    list. They share one endpoint, so this decides which rules apply.
-
-    Identified by the shared secret our Next.js proxy attaches (checked with
-    a constant-time compare; a visitor can't know it), or — in case that
-    secret isn't configured — by the page's own address as the browser
-    declares it. Neither lets a caller dodge a rule: someone who claims to
-    be the hosted page gets the link's rules (password included), and
-    everyone else gets the widget's (listed website required).
-    """
-    if INTERNAL_PROXY_SECRET:
-        presented = request.headers.get("X-Internal-Proxy-Secret", "")
-        if presented and hmac.compare_digest(presented, INTERNAL_PROXY_SECRET):
-            return True
-    try:
-        own_host = (urlparse(FRONTEND_URL).hostname or "").lower()
-    except Exception:
-        own_host = ""
-    return bool(own_host) and _request_host(request) == own_host
-
-
 def _origin_allowed(request, allowed_domains) -> bool:
     """The website widget's rule: the browser-declared Origin must be one of
     the merchant's Allowed websites.
@@ -221,57 +148,10 @@ def _origin_allowed(request, allowed_domains) -> bool:
     return _host_on_allowlist(_request_host(request), allowed_domains)
 
 
-def _verify_chat_password(password: str, stored: str) -> bool:
-    """Verifies a chat password against its scrypt hash.
-
-    Format is `scrypt$N$r$p$salt_b64$hash_b64`, written by
-    src/lib/chat-password.js. The two must stay in step — a change to the
-    parameters there has to land here at the same time.
-
-    The password used to be stored and compared in plaintext. scrypt rather
-    than the bare SHA-256 used for api_keys, because this one is chosen by
-    a human and so needs a slow, salted KDF rather than a fast digest.
-    """
-    try:
-        parts = (stored or "").split("$")
-        if len(parts) != 6 or parts[0] != "scrypt":
-            return False
-        _, n, r, p, salt_b64, hash_b64 = parts
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(hash_b64)
-        actual = hashlib.scrypt(
-            (password or "").encode(),
-            salt=salt,
-            n=int(n),
-            r=int(r),
-            p=int(p),
-            dklen=len(expected),
-            maxmem=64 * 1024 * 1024,
-        )
-        return hmac.compare_digest(actual, expected)
-    except Exception as e:
-        # Only reaches here on a malformed stored hash (bad base64, an
-        # unexpected scrypt parameter) — never on a simple wrong-password
-        # guess, which returns False earlier without raising. That makes
-        # this a data-integrity signal (a corrupted chat_password_hash
-        # column) rather than routine traffic, and it was silently lost.
-        sentry_sdk.capture_exception(e)
-        return False
-
-
 def _project_public_settings(project_id: str) -> dict:
-    # chat_password_hash is selected, not the old plaintext column, and only
-    # its presence is ever read (see the gate in public_chat). Reduced to a
-    # boolean here so the secret never sits in memory on a public request.
-    res = supabase.table("projects").select(
-        "chat_enabled, chat_password_hash, allowed_domains"
-    ).eq("id", project_id).maybe_single().execute()
-    data = (res.data if res else None) or {}
-    if data:
-        stored = data.pop("chat_password_hash", None)
-        data["has_chat_password"] = bool(stored)
-        data["chat_password_fp"] = _password_fingerprint(stored) if stored else ""
-    return data
+    res = supabase.table("projects").select("allowed_domains") \
+        .eq("id", project_id).maybe_single().execute()
+    return (res.data if res else None) or {}
 
 
 # -------------------------------------------------
@@ -296,16 +176,12 @@ class PublicChatRequest(BaseModel):
     # this string directly controls which paid tools (e.g. SHOPIFY_CART_TOOLS)
     # get offered to the model for this conversation.
     channel: Optional[str] = None
-    accessToken: Optional[str] = None
     # Durable per-browser id (widget.js's rag_user_id). Distinct from
     # sessionId, which rotates every 3 hours — a visitor who already gave
     # their details must not be asked again just because their chat session
     # expired. This is the key /public/leads dedups on.
     visitorId: Optional[str] = Field(default=None, max_length=64)
 
-class VerifyPasswordRequest(BaseModel):
-    projectId: str
-    password: str
 
 
 # -------------------------------------------------
@@ -1685,27 +1561,6 @@ def chat(req: ChatRequest, user=Depends(verify_token)):
     return result
 
 
-@router.post("/public/chat/verify-password")
-def verify_chat_password(req: VerifyPasswordRequest, request: Request):
-    # This used to be a plain string compare with no attempt limiting at
-    # all — straightforwardly brute-forceable. A tighter, longer window
-    # than the chat burst limiter, since this guards a password rather than
-    # just costing money per attempt.
-    ip = client_ip(request)
-    if is_rate_limited(f"pw:{req.projectId}:{ip}", limit=5, window_seconds=300):
-        raise HTTPException(status_code=429, detail="Too many attempts — please wait a few minutes and try again.")
-
-    res = supabase.table("projects").select("chat_password_hash").eq("id", req.projectId).maybe_single().execute()
-    project = res.data if res else None
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    stored = project.get("chat_password_hash") or ""
-    if not stored or not _verify_chat_password(req.password or "", stored):
-        raise HTTPException(status_code=401, detail="Incorrect password")
-
-    return {"success": True, "accessToken": _issue_chat_access_token(req.projectId, _password_fingerprint(stored))}
-
 
 class ChatPollRequest(BaseModel):
     projectId: str
@@ -1903,42 +1758,25 @@ def public_chat(req: PublicChatRequest, request: Request):
 
     settings = _project_public_settings(req.projectId)
 
-    if _is_hosted_page_request(request):
-        # The Shareable Chat Link: its own on/off switch and password, and
-        # nothing else. (These were once enforced only in the Next.js page,
-        # so turning the link off merely hid the UI while this endpoint kept
-        # answering and kept billing.) The Allowed websites list does not
-        # apply here — it belongs to the widget.
-        if settings.get("chat_enabled") is False:
-            raise HTTPException(status_code=403, detail="This chat is not available.")
-        if settings.get("has_chat_password") and not _chat_access_token_valid(
-            req.projectId, req.accessToken or "", settings.get("chat_password_fp", "")
-        ):
-            raise HTTPException(status_code=401, detail="This chat is password protected.")
-    else:
-        # The website widget: only the Allowed websites list. No password and
-        # no link switch — the link's settings don't touch the widget.
-        #
-        # The list is the merchant's own websites, plus — for the Shopify
-        # storefront widget — the connected store's domain, so Shopify
-        # merchants' widgets keep working without listing their
-        # myshopify.com address by hand. (A store on a custom domain adds
-        # that domain to the list like any other website.)
-        allowed_sites = list(settings.get("allowed_domains") or [])
-        if req.channel == "shopify":
-            shop = supabase.table("shopify_integrations") \
-                .select("shop_domain") \
-                .eq("project_id", req.projectId) \
-                .limit(1) \
-                .execute()
-            if shop.data and shop.data[0].get("shop_domain"):
-                allowed_sites.append(shop.data[0]["shop_domain"])
+    # The website widget's rule: the Allowed websites list. (The list is the
+    # merchant's own websites, plus - for the Shopify storefront widget - the
+    # connected store's domain, so Shopify merchants' widgets keep working
+    # without listing their myshopify.com address by hand.)
+    allowed_sites = list(settings.get("allowed_domains") or [])
+    if req.channel == "shopify":
+        shop = supabase.table("shopify_integrations") \
+            .select("shop_domain") \
+            .eq("project_id", req.projectId) \
+            .limit(1) \
+            .execute()
+        if shop.data and shop.data[0].get("shop_domain"):
+            allowed_sites.append(shop.data[0]["shop_domain"])
 
-        if not _origin_allowed(request, allowed_sites):
-            raise HTTPException(
-                status_code=403,
-                detail="This assistant isn't available on this site.",
-            )
+    if not _origin_allowed(request, allowed_sites):
+        raise HTTPException(
+            status_code=403,
+            detail="This assistant isn't available on this site.",
+        )
 
     session_id = req.sessionId or str(uuid.uuid4())
 
