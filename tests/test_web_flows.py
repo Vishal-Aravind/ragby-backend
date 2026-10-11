@@ -337,6 +337,15 @@ class WhatsAppParityTests(unittest.TestCase):
         self.assertTrue(acted)
         self.assertEqual(entries[0], {"role": "user", "content": "do you deliver?"})
 
+    def test_known_contact_fills_name(self):
+        nodes = [node("n1", "message", {"body": "Hi {{name|there}}!"}, start=True)]
+        eng, store, fx = make(nodes, [])
+        self.assertEqual(eng.start(PID, None, VID, "open")["messages"][0]["text"], "Hi there!")
+        fx.contact_vars = lambda pid, vid: {"name": "Mani", "email": "m@x.com"}
+        eng2, store2, fx2 = make(nodes, [])
+        fx2.contact_vars = fx.contact_vars
+        self.assertEqual(eng2.start(PID, None, VID, "open")["messages"][0]["text"], "Hi Mani!")
+
     def test_recent_team_reply_is_not_idle(self):
         eng, store, fx = self.flow()
         env = self.to_ai(eng)

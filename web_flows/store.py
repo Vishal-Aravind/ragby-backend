@@ -138,6 +138,19 @@ class LiveEffects:
             sentry_sdk.capture_exception(e)
             return None
 
+    def contact_vars(self, project_id, visitor_id):
+        """A known visitor's saved name / email / phone, for {{name}} etc.
+        (like WhatsApp, which fills {{name}} from the contact)."""
+        if not visitor_id:
+            return {}
+        try:
+            res = supabase.table("leads").select("name, email, phone")                 .eq("project_id", project_id).eq("session_id", visitor_id).limit(1).execute()
+            row = res.data[0] if res.data else {}
+            return {k: str(row.get(k) or "").strip() for k in ("name", "email", "phone") if (row.get(k) or "").strip()}
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            return {}
+
     def log_events(self, events):
         try:
             supabase.table("web_flow_events").insert(events[:60]).execute()

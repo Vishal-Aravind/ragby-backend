@@ -136,6 +136,14 @@ class Engine:
                 "expires_at": (self.fx.now() + timedelta(hours=SESSION_HOURS)).isoformat(),
             })
         self._set_page(sess, page)
+        # A visitor who is already a contact: their saved name / email /
+        # phone fill {{name}} etc. (answers given in this flow still win).
+        contact_vars = getattr(self.fx, "contact_vars", None)
+        if contact_vars:
+            variables = sess.setdefault("variables", {})
+            for key, value in (contact_vars(project_id, visitor_id) or {}).items():
+                if value and not variables.get(key):
+                    variables[key] = value
         ctx = Ctx(flow)
         ctx.events.append(("start", None, {"via": str(via or "open")[:40]}))
         text = str(text or "").strip()[:4000]
