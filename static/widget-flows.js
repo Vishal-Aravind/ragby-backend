@@ -80,6 +80,29 @@
     ".zf-chip:disabled { opacity: .45; cursor: default; }",
     ".zf-chip[aria-pressed=true] { background: var(--c2); color: #fff; opacity: 1; }",
     ".zf-filter { width: 100%; margin-bottom: 8px; }",
+    ".zf-listbtn { display: flex; align-items: center; gap: 10px; width: 84%; border: 1px solid #e6e3f8; background: #fff;",
+    "  border-radius: 14px; padding: 8px 14px 8px 8px; font-size: 13.5px; font-weight: 600; color: var(--c1); cursor: pointer;",
+    "  box-shadow: 0 1px 2px rgba(79,70,229,.06); text-align: left; transition: border-color .15s, background .15s, box-shadow .15s; }",
+    ".zf-listbtn:hover:not(:disabled) { background: #f7f5ff; border-color: var(--c2); box-shadow: 0 3px 10px rgba(79,70,229,.12); }",
+    ".zf-listbtn:disabled { opacity: .5; cursor: default; }",
+    ".zf-listbtn .zf-chev { margin-left: auto; color: #9ca3af; font-size: 18px; line-height: 1; }",
+    ".zf-sheet-bg { position: absolute; inset: 0; background: rgba(17,24,39,.32); z-index: 20; display: flex; align-items: flex-end;",
+    "  animation: zf-fade .18s ease-out; border-radius: inherit; overflow: hidden; }",
+    ".zf-sheet { background: #fff; width: 100%; max-height: 72%; border-radius: 20px 20px 0 0; display: flex; flex-direction: column;",
+    "  box-shadow: 0 -8px 28px rgba(49,46,129,.18); animation: zf-up .22s ease-out; }",
+    ".zf-sheet-hd { display: flex; align-items: center; gap: 8px; padding: 14px 16px 12px; border-bottom: 1px solid #f1f0f9;",
+    "  font-weight: 650; font-size: 15px; color: #111827; }",
+    ".zf-sheet-x { margin-left: auto; width: 28px; height: 28px; border: none; border-radius: 50%; background: #f3f4f6; cursor: pointer;",
+    "  font-size: 16px; line-height: 1; color: #4b5563; }",
+    ".zf-sheet-list { overflow-y: auto; padding: 4px 0 12px; }",
+    ".zf-opt { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 18px; border: none; background: none;",
+    "  text-align: left; font-size: 14px; color: #1f2937; cursor: pointer; border-bottom: 1px solid #f5f4fb; }",
+    ".zf-opt:last-child { border-bottom: none; }",
+    ".zf-opt:hover, .zf-opt:focus-visible { background: #f7f5ff; outline: none; }",
+    ".zf-radio { margin-left: auto; flex: 0 0 18px; width: 18px; height: 18px; border-radius: 50%; border: 2px solid #c4b5fd; }",
+    ".zf-opt:hover .zf-radio { border-color: var(--c2); }",
+    "@keyframes zf-up { from { transform: translateY(100%); } to { transform: none; } }",
+    "@keyframes zf-fade { from { opacity: 0; } to { opacity: 1; } }",
     ".zf-more { background: none; border: none; color: var(--c1); font-weight: 600; font-size: 13px; cursor: pointer; padding: 4px 2px; }",
     ".zf-car { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; padding: 2px 2px 8px; width: 100%; }",
     ".zf-car:focus-visible { outline: 3px solid var(--ring); }",
@@ -347,6 +370,7 @@
   }
 
   function retireLive() {
+    closeSheet();
     if (state.menuRow) { state.menuRow.remove(); state.menuRow = null; }
     if (state.liveInput) {
       state.liveInput.querySelectorAll("button, input, select").forEach(function (x) { x.disabled = true; });
@@ -377,7 +401,7 @@
     }
     if (!inp) return;
     var nodeId = env.nodeId;
-    if (inp.kind === "choices") return renderChoices(inp, nodeId);
+    if (inp.kind === "choices") return inp.layout === "list" ? renderListPicker(inp, nodeId) : renderChoices(inp, nodeId);
     if (inp.kind === "carousel") return renderCarousel(inp, nodeId);
     if (inp.kind === "form") return renderForm(inp, nodeId);
     if (inp.kind === "rating") return renderRating(inp, nodeId);
@@ -483,6 +507,79 @@
     svg.setAttribute("viewBox", "0 0 24 24");
     var path = document.createElementNS(NS, "path");
     path.setAttribute("d", "M2.5 20.5 22 12 2.5 3.5 2.5 10.2 16 12 2.5 13.8z");
+    svg.appendChild(path);
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
+  // ----------------------------------------------------------- list picker
+  // A List is one button; tapping it opens a panel from the bottom of the
+  // chat with the options (like WhatsApp's list). Tapping an option sends it.
+  function closeSheet() {
+    if (state.sheet) { state.sheet.remove(); state.sheet = null; }
+  }
+
+  function renderListPicker(inp, nodeId) {
+    var row = inputRow(false);
+    var options = inp.options || [];
+    var title = inp.buttonText || "View options";
+    var btn = el("button", "zf-listbtn");
+    btn.type = "button";
+    btn.setAttribute("aria-haspopup", "dialog");
+    btn.appendChild(listIcon());
+    btn.appendChild(el("span", null, title));
+    btn.appendChild(el("span", "zf-chev", String.fromCharCode(0x203A)));
+    btn.onclick = function () { if (!state.busy) openSheet(title, options, btn, row, nodeId); };
+    row.appendChild(btn);
+    api.scrollToEnd(true);
+  }
+
+  function openSheet(title, options, btn, row, nodeId) {
+    closeSheet();
+    var panel = msgs.parentNode;
+    var bg = el("div", "zf-sheet-bg");
+    var sheet = el("div", "zf-sheet");
+    sheet.setAttribute("role", "dialog");
+    sheet.setAttribute("aria-label", title);
+    var hd = el("div", "zf-sheet-hd");
+    hd.appendChild(el("span", null, title));
+    var x = el("button", "zf-sheet-x", String.fromCharCode(0x00D7));
+    x.type = "button";
+    x.setAttribute("aria-label", "Close");
+    x.onclick = closeSheet;
+    hd.appendChild(x);
+    sheet.appendChild(hd);
+    var list = el("div", "zf-sheet-list");
+    options.forEach(function (o) {
+      var b = el("button", "zf-opt");
+      b.type = "button";
+      b.appendChild(el("span", null, o.label));
+      b.appendChild(el("span", "zf-radio"));
+      b.onclick = function () {
+        if (state.busy) return;
+        closeSheet();
+        choose(btn, row, o.label, { type: "choice", id: o.id }, nodeId);
+      };
+      list.appendChild(b);
+    });
+    sheet.appendChild(list);
+    bg.appendChild(sheet);
+    bg.addEventListener("click", function (e) { if (e.target === bg) closeSheet(); });
+    bg.addEventListener("keydown", function (e) { if (e.key === "Escape") closeSheet(); });
+    panel.appendChild(bg);
+    state.sheet = bg;
+    var first = list.querySelector("button");
+    if (first && finePointer()) first.focus();
+  }
+
+  function listIcon() {
+    var NS = "http://www.w3.org/2000/svg";
+    var wrap = el("span", "zf-ico");
+    wrap.setAttribute("aria-hidden", "true");
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    var path = document.createElementNS(NS, "path");
+    path.setAttribute("d", "M4 6.5h2v2H4zM8 6.5h12v2H8zM4 11h2v2H4zM8 11h12v2H8zM4 15.5h2v2H4zM8 15.5h12v2H8z");
     svg.appendChild(path);
     wrap.appendChild(svg);
     return wrap;
