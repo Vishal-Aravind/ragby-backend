@@ -410,7 +410,7 @@
       else if (inp.kind === "field") renderField(inp, nodeId);
     }
     // A way back wherever the visitor could otherwise be stuck: a typed
-    // question, a form, a rating, waiting for a person, a carousel of links.
+    // question, a form, a rating, a carousel, waiting for a person.
     if (env.menuChip && env.status !== "ai") {
       renderChipRow("Back to menu", function () {
         api.addMsg("user", api.render("Back to menu"));

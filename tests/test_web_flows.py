@@ -358,6 +358,8 @@ class WhatsAppParityTests(unittest.TestCase):
         env = eng.step(PID, env["sessionId"], VID, env["seq"], "r", {"type": "rating", "value": 4})
         self.assertEqual(env["input"]["kind"], "carousel")
         self.assertTrue(env["menuChip"])                                  # link-only carousel
+        eng2, _, _ = make([node("c", "carousel", {"cards": [{"title": "A", "buttons": [{"id": "c1", "label": "Choose"}]}]}, start=True)], [])
+        self.assertTrue(eng2.start(PID, None, VID, "open")["menuChip"])    # carousel with choices too
         eng, store, fx = make([dict(nodes[2], is_start=True)], [])
         self.assertTrue(eng.start(PID, None, VID, "open")["menuChip"])    # form
 

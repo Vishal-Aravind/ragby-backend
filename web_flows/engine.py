@@ -747,16 +747,11 @@ class Engine:
     def _menu_chip(self, sess, ctx):
         """Offer 'Back to menu' wherever the visitor could otherwise be stuck:
         AI mode, waiting for a person, a typed question, a form, a rating,
-        and a carousel whose cards only have links."""
+        and a carousel (a customer may like none of the cards)."""
         if sess.get("mode") in ("ai", "human"):
             return True
         aw = sess.get("awaiting") or {}
-        if aw.get("kind") in ("field", "form", "rating"):
-            return True
-        if aw.get("kind") == "carousel" and ctx:
-            node = ctx.nodes.get(aw.get("node_id"))
-            return bool(node) and not _options(node)
-        return False
+        return aw.get("kind") in ("field", "form", "rating", "carousel")
 
     def _resync(self, sess, saved=False):
         """The visitor's view is stale: return the current input, no effects."""
