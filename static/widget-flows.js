@@ -255,18 +255,20 @@
           return;
         }
         if (invalid) showError(env.error, null);
+        // Typed text while a carousel or a form is waiting (AI answer or a
+        // "please fill in" reminder): offer it again with one small chip
+        // instead of repeating the whole thing. Smaller choices are shown again.
+        var kind = env.input && env.input.kind;
+        var offerAgain = action && action.type === "text" && !invalid
+          && (kind === "carousel" || kind === "form") && env.nodeId === prevNode;
+        var showInput = function () {
+          if (offerAgain) renderChipRow(kind === "form" ? "Show form again" : "Show options again", function () { renderInput(env); });
+          else renderInput(env);
+        };
         if (env.delegate === "ai" && action && action.type === "text") {
-          return api.askBot(action.text).then(function () {
-            // A carousel is big: offer it again instead of repeating it
-            // under every answer. Smaller choices are simply shown again.
-            if (env.input && env.input.kind === "carousel") {
-              renderChipRow("Show options again", function () { renderInput(env); });
-            } else {
-              renderInput(env);
-            }
-          });
+          return api.askBot(action.text).then(showInput);
         }
-        renderInput(env);
+        showInput();
         if (env.continueAfterMs != null) scheduleContinue(env.continueAfterMs);
         if (env.status === "human") startPolling();
       });
@@ -408,7 +410,7 @@
       else if (inp.kind === "field") renderField(inp, nodeId);
     }
     // A way back wherever the visitor could otherwise be stuck: a typed
-    // question, a rating, waiting for a person, a carousel of only links.
+    // question, a form, a rating, waiting for a person, a carousel of links.
     if (env.menuChip && env.status !== "ai") {
       renderChipRow("Back to menu", function () {
         api.addMsg("user", api.render("Back to menu"));

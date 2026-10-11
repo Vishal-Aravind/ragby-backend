@@ -359,7 +359,7 @@ class WhatsAppParityTests(unittest.TestCase):
         self.assertEqual(env["input"]["kind"], "carousel")
         self.assertTrue(env["menuChip"])                                  # link-only carousel
         eng, store, fx = make([dict(nodes[2], is_start=True)], [])
-        self.assertFalse(eng.start(PID, None, VID, "open")["menuChip"])   # forms: by choice
+        self.assertTrue(eng.start(PID, None, VID, "open")["menuChip"])    # form
 
     def test_unanswered_handoff_is_released_after_30_minutes(self):
         nodes = [node("m", "quick_replies", {"body": "Menu", "options": [{"id": "o_h", "label": "Talk to us"}]}, start=True),
