@@ -346,6 +346,51 @@ class WhatsAppParityTests(unittest.TestCase):
         fx2.contact_vars = fx.contact_vars
         self.assertEqual(eng2.start(PID, None, VID, "open")["messages"][0]["text"], "Hi Mani!")
 
+    def test_no_dead_ends(self):
+        nodes = [
+            node("r", "rating", {"body": "Rate us"}, start=True),
+            node("k", "carousel", {"cards": [{"title": "A", "buttons": [{"label": "Site", "url": "https://x.test"}]}]}),
+            node("f", "form", {"fields": [{"name": "email", "type": "email", "label": "Email"}]}),
+        ]
+        eng, store, fx = make(nodes, [edge("r", "next", "k")])
+        env = eng.start(PID, None, VID, "open")
+        self.assertTrue(env["menuChip"])                                  # rating
+        env = eng.step(PID, env["sessionId"], VID, env["seq"], "r", {"type": "rating", "value": 4})
+        self.assertEqual(env["input"]["kind"], "carousel")
+        self.assertTrue(env["menuChip"])                                  # link-only carousel
+        eng, store, fx = make([dict(nodes[2], is_start=True)], [])
+        self.assertFalse(eng.start(PID, None, VID, "open")["menuChip"])   # forms: by choice
+
+    def test_unanswered_handoff_is_released_after_30_minutes(self):
+        nodes = [node("m", "quick_replies", {"body": "Menu", "options": [{"id": "o_h", "label": "Talk to us"}]}, start=True),
+                 node("h", "talk_to_human", {"body": "Connecting..."})]
+        edges = [edge("m", "o_h", "h")]
+        for free, expect in ((True, "ai"), (False, "ai")):
+            eng, store, fx = make(nodes, edges, free)
+            env = eng.start(PID, None, VID, "open")
+            env = eng.step(PID, env["sessionId"], VID, env["seq"], "m", {"type": "choice", "id": "o_h"})
+            self.assertEqual(env["status"], "human")
+            self.assertTrue(env["menuChip"])                              # way out while waiting
+            sid = env["sessionId"]
+            fx.clock += timedelta(minutes=10)
+            store.sessions[sid]["updated_at"] = fx.clock.isoformat()
+            env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "hello?"})
+            self.assertEqual(env["status"], "human")                      # still waiting at 10 min
+            fx.clock += timedelta(minutes=25)
+            store.sessions[sid]["updated_at"] = fx.clock.isoformat()
+            env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "anyone?"})
+            self.assertEqual(env["status"], expect)                       # released at 35 min
+        # a recent team reply keeps it with the person
+        eng, store, fx = make(nodes, edges, True)
+        env = eng.start(PID, None, VID, "open")
+        env = eng.step(PID, env["sessionId"], VID, env["seq"], "m", {"type": "choice", "id": "o_h"})
+        sid = env["sessionId"]
+        fx.clock += timedelta(minutes=40)
+        store.sessions[sid].update(updated_at=fx.clock.isoformat(),
+                                   last_agent_msg_at=(fx.clock - timedelta(minutes=5)).isoformat())
+        env = eng.step(PID, sid, VID, store.sessions[sid]["seq"], None, {"type": "text", "text": "ok"})
+        self.assertEqual(env["status"], "human")
+
     def test_recent_team_reply_is_not_idle(self):
         eng, store, fx = self.flow()
         env = self.to_ai(eng)

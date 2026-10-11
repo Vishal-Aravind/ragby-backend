@@ -398,7 +398,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         pass
 
     elif t in ("handoff", "talk_to_human"):
-        send_whatsapp_message(to, c.get("body", "Connecting you to our team. Please wait..."), phone_number_id, token)
+        send_handoff_message(to, c.get("body") or "Connecting you to our team. Please wait...", phone_number_id, token)
 
     elif t == "call_us":
         phone = c.get("phone", "").replace(" ", "")
@@ -491,6 +491,17 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
                 "mode": "shop_browsing",
                 "metadata": {"catalog_id": catalog_id},
             })
+
+
+def send_handoff_message(to: str, text: str, phone_number_id: str, token: str):
+    """'Connecting you to our team' with a way out: if nobody replies, the
+    customer isn't stuck (their messages are not answered while a person
+    is on the chat)."""
+    send_whatsapp_buttons(
+        to, (text or "Connecting you to our team. Please wait...")[:1024],
+        [{"id": RESERVED_BACK, "title": "↩ Back to Menu"}],
+        phone_number_id, token
+    )
 
 
 def send_back_to_menu_button(to: str, text: str, phone_number_id: str, token: str):
@@ -646,10 +657,10 @@ def _enter_node(flow_id, next_node, project_id, phone_number, phone_number_id, t
     })
 
     if next_node["type"] in ("handoff", "talk_to_human"):
-        msg = next_node["content"].get("body", "Connecting you to our team...")
+        msg = next_node["content"].get("body") or "Connecting you to our team..."
         if "{{" in (msg or ""):
             msg = render_text(msg, flow_vars(project_id, phone_number))
-        send_whatsapp_message(phone_number, msg, phone_number_id, token)
+        send_handoff_message(phone_number, msg, phone_number_id, token)
         if chat_id:
             save_message(chat_id, "assistant", msg)
     elif next_node["type"] == "back_to_menu":
@@ -855,7 +866,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             "mode": "human",
         })
         msg = "Connecting you to our team. Please wait..."
-        send_whatsapp_message(phone_number, msg, phone_number_id, token)
+        send_handoff_message(phone_number, msg, phone_number_id, token)
         if chat_id:
             save_message(chat_id, "assistant", msg)
         return

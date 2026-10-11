@@ -39,6 +39,7 @@ MAX_CARDS = 10
 MAX_CARD_BUTTONS = 3
 MAX_FORM_FIELDS = 10
 IDLE_RESTART_HOURS = 2       # like WhatsApp: quiet this long -> next message opens the menu
+HUMAN_RELEASE_MINUTES = 30   # Talk to Human with no team reply this long -> the bot answers again
 INLINE_DELAY_MAX_S = 10      # up to this: a typing pause, no round trip
 MAX_DELAY_S = 600            # web delays are capped at 10 minutes
 
@@ -326,6 +327,14 @@ class Engine:
         mode = sess.get("mode")
         free = bool(ctx.flow.get("free_questions"))
 
+        if mode == "human" and self._handoff_unanswered(sess):
+            # Nobody from the team replied: don't leave the visitor talking
+            # to no one. Like plain website chats, the AI answers again (with
+            # Back to menu) - even with AI answers off, since a restart could
+            # lead straight back to the same unanswered handoff.
+            ctx.events.append(("human_release", None, {}))
+            sess["mode"], sess["awaiting"] = "ai", None
+            mode = sess["mode"]
         if mode == "human":
             ctx.transcript.append({"role": "user", "content": text})
             self.store.save_session(sess)
@@ -401,6 +410,24 @@ class Engine:
             latest = when if latest is None or when > latest else latest
         return latest is not None and self.fx.now() - latest > timedelta(hours=IDLE_RESTART_HOURS)
 
+    def _handoff_unanswered(self, sess):
+        """True when the chat was handed to a person HUMAN_RELEASE_MINUTES ago
+        (or the team's last reply was that long ago) and nobody has replied
+        since. No known start time -> never released automatically."""
+        aw = sess.get("awaiting") or {}
+        latest = None
+        for value in (aw.get("since") if aw.get("kind") == "human" else None, sess.get("last_agent_msg_at")):
+            if not value:
+                continue
+            try:
+                when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            latest = when if latest is None or when > latest else latest
+        return latest is not None and self.fx.now() - latest > timedelta(minutes=HUMAN_RELEASE_MINUTES)
+
     def _restart(self, sess, ctx):
         sess.update({"flow_id": ctx.flow["id"], "mode": "flow", "awaiting": None,
                      "current_node_id": None, "resume_at": None})
@@ -464,7 +491,8 @@ class Engine:
                 return
             if t in ("talk_to_human", "handoff"):
                 self._say(ctx, render_text(c.get("body") or "Connecting you to our team. Please wait...", variables))
-                sess.update({"mode": "human", "awaiting": None})
+                # "since" lets an unanswered handoff hand the chat back.
+                sess.update({"mode": "human", "awaiting": {"kind": "human", "since": self.fx.now().isoformat()}})
                 return
             if t == "end":
                 if c.get("body"):
@@ -713,8 +741,22 @@ class Engine:
             "nodeId": aw.get("node_id"), "messages": ctx.messages if ctx else [],
             "input": input, "continueAfterMs": ctx.continue_after_ms if ctx else None,
             "delegate": delegate, "error": ctx.error if ctx else None,
-            "menuChip": sess.get("mode") == "ai" or (aw.get("kind") == "field"),
+            "menuChip": self._menu_chip(sess, ctx),
         }
+
+    def _menu_chip(self, sess, ctx):
+        """Offer 'Back to menu' wherever the visitor could otherwise be stuck:
+        AI mode, waiting for a person, a typed question, a rating, and a
+        carousel whose cards only have links. (Forms: by choice, no chip.)"""
+        if sess.get("mode") in ("ai", "human"):
+            return True
+        aw = sess.get("awaiting") or {}
+        if aw.get("kind") in ("field", "rating"):
+            return True
+        if aw.get("kind") == "carousel" and ctx:
+            node = ctx.nodes.get(aw.get("node_id"))
+            return bool(node) and not _options(node)
+        return False
 
     def _resync(self, sess, saved=False):
         """The visitor's view is stale: return the current input, no effects."""

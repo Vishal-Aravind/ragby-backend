@@ -399,22 +399,21 @@
     if (env.menuChip && env.status === "ai") {
       inp = { kind: "choices", layout: "chips", options: [{ id: "__menu", label: "Back to menu" }], menu: true };
     }
-    if (!inp) return;
     var nodeId = env.nodeId;
-    if (inp.kind === "choices") return inp.layout === "list" ? renderListPicker(inp, nodeId) : renderChoices(inp, nodeId);
-    if (inp.kind === "carousel") return renderCarousel(inp, nodeId);
-    if (inp.kind === "form") return renderForm(inp, nodeId);
-    if (inp.kind === "rating") return renderRating(inp, nodeId);
-    if (inp.kind === "field") {
-      renderField(inp, nodeId);
-      // A typed answer is expected; this is the way out without typing.
-      if (env.menuChip) {
-        renderChipRow("Back to menu", function () {
-          api.addMsg("user", api.render("Back to menu"));
-          step({ type: "menu" }, null);
-        });
-      }
-      return;
+    if (inp) {
+      if (inp.kind === "choices") inp.layout === "list" ? renderListPicker(inp, nodeId) : renderChoices(inp, nodeId);
+      else if (inp.kind === "carousel") renderCarousel(inp, nodeId);
+      else if (inp.kind === "form") renderForm(inp, nodeId);
+      else if (inp.kind === "rating") renderRating(inp, nodeId);
+      else if (inp.kind === "field") renderField(inp, nodeId);
+    }
+    // A way back wherever the visitor could otherwise be stuck: a typed
+    // question, a rating, waiting for a person, a carousel of only links.
+    if (env.menuChip && env.status !== "ai") {
+      renderChipRow("Back to menu", function () {
+        api.addMsg("user", api.render("Back to menu"));
+        step({ type: "menu" }, null);
+      });
     }
   }
 
