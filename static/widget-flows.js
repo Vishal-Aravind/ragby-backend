@@ -233,7 +233,15 @@
         }
         if (invalid) showError(env.error, null);
         if (env.delegate === "ai" && action && action.type === "text") {
-          return api.askBot(action.text).then(function () { renderInput(env); });
+          return api.askBot(action.text).then(function () {
+            // A carousel is big: offer it again instead of repeating it
+            // under every answer. Smaller choices are simply shown again.
+            if (env.input && env.input.kind === "carousel") {
+              renderChipRow("Show options again", function () { renderInput(env); });
+            } else {
+              renderInput(env);
+            }
+          });
         }
         renderInput(env);
         if (env.continueAfterMs != null) scheduleContinue(env.continueAfterMs);
@@ -376,20 +384,26 @@
     if (inp.kind === "field") {
       renderField(inp, nodeId);
       // A typed answer is expected; this is the way out without typing.
-      if (env.menuChip) renderMenuChip();
+      if (env.menuChip) {
+        renderChipRow("Back to menu", function () {
+          api.addMsg("user", api.render("Back to menu"));
+          step({ type: "menu" }, null);
+        });
+      }
       return;
     }
   }
 
-  function renderMenuChip() {
+  // One small chip below the conversation (removed by the next action).
+  function renderChipRow(label, onTap) {
+    if (state.menuRow) state.menuRow.remove();
     var row = el("div", "zf-row");
-    var b = el("button", "zf-chip", "Back to menu");
+    var b = el("button", "zf-chip", label);
     b.type = "button";
     b.onclick = function () {
       if (state.busy) return;
       b.disabled = true;
-      api.addMsg("user", api.render("Back to menu"));
-      step({ type: "menu" }, null);
+      onTap();
     };
     row.appendChild(b);
     msgs.appendChild(row);
