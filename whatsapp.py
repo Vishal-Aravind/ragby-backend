@@ -486,6 +486,28 @@ def _token_for(row: Optional[dict]) -> str:
     return ((row or {}).get("access_token")) or WHATSAPP_TOKEN
 
 
+def send_typing_indicator(message_id: str, phone_number_id: str, token: str):
+    """Show the customer the "typing..." dots while their reply is prepared.
+    WhatsApp only allows it together with marking their message read (blue
+    ticks). The dots clear when the reply arrives, or after 25 seconds.
+    Sent before the reply (not in a thread) so it can never arrive after it.
+    Best effort: a failure here must never stop the reply."""
+    if not message_id or not phone_number_id or not token:
+        return
+    try:
+        res = http.post(
+            f"https://graph.facebook.com/v25.0/{phone_number_id}/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"messaging_product": "whatsapp", "status": "read", "message_id": message_id,
+                  "typing_indicator": {"type": "text"}},
+            timeout=4,
+        )
+        if not res.ok:
+            print(f"WhatsApp typing indicator error: {res.text}")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
+
 def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None, preview_url: bool = False):
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
@@ -781,6 +803,8 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
             return {"status": "ignored"}
 
         session = get_session(project_id, from_number)
+        # A tap always gets an answer: show the typing dots meanwhile.
+        send_typing_indicator(wa_message_id, phone_number_id, token)
         if session:
             handle_interactive(session, trigger, from_number, phone_number_id, token, project_id, chat_id)
         else:
@@ -796,6 +820,10 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
     if msg_type == "text":
         text = message["text"]["body"].strip()
         session = get_session(project_id, from_number)
+        # Typing dots while the bot prepares its reply - but not while a
+        # person from the team is handling the chat (the bot stays quiet).
+        if not (session and session.get("mode") == "human"):
+            send_typing_indicator(wa_message_id, phone_number_id, token)
         handle_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
         return {"status": "ok"}
 
