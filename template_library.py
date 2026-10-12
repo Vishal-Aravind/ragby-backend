@@ -302,7 +302,7 @@ def sync_templates_from_meta(project_id: str, user=Depends(verify_token)):
     res = http.get(
         f"https://graph.facebook.com/v25.0/{waba_id}/message_templates",
         headers={"Authorization": f"Bearer {wa['token']}"},
-        params={"fields": "name,status,category,language,components", "limit": 100},
+        params={"fields": "id,name,status,category,language,components,rejected_reason", "limit": 100},
     )
 
     if not res.ok:

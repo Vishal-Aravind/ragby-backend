@@ -267,6 +267,10 @@ class CampaignRequest(BaseModel):
     template_name: str = Field(max_length=512)
     template_language: str = Field(default="en_US", max_length=16)
     variables: List[str] = Field(default_factory=list, max_length=10)
+    # For templates with a header: the image shown on top (image header) or
+    # the value of the header's {{1}} (text header).
+    header_image_url: Optional[str] = Field(default=None, max_length=1000)
+    header_text: Optional[str] = Field(default=None, max_length=60)
     recipient_filter: str = Field(default="all", max_length=20)
     tag_filter: Optional[str] = Field(default=None, max_length=40)
     csv_contacts: Optional[list] = None
@@ -292,19 +296,59 @@ def _validate_common(req: CampaignRequest):
             raise HTTPException(status_code=400, detail="One of the template values is too long.")
 
 
-def _assert_template_approved(waba_id: str, token: str, template_name: str, language: str):
+def _assert_template_approved(waba_id: str, token: str, template_name: str, language: str) -> dict:
     """get_templates carefully filters to APPROVED for display, then create
     accepted any string. A stale or misspelled name means every single
     message fails — and bulk failures are exactly what damages a WABA's
     quality rating, which is the outcome the merchant most needs protecting
     from. Checked once here instead of discovered a thousand times."""
     approved = _fetch_approved_templates(waba_id, token)
-    names = {t.get("name") for t in approved}
-    if template_name not in names:
+    matches = [t for t in approved if t.get("name") == template_name]
+    if not matches:
         raise HTTPException(
             status_code=400,
             detail="That template isn't approved on your WhatsApp account. Pick one from the list.",
         )
+    return next((t for t in matches if t.get("language") == language), matches[0])
+
+
+_VAR_RE = re.compile(r"\{\{\s*(\d+)\s*\}\}")
+
+
+def _template_header(template: dict, req) -> Optional[dict]:
+    """What this template needs besides body values, checked before a single
+    message goes out (a missing header image fails every send). Returns the
+    header to send with each message, or None."""
+    comps = template.get("components") or []
+    header = next((c for c in comps if c.get("type") == "HEADER"), None)
+    body = next((c for c in comps if c.get("type") == "BODY"), None) or {}
+    buttons = next((c for c in comps if c.get("type") == "BUTTONS"), None) or {}
+
+    for b in buttons.get("buttons") or []:
+        if b.get("type") == "URL" and "{{" in str(b.get("url") or ""):
+            raise HTTPException(status_code=400, detail="This template has a link button with a variable, which campaigns can't fill yet. Pick another template.")
+
+    needed = len(set(_VAR_RE.findall(body.get("text") or "")))
+    values = [str(v).strip() for v in (req.variables or [])]
+    if needed and (len(values) < needed or not all(values[:needed])):
+        raise HTTPException(status_code=400, detail="Fill in a value for every variable in the message.")
+
+    if not header:
+        return None
+    fmt = header.get("format")
+    if fmt == "IMAGE":
+        url = (req.header_image_url or "").strip()
+        if not url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="This template has an image on top - upload the image to send.")
+        return {"image": url}
+    if fmt == "TEXT":
+        if _VAR_RE.search(header.get("text") or ""):
+            text = (req.header_text or "").strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="Fill in the header value for this template.")
+            return {"text": text}
+        return None
+    raise HTTPException(status_code=400, detail="Templates with a video, document or location header can't be sent from campaigns yet. Pick another template.")
 
 
 def _is_duplicate_error(e: Exception) -> bool:
@@ -338,8 +382,10 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
     wa = _wa_integration(req.project_id)
     if not wa["phone_number_id"]:
         raise HTTPException(status_code=400, detail="WhatsApp not connected")
+    header = None
     if wa["waba_id"]:
-        _assert_template_approved(wa["waba_id"], wa["token"], req.template_name, req.template_language)
+        template = _assert_template_approved(wa["waba_id"], wa["token"], req.template_name, req.template_language)
+        header = _template_header(template, req)
 
     scheduled_dt_iso, is_future, recurrence = _parse_and_validate_schedule(
         req.scheduled_at, req.recurrence, req.recipient_filter
@@ -349,7 +395,7 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
         "project_id": req.project_id,
         "name": req.name.strip(),
         "template_name": req.template_name,
-        "template_variables": {"variables": req.variables, "language": req.template_language},
+        "template_variables": {"variables": req.variables, "language": req.template_language, "header": header},
         "status": "scheduled" if is_future else "sending",
         "recipient_filter": req.recipient_filter,
         "tag_filter": req.tag_filter,
@@ -397,7 +443,7 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
     background_tasks.add_task(
         send_campaign_messages,
         campaign_id, contacts, req.template_name, req.template_language,
-        req.variables, wa["phone_number_id"], wa["token"],
+        req.variables, wa["phone_number_id"], wa["token"], header,
     )
 
     return {"id": campaign_id, "total": len(contacts), "status": "sending"}
@@ -429,8 +475,10 @@ def update_campaign(campaign_id: str, req: CampaignRequest, user=Depends(verify_
     _enforce_recipient_cap(contacts)
 
     wa = _wa_integration(project_id)
+    header = None
     if wa["waba_id"]:
-        _assert_template_approved(wa["waba_id"], wa["token"], req.template_name, req.template_language)
+        template = _assert_template_approved(wa["waba_id"], wa["token"], req.template_name, req.template_language)
+        header = _template_header(template, req)
 
     # Conditional on the status STILL being scheduled. Read-then-write was a
     # race with dispatch_scheduled_campaigns: it could flip the campaign to
@@ -439,7 +487,7 @@ def update_campaign(campaign_id: str, req: CampaignRequest, user=Depends(verify_
     res = supabase.table("campaigns").update({
         "name": req.name.strip(),
         "template_name": req.template_name,
-        "template_variables": {"variables": req.variables, "language": req.template_language},
+        "template_variables": {"variables": req.variables, "language": req.template_language, "header": header},
         "recipient_filter": req.recipient_filter,
         "tag_filter": req.tag_filter,
         "scheduled_at": scheduled_dt_iso,
@@ -476,7 +524,7 @@ def _campaign_still_sending(campaign_id) -> bool:
 
 def send_campaign_messages(
     campaign_id, contacts, template_name, template_lang,
-    variables, phone_number_id, token=None
+    variables, phone_number_id, token=None, header=None
 ):
     """Send template messages to all contacts.
 
@@ -501,6 +549,10 @@ def send_campaign_messages(
 
     # Built once — it's identical for every recipient.
     components = []
+    if header and header.get("image"):
+        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header["image"]}}]})
+    elif header and header.get("text"):
+        components.append({"type": "header", "parameters": [{"type": "text", "text": str(header["text"])}]})
     if variables:
         components.append({
             "type": "body",
@@ -683,7 +735,7 @@ def dispatch_scheduled_campaigns():
                 # for the whole campaign.
                 completed = send_campaign_messages(
                     camp["id"], contacts, camp["template_name"], template_lang,
-                    variables, phone_number_id, wa_token,
+                    variables, phone_number_id, wa_token, tv.get("header"),
                 )
 
                 recurrence = camp.get("recurrence")
