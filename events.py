@@ -228,7 +228,26 @@ def list_registrations(event_id: str, user=Depends(verify_token)):
         .eq("event_id", event_id) \
         .order("created_at", desc=True) \
         .execute()
-    return res.data or []
+    regs = res.data or []
+
+    # The answers to the page's extra questions (company, budget, visit
+    # time...) live in form_submissions; attach them by phone so the
+    # merchant can see them next to each registration.
+    try:
+        subs = supabase.table("form_submissions").select("data, created_at") \
+            .eq("entity_type", "event").eq("entity_id", event_id) \
+            .order("created_at", desc=True).limit(5000).execute().data or []
+        by_phone = {}
+        for sub in subs:
+            data = sub.get("data") or {}
+            phone = _valid_phone(data.get("phone")) if isinstance(data, dict) else None
+            if phone and phone not in by_phone:
+                by_phone[phone] = {k: v for k, v in data.items() if k not in ("name", "phone", "email")}
+        for r in regs:
+            r["answers"] = by_phone.get(r.get("phone")) or {}
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+    return regs
 
 
 @router.put("/events/registrations/{registration_id}")
