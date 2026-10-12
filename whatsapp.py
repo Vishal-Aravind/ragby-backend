@@ -782,6 +782,8 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
                 from chat import save_message
                 if msg_type == "text":
                     save_message(chat_id, "user", message["text"]["body"].strip())
+                elif msg_type == "button" and (message.get("button") or {}).get("text"):
+                    save_message(chat_id, "user", str(message["button"]["text"]).strip()[:200])
             except Exception as e:
                 sentry_sdk.capture_exception(e)
             return {"status": "suppressed_human_active"}
@@ -814,6 +816,31 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
             flow = get_active_flow(project_id)
             if flow:
                 start_flow(flow, project_id, from_number, phone_number_id, token, chat_id)
+        return {"status": "ok"}
+
+    # ── Template quick-reply tap ──────────────────────
+    # A tap on a quick-reply button of a TEMPLATE message (campaigns,
+    # reminders) arrives as type "button", not "interactive". It used to be
+    # ignored completely - no reply, not even saved. Treated as if the
+    # customer had typed the button's text; "Back to menu"/"Menu" opens the
+    # flow's start menu.
+    if msg_type == "button":
+        text = str((message.get("button") or {}).get("text") or "").strip()[:200]
+        if not text:
+            return {"status": "ignored"}
+        session = get_session(project_id, from_number)
+        human = bool(session and session.get("mode") == "human")
+        if not human:
+            send_typing_indicator(wa_message_id, phone_number_id, token)
+            if re.sub(r"[^a-z ]", "", text.lower()).strip() in ("back to menu", "menu", "main menu"):
+                from flows import get_active_flow, start_flow
+                flow = get_active_flow(project_id)
+                if flow:
+                    from chat import save_message
+                    save_message(chat_id, "user", text)
+                    start_flow(flow, project_id, from_number, phone_number_id, token, chat_id)
+                    return {"status": "ok"}
+        handle_text(session, text, project_id, chat_id, from_number, phone_number_id, token)
         return {"status": "ok"}
 
     # ── Text message ──────────────────────────────────
