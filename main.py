@@ -256,6 +256,20 @@ def run_whatsapp_sync_monitor():
         _record_job_run("whatsapp_sync_monitor", started_at, "failure", {"error": str(e)})
 
 
+def run_storage_cleanup():
+    """Daily: delete uploaded media nobody has used for 7 days (storage_cleanup.py)."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
+    try:
+        from storage_cleanup import run_storage_cleanup as _run
+        detail = _run()
+        _record_job_run("storage_cleanup", started_at, "success", detail)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Scheduler: storage cleanup error: {e}")
+        _record_job_run("storage_cleanup", started_at, "failure", {"error": str(e)[:300]})
+
+
 def run_web_flow_prune():
     """Daily: drop finished website-flow sessions and analytics older than 90 days."""
     from web_flows.store import prune_expired
@@ -274,6 +288,7 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_release_expired_holds, 'interval', minutes=2, id='appointment_hold_release')
         scheduler.add_job(run_whatsapp_sync_monitor, 'interval', minutes=30, id='whatsapp_sync_monitor')
         scheduler.add_job(run_web_flow_prune, 'interval', hours=24, id='web_flow_prune')
+        scheduler.add_job(run_storage_cleanup, 'interval', hours=24, id='storage_cleanup')
         scheduler.start()
         print("Schedulers started — appointment reminders hourly, campaign dispatch every 30s, Shopify reconciliation every 6h, appointment hold release every 2m, WhatsApp sync monitor every 30m")
     except Exception as e:
