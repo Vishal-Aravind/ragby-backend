@@ -108,6 +108,46 @@ TEMPLATE_LIBRARY = [
         "language": "en_US",
     },
     {
+        "id": "appointment_confirmed",
+        "category": "UTILITY",
+        "industry": "Healthcare / Services",
+        "name": "appointment_confirmed",
+        "display_name": "Appointment Confirmed",
+        "description": "Confirms a booking made on your booking page, with Reschedule / Cancel buttons",
+        "preview": "Hi {Name}! Your {Service} is confirmed for {Date} at {Time}. Booking ID: {Booking ID}. Tap below if you need to change it.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}! Your {{2}} is confirmed for {{3}} at {{4}}. Booking ID: {{5}}. Tap below if you need to change it.",
+            },
+            {
+                "type": "BUTTONS",
+                "buttons": [{"type": "QUICK_REPLY", "text": "Reschedule"}, {"type": "QUICK_REPLY", "text": "Cancel"}],
+            },
+        ],
+        "example_body": ["Asha", "Consultation", "14 November 2026", "10:30 AM", "A1B2C3D4"],
+        "variables": ["Customer name", "Service", "Date", "Time", "Booking ID"],
+        "language": "en_US",
+    },
+    {
+        "id": "appointment_cancelled",
+        "category": "UTILITY",
+        "industry": "Healthcare / Services",
+        "name": "appointment_cancelled",
+        "display_name": "Appointment Cancelled",
+        "description": "Tells the customer their appointment was cancelled",
+        "preview": "Hi {Name}, your {Service} on {Date} at {Time} has been cancelled. Message us any time to book a new slot.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}, your {{2}} on {{3}} at {{4}} has been cancelled. Message us any time to book a new slot.",
+            }
+        ],
+        "example_body": ["Asha", "Consultation", "14 November 2026", "10:30 AM"],
+        "variables": ["Customer name", "Service", "Date", "Time"],
+        "language": "en_US",
+    },
+    {
         "id": "event_registration",
         "category": "UTILITY",
         "industry": "All businesses",

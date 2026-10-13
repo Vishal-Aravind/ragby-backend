@@ -925,16 +925,24 @@ def create_appointment(
                 msg += f"👤 Name: {customer_name}\n\n"
                 msg += f"Booking ID: #{appointment['id'][:8].upper()}"
 
-                send_whatsapp_buttons(
-                    to=phone,
-                    body=msg,
-                    buttons=[
-                        {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
-                        {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
-                    ],
-                    phone_number_id=phone_number_id,
-                    token=token,
-                )
+                # Template first (reaches website bookers too); its Reschedule
+                # / Cancel buttons carry the same ids as the buttons below.
+                if not _send_appt_template(
+                    "appointment_confirmed", phone,
+                    [customer_name, service, date_formatted, start_time, appointment["id"][:8].upper()],
+                    phone_number_id, token,
+                    button_payloads=[f"reschedule_{appointment['id']}", f"cancel_appt_{appointment['id']}"],
+                ):
+                    send_whatsapp_buttons(
+                        to=phone,
+                        body=msg,
+                        buttons=[
+                            {"id": f"reschedule_{appointment['id']}", "title": "Reschedule 🔄"},
+                            {"id": f"cancel_appt_{appointment['id']}", "title": "Cancel ❌"},
+                        ],
+                        phone_number_id=phone_number_id,
+                        token=token,
+                    )
 
                 # Non-blocking payment request, sent as its own message —
                 # WhatsApp interactive messages can't mix quick-reply
@@ -1140,12 +1148,19 @@ def cancel_appointment(appointment_id: str, notify_customer: bool = True) -> dic
             wa_data = (wa_res.data if wa_res else None)
             if wa_data:
                 from whatsapp import send_whatsapp_message
-                send_whatsapp_message(
-                    to=appt["customer_phone"],
-                    text=f"❌ *Appointment Cancelled*\n\nYour {appt['service_name']} on {appt['appointment_date']} at {appt['start_time']} has been cancelled.\n\nReply *book* to schedule a new appointment.",
-                    phone_number_id=wa_data["phone_number_id"],
-                    token=wa_data.get("access_token") or WHATSAPP_TOKEN,
-                )
+                pid = wa_data["phone_number_id"]
+                tok = wa_data.get("access_token") or WHATSAPP_TOKEN
+                if not _send_appt_template(
+                    "appointment_cancelled", appt["customer_phone"],
+                    [appt.get("customer_name") or "there", appt["service_name"], appt["appointment_date"], appt["start_time"]],
+                    pid, tok,
+                ):
+                    send_whatsapp_message(
+                        to=appt["customer_phone"],
+                        text=f"❌ *Appointment Cancelled*\n\nYour {appt['service_name']} on {appt['appointment_date']} at {appt['start_time']} has been cancelled.\n\nReply *book* to schedule a new appointment.",
+                        phone_number_id=pid,
+                        token=tok,
+                    )
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"Cancel notification error: {e}")
@@ -1185,6 +1200,32 @@ def update_appointment(appointment_id: str, body: AppointmentStatusUpdate, user=
 # send_reminders_job's logic, and served no legitimate purpose. Removed
 # rather than patched, per the security audit.
 # -------------------------------------------------
+def _send_appt_template(name: str, to: str, params: list, phone_number_id: str, token: str,
+                        button_payloads: list = None) -> bool:
+    """Send an appointment template (Templates > library). False when it
+    isn't in the account or WhatsApp refuses it - the caller then sends the
+    old free-form message, which only arrives inside WhatsApp's 24-hour
+    window (i.e. for people who messaged the business recently). Website
+    bookers have no such window, so without the template they got nothing."""
+    components = [{"type": "body", "parameters": [{"type": "text", "text": str(p or "-")[:200]} for p in params]}]
+    for i, payload in enumerate(button_payloads or []):
+        components.append({"type": "button", "sub_type": "quick_reply", "index": str(i),
+                           "parameters": [{"type": "payload", "payload": payload}]})
+    try:
+        res = http.post(
+            f"https://graph.facebook.com/v25.0/{phone_number_id}/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"messaging_product": "whatsapp", "to": to, "type": "template",
+                  "template": {"name": name, "language": {"code": "en_US"}, "components": components}},
+        )
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return False
+    if not res.ok:
+        print(f"Appointment template {name} not sent ({res.status_code}); falling back")
+    return res.ok
+
+
 def _send_reminder_template(to: str, customer_name: str, date: str, time: str, phone_number_id: str, token: str) -> bool:
     """
     Send appointment_reminder template message.

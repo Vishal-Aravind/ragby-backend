@@ -826,6 +826,14 @@ def _process_single_message(value, message, project_id, phone_number_id, token):
     # flow's start menu.
     if msg_type == "button":
         text = str((message.get("button") or {}).get("text") or "").strip()[:200]
+        payload = str((message.get("button") or {}).get("payload") or "")
+        # A template button that carries an action (appointment Reschedule /
+        # Cancel) works exactly like the same button on a normal message.
+        if payload.startswith(("reschedule_", "cancel_appt_")):
+            send_typing_indicator(wa_message_id, phone_number_id, token)
+            handle_interactive(get_session(project_id, from_number) or {}, payload,
+                               from_number, phone_number_id, token, project_id, chat_id)
+            return {"status": "ok"}
         if not text:
             return {"status": "ignored"}
         session = get_session(project_id, from_number)
