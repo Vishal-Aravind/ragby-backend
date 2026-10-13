@@ -434,6 +434,35 @@ def get_registrations_for_phone(
     return result
 
 
+REGISTRATION_TEMPLATE = "event_registration"   # Templates > library > "Event Registration Confirmed"
+
+
+def _send_registration_template(to, name, title, when, booking_id, phone_number_id, token) -> bool:
+    """The registration confirmation as the approved template. False when
+    the template isn't in the account or WhatsApp refuses it (the caller
+    then falls back to plain text)."""
+    from whatsapp import http
+    params = [str(v or "-")[:200] for v in (name, title, when, booking_id)]
+    try:
+        res = http.post(
+            f"https://graph.facebook.com/v25.0/{phone_number_id}/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "messaging_product": "whatsapp", "to": to, "type": "template",
+                "template": {
+                    "name": REGISTRATION_TEMPLATE, "language": {"code": "en_US"},
+                    "components": [{"type": "body", "parameters": [{"type": "text", "text": p} for p in params]}],
+                },
+            },
+        )
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return False
+    if not res.ok:
+        print(f"Registration template not sent ({res.status_code}); falling back to text")
+    return res.ok
+
+
 def register_for_event_core(event_id: str, data: dict) -> dict:
     """Core registration logic — shared by the public route and the
     in-chat tool. Re-validates is_active, registration_deadline, capacity,
@@ -583,9 +612,20 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
             if event.get("location"):
                 msg += f"📍 {event['location']}\n"
             msg += f"\n👤 {name}\n"
-            msg += f"\nBooking ID: #{registration['id'][:8].upper()}\n\nSee you there!"
+            booking_id = registration['id'][:8].upper()
+            msg += f"\nBooking ID: #{booking_id}\n\nSee you there!"
 
-            send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
+            # WhatsApp only delivers plain text to someone who messaged the
+            # business in the last 24 hours - true for people registering
+            # from a WhatsApp flow, never for people coming from the website
+            # link (their text was silently dropped). An approved template
+            # is delivered either way, so it goes first; the text is the
+            # fallback when the template isn't in the account (yet).
+            when = date_str or "the event date"
+            if date_str and event.get("event_time"):
+                when += f", {event['event_time']}"
+            if not _send_registration_template(phone, name, event["title"], when, booking_id, phone_number_id, token):
+                send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Event registration WhatsApp confirmation error: {e}")

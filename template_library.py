@@ -108,6 +108,24 @@ TEMPLATE_LIBRARY = [
         "language": "en_US",
     },
     {
+        "id": "event_registration",
+        "category": "UTILITY",
+        "industry": "All businesses",
+        "name": "event_registration",
+        "display_name": "Event Registration Confirmed",
+        "description": "Confirms a registration made on your event page (Registrations)",
+        "preview": "Hi {Name}! You're registered for {Event} on {Date}. Your booking ID is {Booking ID}. See you there!",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}! You're registered for {{2}} on {{3}}. Your booking ID is {{4}}. See you there!",
+            }
+        ],
+        "example_body": ["Asha", "Business Summit 2026", "14 November 2026, 10 AM", "A1B2C3D4"],
+        "variables": ["Customer name", "Event name", "Date and time", "Booking ID"],
+        "language": "en_US",
+    },
+    {
         "id": "welcome_message",
         "category": "MARKETING",
         "industry": "All businesses",
