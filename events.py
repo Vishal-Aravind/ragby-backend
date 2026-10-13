@@ -112,6 +112,7 @@ class EventUpdate(BaseModel):
     page_json: Optional[list] = None
     form_schema: Optional[list] = None
     bot_can_register: Optional[bool] = None
+    send_wa_confirmation: Optional[bool] = None
 
 class RegistrationCreate(BaseModel):
     event_id: str
@@ -144,7 +145,7 @@ def list_events(project_id: str, user=Depends(verify_token)):
             "id, project_id, title, description, banner_url, event_date, "
             "event_time, location, capacity, registration_deadline, "
             "contact_phone, accent_color, page_json, form_schema, "
-            "is_active, bot_can_register, created_at"
+            "is_active, bot_can_register, send_wa_confirmation, created_at"
         ) \
         .eq("project_id", project_id) \
         .order("created_at", desc=True) \
@@ -480,7 +481,7 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
     # Scoped rather than select("*"): this is the unauthenticated
     # registration path, and these are the only fields it reads.
     event_res = supabase.table("events") \
-        .select("id, project_id, title, is_active, capacity, registration_deadline, event_date, event_time, location") \
+        .select("id, project_id, title, is_active, capacity, registration_deadline, event_date, event_time, location, send_wa_confirmation") \
         .eq("id", event_id) \
         .maybe_single() \
         .execute()
@@ -617,14 +618,17 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
 
             # WhatsApp only delivers plain text to someone who messaged the
             # business in the last 24 hours - true for people registering
-            # from a WhatsApp flow, never for people coming from the website
-            # link (their text was silently dropped). An approved template
-            # is delivered either way, so it goes first; the text is the
-            # fallback when the template isn't in the account (yet).
+            # through WhatsApp (flows, AI chat), never for people coming from
+            # the website link. The merchant chooses per event
+            # (send_wa_confirmation) whether to also send the approved
+            # template, which reaches everyone. Without it - or if the
+            # template isn't approved - only the plain text goes out.
             when = date_str or "the event date"
             if date_str and event.get("event_time"):
                 when += f", {event['event_time']}"
-            if not _send_registration_template(phone, name, event["title"], when, booking_id, phone_number_id, token):
+            sent = event.get("send_wa_confirmation") and _send_registration_template(
+                phone, name, event["title"], when, booking_id, phone_number_id, token)
+            if not sent:
                 send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
     except Exception as e:
         sentry_sdk.capture_exception(e)
