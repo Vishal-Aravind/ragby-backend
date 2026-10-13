@@ -31,6 +31,25 @@ MIN_AGE = timedelta(hours=24)       # a fresh upload may not be saved anywhere y
 MAX_DELETE_PER_RUN = 500
 PAGE = 1000
 
+# Only files in these upload folders are ever cleaned up - the ones whose
+# every use is covered by REFERENCE_SOURCES below. Paths look like
+# "<user id>/<folder>/<file>". A new feature that uploads gets its own folder
+# (src/app/api/storage/upload/route.js FOLDER_RULES only accepts listed
+# folders), so its files are left alone until that folder is added here AND
+# the place its URLs are saved is added to REFERENCE_SOURCES.
+CLEANABLE_FOLDERS = {
+    "message_media", "message_video", "message_audio", "message_document",   # WhatsApp flows
+    "web-image", "web-video", "web-audio", "web-document",                    # website flows
+    "products",                                                               # shop
+    "event-pages",                                                            # registrations
+    "wa-template",                                                            # templates / campaigns
+}
+
+
+def _cleanable(path: str) -> bool:
+    parts = path.split("/")
+    return len(parts) >= 3 and parts[1] in CLEANABLE_FOLDERS
+
 # Every place a flow-media URL can be saved. Whole rows are scanned as text,
 # so a URL anywhere in a JSON column (node content, page blocks, campaign
 # header) counts.
@@ -96,7 +115,8 @@ def plan_cleanup(files, refs: set, noted: dict, now: datetime):
     files: [(path, created_at)], refs: referenced paths,
     noted: {path: first_unused_at} from storage_orphans.
     Returns (to_note, to_unnote, to_delete)."""
-    unused = {p for p, created in files if p not in refs and (created is None or now - created >= MIN_AGE)}
+    unused = {p for p, created in files
+              if _cleanable(p) and p not in refs and (created is None or now - created >= MIN_AGE)}
     to_note = sorted(unused - set(noted))
     to_unnote = sorted(set(noted) - unused)
     cutoff = now - timedelta(days=GRACE_DAYS)

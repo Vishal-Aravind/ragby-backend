@@ -14,34 +14,44 @@ OLD = NOW - timedelta(days=30)
 
 class PlanTests(unittest.TestCase):
     def test_new_unused_file_is_only_noted(self):
-        note, unnote, delete = sc.plan_cleanup([("u/a.jpg", OLD)], set(), {}, NOW)
-        self.assertEqual((note, unnote, delete), (["u/a.jpg"], [], []))
+        note, unnote, delete = sc.plan_cleanup([("u/message_media/a.jpg", OLD)], set(), {}, NOW)
+        self.assertEqual((note, unnote, delete), (["u/message_media/a.jpg"], [], []))
 
     def test_deleted_only_after_seven_days_unused(self):
-        files = [("u/a.jpg", OLD), ("u/b.jpg", OLD)]
-        noted = {"u/a.jpg": NOW - timedelta(days=8), "u/b.jpg": NOW - timedelta(days=3)}
+        files = [("u/message_media/a.jpg", OLD), ("u/message_media/b.jpg", OLD)]
+        noted = {"u/message_media/a.jpg": NOW - timedelta(days=8), "u/message_media/b.jpg": NOW - timedelta(days=3)}
         _, _, delete = sc.plan_cleanup(files, set(), noted, NOW)
-        self.assertEqual(delete, ["u/a.jpg"])
+        self.assertEqual(delete, ["u/message_media/a.jpg"])
 
     def test_used_again_is_unnoted_and_kept(self):
-        noted = {"u/a.jpg": NOW - timedelta(days=20)}
-        note, unnote, delete = sc.plan_cleanup([("u/a.jpg", OLD)], {"u/a.jpg"}, noted, NOW)
-        self.assertEqual((note, unnote, delete), ([], ["u/a.jpg"], []))
+        noted = {"u/message_media/a.jpg": NOW - timedelta(days=20)}
+        note, unnote, delete = sc.plan_cleanup([("u/message_media/a.jpg", OLD)], {"u/message_media/a.jpg"}, noted, NOW)
+        self.assertEqual((note, unnote, delete), ([], ["u/message_media/a.jpg"], []))
 
     def test_files_in_use_or_fresh_are_never_touched(self):
-        files = [("u/used.jpg", OLD), ("u/fresh.jpg", NOW - timedelta(hours=2))]
-        note, _, delete = sc.plan_cleanup(files, {"u/used.jpg"}, {}, NOW)
+        files = [("u/products/used.jpg", OLD), ("u/products/fresh.jpg", NOW - timedelta(hours=2))]
+        note, _, delete = sc.plan_cleanup(files, {"u/products/used.jpg"}, {}, NOW)
         self.assertEqual((note, delete), ([], []))
 
     def test_rows_for_files_already_gone_are_cleared(self):
-        _, unnote, _ = sc.plan_cleanup([], set(), {"u/gone.jpg": OLD}, NOW)
-        self.assertEqual(unnote, ["u/gone.jpg"])
+        _, unnote, _ = sc.plan_cleanup([], set(), {"u/products/gone.jpg": OLD}, NOW)
+        self.assertEqual(unnote, ["u/products/gone.jpg"])
 
     def test_delete_is_capped_per_run(self):
-        files = [(f"u/{i}.jpg", OLD) for i in range(sc.MAX_DELETE_PER_RUN + 50)]
+        files = [(f"u/web-image/{i}.jpg", OLD) for i in range(sc.MAX_DELETE_PER_RUN + 50)]
         noted = {p: NOW - timedelta(days=10) for p, _ in files}
         _, _, delete = sc.plan_cleanup(files, set(), noted, NOW)
         self.assertEqual(len(delete), sc.MAX_DELETE_PER_RUN)
+
+
+class FolderTests(unittest.TestCase):
+    def test_only_known_upload_folders_are_cleaned(self):
+        files = [("u/message_media/a.jpg", OLD), ("u/new-feature/b.jpg", OLD), ("loose.jpg", OLD)]
+        noted = {p: NOW - timedelta(days=30) for p, _ in files}
+        note, unnote, delete = sc.plan_cleanup(files, set(), noted, NOW)
+        self.assertEqual(delete, ["u/message_media/a.jpg"])
+        # files outside the known folders are un-noted, never deleted
+        self.assertEqual(unnote, ["loose.jpg", "u/new-feature/b.jpg"])
 
 
 class ReferenceTests(unittest.TestCase):
