@@ -576,6 +576,7 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
         return {
             "status": "confirmed",
             "registration_id": registration["id"],
+            "booking_id": registration["id"][:8].upper(),
             "event_title": event["title"],
             "event_date": event.get("event_date"),
             "event_time": event.get("event_time"),
@@ -583,6 +584,10 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
             "confirmation_sent": False,
         }
 
+    # True only when the approved template went out - the one message
+    # WhatsApp delivers to everyone. The plain text below only reaches people
+    # inside WhatsApp's 24-hour window, so it can't be promised on the page.
+    confirmation_sent = False
     try:
         wa_res = supabase.table("whatsapp_integrations") \
             .select("phone_number_id, access_token") \
@@ -628,6 +633,7 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
                 when += f", {event['event_time']}"
             sent = event.get("send_wa_confirmation") and _send_registration_template(
                 phone, name, event["title"], when, booking_id, phone_number_id, token)
+            confirmation_sent = bool(sent)
             if not sent:
                 send_whatsapp_message(to=phone, text=msg, phone_number_id=phone_number_id, token=token)
     except Exception as e:
@@ -637,10 +643,12 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
     return {
         "status": "confirmed",
         "registration_id": registration["id"],
+        "booking_id": registration["id"][:8].upper(),
         "event_title": event["title"],
         "event_date": event.get("event_date"),
         "event_time": event.get("event_time"),
         "location": event.get("location"),
+        "confirmation_sent": confirmation_sent,
     }
 
 
