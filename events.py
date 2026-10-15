@@ -435,10 +435,12 @@ def get_registrations_for_phone(
     return result
 
 
-REGISTRATION_TEMPLATE = "event_registration"   # Templates > library > "Event Registration Confirmed"
+REGISTRATION_TEMPLATE = "event_registration"
+CANCELLATION_TEMPLATE = "event_registration_cancelled"   # Templates > library > "Event Registration Confirmed"
 
 
-def _send_registration_template(to, name, title, when, booking_id, phone_number_id, token) -> bool:
+def _send_registration_template(to, name, title, when, booking_id, phone_number_id, token,
+                                template=REGISTRATION_TEMPLATE) -> bool:
     """The registration confirmation as the approved template. False when
     the template isn't in the account or WhatsApp refuses it (the caller
     then falls back to plain text)."""
@@ -451,7 +453,7 @@ def _send_registration_template(to, name, title, when, booking_id, phone_number_
             json={
                 "messaging_product": "whatsapp", "to": to, "type": "template",
                 "template": {
-                    "name": REGISTRATION_TEMPLATE, "language": {"code": "en_US"},
+                    "name": template, "language": {"code": "en_US"},
                     "components": [{"type": "body", "parameters": [{"type": "text", "text": p} for p in params]}],
                 },
             },
@@ -676,7 +678,8 @@ def cancel_registration_core(registration_id: str, notify_customer: bool = True)
 
     if notify_customer:
         try:
-            event_res = supabase.table("events").select("title").eq("id", registration["event_id"]).maybe_single().execute()
+            event_res = supabase.table("events").select("title, event_date, event_time, send_wa_confirmation") \
+                .eq("id", registration["event_id"]).maybe_single().execute()
             event = (event_res.data if event_res else None)
             wa_res = supabase.table("whatsapp_integrations") \
                 .select("phone_number_id, access_token") \
@@ -686,12 +689,29 @@ def cancel_registration_core(registration_id: str, notify_customer: bool = True)
             wa_data = (wa_res.data if wa_res else None)
             if event and wa_data:
                 from whatsapp import send_whatsapp_message
-                send_whatsapp_message(
-                    to=registration["phone"],
-                    text=f"❌ *Registration Cancelled*\n\nYour registration for {event['title']} has been cancelled.",
-                    phone_number_id=wa_data["phone_number_id"],
-                    token=wa_data.get("access_token") or WHATSAPP_TOKEN,
-                )
+                token = wa_data.get("access_token") or WHATSAPP_TOKEN
+                # Same rule as the confirmation: plain text only reaches people
+                # inside WhatsApp's 24-hour window, so events that send the
+                # confirmation template also send the cancellation template.
+                when = "the event date"
+                if event.get("event_date"):
+                    try:
+                        when = datetime.strptime(event["event_date"], "%Y-%m-%d").strftime("%d %B %Y")
+                    except Exception:
+                        when = event["event_date"]
+                    if event.get("event_time"):
+                        when += f", {event['event_time']}"
+                sent = event.get("send_wa_confirmation") and _send_registration_template(
+                    registration["phone"], registration.get("name"), event["title"], when,
+                    registration["id"][:8].upper(), wa_data["phone_number_id"], token,
+                    template=CANCELLATION_TEMPLATE)
+                if not sent:
+                    send_whatsapp_message(
+                        to=registration["phone"],
+                        text=f"❌ *Registration Cancelled*\n\nYour registration for {event['title']} has been cancelled.",
+                        phone_number_id=wa_data["phone_number_id"],
+                        token=token,
+                    )
         except Exception as e:
             sentry_sdk.capture_exception(e)
             print(f"Registration cancel notification error: {e}")

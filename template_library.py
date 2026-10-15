@@ -166,6 +166,24 @@ TEMPLATE_LIBRARY = [
         "language": "en_US",
     },
     {
+        "id": "event_registration_cancelled",
+        "category": "UTILITY",
+        "industry": "All businesses",
+        "name": "event_registration_cancelled",
+        "display_name": "Event Registration Cancelled",
+        "description": "Tells the customer their event registration was cancelled (Registrations)",
+        "preview": "Hi {Name}, your registration for {Event} on {Date} has been cancelled. Booking ID: {Booking ID}. Please contact us if this was a mistake.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}, your registration for {{2}} on {{3}} has been cancelled. Booking ID: {{4}}. Please contact us if this was a mistake.",
+            }
+        ],
+        "example_body": ["Asha", "Business Summit 2026", "14 November 2026, 10 AM", "A1B2C3D4"],
+        "variables": ["Customer name", "Event name", "Date and time", "Booking ID"],
+        "language": "en_US",
+    },
+    {
         "id": "welcome_message",
         "category": "MARKETING",
         "industry": "All businesses",
