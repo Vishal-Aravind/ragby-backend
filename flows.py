@@ -427,10 +427,18 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
 
         # Send rich card — image + body + Register button (+ optional Call button)
         from media_check import check_media_link
-        if c.get("banner_url") and check_media_link(c["banner_url"], "image")["ok"]:
+        # The block's own image wins; otherwise use the event's cover image.
+        banner = c.get("banner_url")
+        if not banner and event_id:
+            try:
+                ev = supabase.table("events").select("banner_url").eq("id", event_id)                     .maybe_single().execute()
+                banner = ((ev.data if ev else None) or {}).get("banner_url")
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
+        if banner and check_media_link(banner, "image")["ok"]:
             send_whatsapp_media(
                 to, "image",
-                {"link": c["banner_url"], "caption": body},
+                {"link": banner, "caption": body},
                 phone_number_id, token,
             )
 
