@@ -608,7 +608,12 @@ class Engine:
             tel = _tel(c.get("contact_phone"))
             if tel:
                 links.append({"label": "Call to attend", "url": tel})
-            card = {"kind": "card", "image": _safe_url(c.get("banner_url"), ("https",)),
+            banner = c.get("banner_url")
+            if not banner and c.get("event_id"):
+                lookup = getattr(self.store, "get_event_banner", None)
+                if lookup:
+                    banner = lookup(sess["project_id"], c["event_id"])
+            card = {"kind": "card", "image": _safe_url(banner, ("https",)),
                     "title": "", "text": body or "Register now - limited spots available!", "links": links}
             ctx.messages.append(card)
             ctx.transcript.append({"role": "assistant", "content": card["text"] + "".join(

@@ -28,6 +28,18 @@ class SupabaseStore:
             .limit(1).execute()
         return res.data[0] if res.data else None
 
+    def get_event_banner(self, project_id, event_id):
+        """The event's cover image, for an Event card whose block has none.
+        Scoped to the project so a flow can't read another tenant's event."""
+        if not project_id or not event_id:
+            return None
+        try:
+            res = supabase.table("events").select("banner_url")                 .eq("id", event_id).eq("project_id", project_id).limit(1).execute()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            return None
+        return (res.data[0].get("banner_url") if res.data else None)
+
     def get_start_node(self, flow_id):
         res = supabase.table("flow_nodes").select("id, type, content") \
             .eq("flow_id", flow_id).eq("is_start", True).limit(1).execute()
