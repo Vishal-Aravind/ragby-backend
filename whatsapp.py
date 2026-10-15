@@ -650,7 +650,8 @@ def send_whatsapp_list(to: str, body: str, button_text: str, sections: list, pho
     return res
 
 
-def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, phone_number_id: str, token: str):
+def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, phone_number_id: str, token: str,
+                          header_image: str = None):
     url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     link = (url_link or "").replace("{{phone_number}}", to)
@@ -675,7 +676,16 @@ def send_whatsapp_cta_url(to: str, body: str, button_text: str, url_link: str, p
             }
         }
     }
+    # One card: picture on top, text, button - instead of an image message
+    # followed by a separate button message.
+    if header_image:
+        payload["interactive"]["header"] = {"type": "image", "image": {"link": header_image}}
     res = http.post(url, headers=headers, json=payload)
+    if not res.ok and header_image:
+        # Image refused (unreachable / unsupported): same card without it.
+        print(f"WhatsApp CTA with image failed, retrying without: {res.text}")
+        payload["interactive"].pop("header", None)
+        res = http.post(url, headers=headers, json=payload)
     if not res.ok:
         print(f"WhatsApp CTA send error: {res.text}")
         # Still rejected (e.g. a tel: link — the button only takes web

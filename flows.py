@@ -435,33 +435,23 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
                 banner = ((ev.data if ev else None) or {}).get("banner_url")
             except Exception as e:
                 sentry_sdk.capture_exception(e)
-        if banner and check_media_link(banner, "image")["ok"]:
-            send_whatsapp_media(
-                to, "image",
-                {"link": banner, "caption": body},
-                phone_number_id, token,
-            )
+        has_image = bool(banner and check_media_link(banner, "image")["ok"])
 
+        # One card: picture, text and the Register button together. The
+        # contact number goes in the text (WhatsApp makes it tappable) rather
+        # than as a second "Call to Attend" message.
+        card_body = body or "Register now — limited spots available!"
+        if c.get("contact_phone"):
+            card_body = f"{card_body}\n\n📞 Prefer to call? {c['contact_phone']}"
         send_whatsapp_cta_url(
             to,
-            body or "Register now — limited spots available!",
+            card_body,
             c.get("button_text", "Register Now"),
             reg_url,
             phone_number_id,
             token,
+            header_image=banner if has_image else None,
         )
-
-        # Optional second message — Call to Attend
-        if c.get("contact_phone"):
-            phone_clean = c["contact_phone"].replace(" ", "")
-            send_whatsapp_cta_url(
-                to,
-                "Prefer to call instead?",
-                "📞 Call to Attend",
-                f"tel:{phone_clean}",
-                phone_number_id,
-                token,
-            )
 
     elif t == "message_booking":
         proj_id = project_id or ""
