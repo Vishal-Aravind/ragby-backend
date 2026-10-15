@@ -302,3 +302,67 @@ def delete_template(req: DeleteTemplate, user=Depends(verify_token)):
     print(f"Meta template delete failed: {res.text}")
     sentry_sdk.capture_message("Meta template delete failed")
     raise HTTPException(status_code=400, detail=_meta_error_text(res) or "WhatsApp couldn't delete this template. Try again.")
+
+
+# -------------------------------------------------
+# WHATSAPP BILLING (can template messages be delivered?)
+# -------------------------------------------------
+# Template messages are paid: without a payment method on the WhatsApp
+# account, Meta accepts them and then fails delivery with code 131042
+# ("Business eligibility payment issue"). Free in-window replies keep
+# working, so nothing looked wrong. Two signals:
+#   - the account's primary_funding_id from Meta (set = a payment method),
+#   - a 131042 failure recorded on any chat in the last 7 days.
+_billing_cache: dict = {}
+_BILLING_TTL = 600
+
+
+@router.get("/whatsapp/billing-status/{project_id}")
+def billing_status(project_id: str, user=Depends(verify_token)):
+    require_project_access(user.id, project_id)
+    import time as _time
+    from datetime import datetime, timedelta, timezone
+    from clients import supabase
+
+    hit = _billing_cache.get(project_id)
+    if hit and _time.time() - hit[0] < _BILLING_TTL:
+        return hit[1]
+
+    try:
+        wa = _wa_integration(project_id)
+    except HTTPException:
+        return {"status": "not_connected"}
+
+    recent_error = False
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        rows = supabase.table("chats").select("id").eq("project_id", project_id) \
+            .eq("channel", "whatsapp").gte("last_send_error_at", since) \
+            .ilike("last_send_error", "%131042%").limit(1).execute().data
+        recent_error = bool(rows)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
+    funding, checked = None, False
+    if wa.get("waba_id"):
+        try:
+            res = http.get(f"{GRAPH}/{wa['waba_id']}", params={"fields": "primary_funding_id"},
+                           headers={"Authorization": f"Bearer {wa['token']}"}, timeout=8)
+            if res.ok:
+                checked = True
+                funding = res.json().get("primary_funding_id")
+            else:
+                print(f"WhatsApp billing check not available: {res.status_code}")
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+
+    if funding:
+        result = {"status": "ok"}                 # a payment method is set (newer than any old error)
+    elif recent_error:
+        result = {"status": "missing", "source": "failed_message"}
+    elif checked:
+        result = {"status": "missing", "source": "meta"}
+    else:
+        result = {"status": "unknown"}
+    _billing_cache[project_id] = (_time.time(), result)
+    return result
