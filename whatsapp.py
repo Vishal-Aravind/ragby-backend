@@ -511,12 +511,18 @@ def send_typing_indicator(message_id: str, phone_number_id: str, token: str):
 _MD_LINK_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^\s)]+)\)")
 
 
+_MD_BOLD_RE = re.compile(r"\*\*([^*\n]{1,200})\*\*")
+
+
 def plain_links(text: str) -> str:
     """WhatsApp doesn't render [label](url) - the AI writes links that way,
     so the customer saw the brackets and the URL twice over. Turn each into
     'label: url', which WhatsApp then makes tappable on its own."""
     if not text:
         return text
+    # The AI writes **bold**; WhatsApp bold is a single *...* (with ** it
+    # shows the extra asterisks).
+    text = _MD_BOLD_RE.sub(r"*\1*", text)
     return _MD_LINK_RE.sub(lambda m: m.group(2) if m.group(1).strip().lower() in m.group(2).lower()
                            else f"{m.group(1)}: {m.group(2)}", text)
 

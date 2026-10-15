@@ -78,7 +78,9 @@
     // Auto-linkify so a checkout/shop link the bot relays is actually
     // tappable — this widget only ever renders plain escaped text, unlike
     // WhatsApp, which auto-links URLs on its own.
-    const linked = mdDone.replace(URL_RE, url => {
+    // **bold** from the AI -> real bold (the text is already escaped).
+    const bolded = mdDone.replace(/\*\*([^*\n]{1,200})\*\*/g, "<strong>$1</strong>");
+    const linked = bolded.replace(URL_RE, url => {
       if (!/^https?:\/\//i.test(url)) return url;
       return `<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:underline">${url}</a>`;
     });
@@ -797,7 +799,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=13`;
+        s.src = `${apiBase}/static/widget-flows.js?v=14`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);
