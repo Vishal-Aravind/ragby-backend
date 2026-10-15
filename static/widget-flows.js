@@ -261,8 +261,19 @@
         var kind = env.input && env.input.kind;
         var offerAgain = action && action.type === "text" && !invalid
           && (kind === "carousel" || kind === "form") && env.nodeId === prevNode;
+        // A typed question answered by the AI while buttons were on screen:
+        // don't repeat the old buttons under the answer - one way back instead.
+        var backOnly = action && action.type === "text" && !invalid
+          && kind === "choices" && env.delegate === "ai" && env.nodeId === prevNode;
         var showInput = function () {
-          if (offerAgain) renderChipRow(kind === "form" ? "Show form again" : "Show options again", function () { renderInput(env); });
+          if (backOnly) {
+            retireLive();
+            renderChipRow("Back to menu", function () {
+              api.addMsg("user", api.render("Back to menu"));
+              step({ type: "menu" }, null);
+            });
+          }
+          else if (offerAgain) renderChipRow(kind === "form" ? "Show form again" : "Show options again", function () { renderInput(env); });
           else renderInput(env);
         };
         if (env.delegate === "ai" && action && action.type === "text") {

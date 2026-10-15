@@ -68,14 +68,21 @@
 
   function render(text) {
     const escaped = esc(text);
+    // [label](https://...) - the AI often writes links this way. Pulled out
+    // first so the plain-URL pass below doesn't link the URL a second time.
+    const anchors = [];
+    const mdDone = escaped.replace(/\[([^\]]{1,200})\]\((https?:\/\/[^\s<>"')]+)\)/g, (m, label, url) => {
+      anchors.push(`<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:underline">${label}</a>`);
+      return `\u0000${anchors.length - 1}\u0000`;
+    });
     // Auto-linkify so a checkout/shop link the bot relays is actually
     // tappable — this widget only ever renders plain escaped text, unlike
     // WhatsApp, which auto-links URLs on its own.
-    const linked = escaped.replace(URL_RE, url => {
+    const linked = mdDone.replace(URL_RE, url => {
       if (!/^https?:\/\//i.test(url)) return url;
       return `<a href="${url}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;text-decoration:underline">${url}</a>`;
     });
-    return linked.replace(/\n/g, "<br/>");
+    return linked.replace(/\u0000(\d+)\u0000/g, (m, i) => anchors[+i]).replace(/\n/g, "<br/>");
   }
 
   // ---------------- FETCH LEAD CONFIG ----------------
@@ -790,7 +797,7 @@
         window.__zavoFlowHosts = window.__zavoFlowHosts || {};
         window.__zavoFlowHosts[projectId] = flowHost;
         var s = document.createElement("script");
-        s.src = `${apiBase}/static/widget-flows.js?v=12`;
+        s.src = `${apiBase}/static/widget-flows.js?v=13`;
         s.async = true;
         s.setAttribute("data-project", projectId);
         document.head.appendChild(s);
