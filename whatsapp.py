@@ -360,30 +360,6 @@ def _handle_message_echoes(project_id: str, echoes: list, business_phone_number:
             }).eq("id", chat_id).execute()
 
 
-PAID_CATEGORIES = {"utility", "marketing", "authentication"}
-
-
-def _clear_payment_error_if_paid(project_id: str, status: dict) -> None:
-    """A PAID (template) message was delivered, so WhatsApp billing works:
-    forget old 131042 'payment issue' failures, which otherwise kept the
-    'no payment method' notice red for up to 7 days after it was fixed.
-    Free in-window replies prove nothing about billing and are ignored.
-    At most once per 10 minutes per project."""
-    category = str(((status.get("pricing") or {}).get("category")) or "").lower()
-    if category not in PAID_CATEGORIES:
-        return
-    if is_rate_limited(f"billing-clear:{project_id}", limit=1, window_seconds=600):
-        return
-    try:
-        supabase.table("chats").update({"last_send_error": None, "last_send_error_at": None}) \
-            .eq("project_id", project_id).eq("channel", "whatsapp") \
-            .ilike("last_send_error", "%131042%").execute()
-        from wa_templates import _billing_cache
-        _billing_cache.pop(project_id, None)
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-
-
 def _handle_statuses(project_id: str, statuses: list) -> None:
     """Record delivery FAILURES against the conversation.
 
@@ -405,12 +381,7 @@ def _handle_statuses(project_id: str, statuses: list) -> None:
     write_failures = 0
 
     for status in statuses[:50]:
-        if not isinstance(status, dict):
-            continue
-        if status.get("status") in ("delivered", "read"):
-            _clear_payment_error_if_paid(project_id, status)
-            continue
-        if status.get("status") != "failed":
+        if not isinstance(status, dict) or status.get("status") != "failed":
             continue
 
         recipient = _valid_phone(status.get("recipient_id"))
