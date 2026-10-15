@@ -822,7 +822,8 @@ def execute_event_tool(name: str, args: dict, project_id: str, channel: str, ext
             event = matches[0]
             return {
                 "event_title": event["title"],
-                "registration_link": f"{FRONTEND_URL}/event/{event['id']}",
+                "registration_link": f"{FRONTEND_URL}/event/{event['id']}?src="
+                                     f"{'whatsapp_chat' if channel == 'whatsapp' else 'website_chat'}",
             }
 
         if name == "check_my_event_registrations":

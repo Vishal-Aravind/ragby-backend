@@ -122,6 +122,9 @@ class RegistrationCreate(BaseModel):
     # defeated the limit entirely. The real project is derived from the
     # event row in register_for_event_core. Pydantic ignores the extra
     # field, so an older page that still sends it keeps working.
+    # Which link they came from (?src= on the event page). Checked against
+    # SOURCES below - anything else is stored as "direct".
+    source: Optional[str] = None
     data: dict   # dynamic — keyed by form field id, e.g. {"name": "John", "phone": "919...", "dietary": "Veg"}
 
 
@@ -228,7 +231,7 @@ def delete_event(event_id: str, user=Depends(verify_token)):
 def list_registrations(event_id: str, user=Depends(verify_token)):
     _require_role_for_event(user.id, event_id)
     res = supabase.table("event_registrations") \
-        .select("id, event_id, name, phone, email, notes, status, created_at") \
+        .select("id, event_id, name, phone, email, notes, status, source, created_at") \
         .eq("event_id", event_id) \
         .order("created_at", desc=True) \
         .execute()
@@ -469,7 +472,10 @@ def _send_registration_template(to, name, title, when, booking_id, phone_number_
     return res.ok
 
 
-def register_for_event_core(event_id: str, data: dict) -> dict:
+SOURCES = {"flow", "whatsapp_chat", "website_chat", "direct"}
+
+
+def register_for_event_core(event_id: str, data: dict, source: Optional[str] = None) -> dict:
     """Core registration logic — shared by the public route and the
     in-chat tool. Re-validates is_active, registration_deadline, capacity,
     and duplicate-phone here — never trusts a stale snapshot (e.g. from an
@@ -549,6 +555,15 @@ def register_for_event_core(event_id: str, data: dict) -> dict:
         raise ValueError("Registration is closed for this event")
 
     registration = result["registration"]
+
+    # Best-effort: which link the person came from. The row is created inside
+    # the atomic function, so this is a follow-up update.
+    try:
+        supabase.table("event_registrations").update(
+            {"source": source if source in SOURCES else "direct"}
+        ).eq("id", registration["id"]).execute()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
 
     try:
         supabase.table("form_submissions").insert({
@@ -801,7 +816,7 @@ def register_for_event(body: RegistrationCreate, request: Request):
         raise HTTPException(status_code=429, detail="Too many registrations from this number. Please try again later.")
 
     try:
-        return register_for_event_core(body.event_id, body.data or {})
+        return register_for_event_core(body.event_id, body.data or {}, body.source)
     except ValueError as e:
         msg = str(e)
         if msg == "Event not found":

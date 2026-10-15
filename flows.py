@@ -423,7 +423,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
     elif t == "message_event":
         event_id = c.get("event_id", "")
         proj_id = project_id or ""
-        reg_url = f"{FRONTEND_URL}/event/{event_id}"
+        reg_url = f"{FRONTEND_URL}/event/{event_id}?src=flow"
 
         # Send rich card — image + body + Register button (+ optional Call button)
         from media_check import check_media_link
