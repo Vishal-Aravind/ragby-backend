@@ -127,6 +127,9 @@ class RegistrationCreate(BaseModel):
 
 class RegistrationStatusUpdate(BaseModel):
     status: str = Field(..., min_length=1, max_length=32)
+    # Cancelling only: the merchant chooses in the dashboard whether the
+    # person gets a WhatsApp message about it.
+    notify: bool = True
 
 
 # -------------------------------------------------
@@ -266,7 +269,7 @@ def update_registration(registration_id: str, body: RegistrationStatusUpdate, us
 
     if status == "cancelled":
         try:
-            return cancel_registration_core(registration_id, notify_customer=True)
+            return cancel_registration_core(registration_id, notify_customer=body.notify)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -690,9 +693,9 @@ def cancel_registration_core(registration_id: str, notify_customer: bool = True)
             if event and wa_data:
                 from whatsapp import send_whatsapp_message
                 token = wa_data.get("access_token") or WHATSAPP_TOKEN
-                # Same rule as the confirmation: plain text only reaches people
-                # inside WhatsApp's 24-hour window, so events that send the
-                # confirmation template also send the cancellation template.
+                # The merchant chose to notify, so try the approved template
+                # (reaches everyone); plain text only reaches people inside
+                # WhatsApp's 24-hour window.
                 when = "the event date"
                 if event.get("event_date"):
                     try:
@@ -701,7 +704,7 @@ def cancel_registration_core(registration_id: str, notify_customer: bool = True)
                         when = event["event_date"]
                     if event.get("event_time"):
                         when += f", {event['event_time']}"
-                sent = event.get("send_wa_confirmation") and _send_registration_template(
+                sent = _send_registration_template(
                     registration["phone"], registration.get("name"), event["title"], when,
                     registration["id"][:8].upper(), wa_data["phone_number_id"], token,
                     template=CANCELLATION_TEMPLATE)
