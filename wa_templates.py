@@ -343,13 +343,12 @@ def billing_status(project_id: str, user=Depends(verify_token)):
     except Exception as e:
         sentry_sdk.capture_exception(e)
 
-    funding, checked = None, False
+    funding = None
     if wa.get("waba_id"):
         try:
             res = http.get(f"{GRAPH}/{wa['waba_id']}", params={"fields": "primary_funding_id"},
                            headers={"Authorization": f"Bearer {wa['token']}"}, timeout=8)
             if res.ok:
-                checked = True
                 funding = res.json().get("primary_funding_id")
             else:
                 print(f"WhatsApp billing check not available: {res.status_code}")
@@ -360,9 +359,10 @@ def billing_status(project_id: str, user=Depends(verify_token)):
         result = {"status": "ok"}                 # a payment method is set (newer than any old error)
     elif recent_error:
         result = {"status": "missing", "source": "failed_message"}
-    elif checked:
-        result = {"status": "missing", "source": "meta"}
     else:
+        # No card on file isn't proof of a problem: prepaid ("Available
+        # funds") accounts pay without one and Meta leaves this field empty.
+        # Only a real 131042 failure turns the notice red.
         result = {"status": "unknown"}
     _billing_cache[project_id] = (_time.time(), result)
     return result
