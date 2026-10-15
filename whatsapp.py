@@ -508,7 +508,21 @@ def send_typing_indicator(message_id: str, phone_number_id: str, token: str):
         sentry_sdk.capture_exception(e)
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^\s)]+)\)")
+
+
+def plain_links(text: str) -> str:
+    """WhatsApp doesn't render [label](url) - the AI writes links that way,
+    so the customer saw the brackets and the URL twice over. Turn each into
+    'label: url', which WhatsApp then makes tappable on its own."""
+    if not text:
+        return text
+    return _MD_LINK_RE.sub(lambda m: m.group(2) if m.group(1).strip().lower() in m.group(2).lower()
+                           else f"{m.group(1)}: {m.group(2)}", text)
+
+
 def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token: str = None, preview_url: bool = False):
+    text = plain_links(text)
     pid = phone_number_id or WHATSAPP_PHONE_NUMBER_ID
     tok = token or WHATSAPP_TOKEN
     url = f"https://graph.facebook.com/v25.0/{pid}/messages"
@@ -536,6 +550,7 @@ def send_whatsapp_message(to: str, text: str, phone_number_id: str = None, token
 
 
 def send_whatsapp_buttons(to: str, body: str, buttons: list, phone_number_id: str, token: str):
+    body = plain_links(body)
     url = f"https://graph.facebook.com/v25.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     # WhatsApp rejects the ENTIRE message if the body exceeds 1024 chars —
