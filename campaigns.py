@@ -522,6 +522,19 @@ def _campaign_still_sending(campaign_id) -> bool:
         return True
 
 
+_NAME_TOKEN_RE = re.compile(r"\{name\}", re.I)
+
+
+def _fill_name(value, contact) -> str:
+    """A value containing {name} gets each contact's first name, or "there"
+    when we don't have one ("Hi there!")."""
+    text = str(value)
+    if not _NAME_TOKEN_RE.search(text):
+        return text
+    first = str(contact.get("name") or "").strip().split(" ")[0][:60] or "there"
+    return _NAME_TOKEN_RE.sub(lambda m: first, text)
+
+
 def send_campaign_messages(
     campaign_id, contacts, template_name, template_lang,
     variables, phone_number_id, token=None, header=None
@@ -547,17 +560,19 @@ def send_campaign_messages(
     send_exceptions = 0
     token = token or WHATSAPP_TOKEN
 
-    # Built once — it's identical for every recipient.
-    components = []
-    if header and header.get("image"):
-        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header["image"]}}]})
-    elif header and header.get("text"):
-        components.append({"type": "header", "parameters": [{"type": "text", "text": str(header["text"])}]})
-    if variables:
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(v)} for v in variables],
-        })
+    # Same for every recipient except where a value uses {name}.
+    def build_components(contact):
+        components = []
+        if header and header.get("image"):
+            components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header["image"]}}]})
+        elif header and header.get("text"):
+            components.append({"type": "header", "parameters": [{"type": "text", "text": _fill_name(header["text"], contact)}]})
+        if variables:
+            components.append({
+                "type": "body",
+                "parameters": [{"type": "text", "text": _fill_name(v, contact)} for v in variables],
+            })
+        return components
 
     def write_progress(status=None):
         update = {"sent_count": sent, "failed_count": failed}
@@ -603,7 +618,7 @@ def send_campaign_messages(
                     "template": {
                         "name": template_name,
                         "language": {"code": template_lang},
-                        "components": components,
+                        "components": build_components(contact),
                     },
                 }
             )
