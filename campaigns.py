@@ -14,6 +14,7 @@ from config import (
     MAX_CAMPAIGNS_PER_HOUR,
 )
 from whatsapp import http
+import phones
 
 router = APIRouter()
 
@@ -87,23 +88,23 @@ def get_templates(project_id: str, user=Depends(verify_token)):
 # -------------------------------------------------
 # RECIPIENT RESOLUTION — shared by immediate + scheduled + recurring sends
 # -------------------------------------------------
-def _valid_phone(raw) -> Optional[str]:
-    """Normalise a recipient phone, or None if it can't be one.
-
-    Every recipient is a paid message, so a malformed number is not just a
-    failed send — it is a failure that counts against the WABA's quality
-    rating. Rejecting it up front is cheaper than letting Meta reject it.
-    """
-    if not isinstance(raw, str):
-        return None
-    digits = re.sub(r"\D", "", raw)
-    # E.164 allows 8-15 digits; anything outside that can't be a real number.
-    if not (8 <= len(digits) <= 15):
-        return None
-    return digits
+_MAX_SKIPPED_SHOWN = 20
 
 
-def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_contacts):
+def _skip(skipped, raw, name, reason):
+    skipped.append({"phone": str(raw or "")[:40], "name": (name if isinstance(name, str) else "")[:120],
+                    "reason": reason})
+
+
+def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_contacts, region: str = None):
+    """(contacts, skipped). Every phone is turned into one exact international
+    number (see phones.py) or skipped with a reason - never guessed. Contacts
+    carry "+<digits>" so the send can't misread them later.
+
+    region: the country for numbers written without a code. Defaults to the
+    business's own WhatsApp number's country."""
+    region = phones.valid_region(region) or phones.default_region_for_project(project_id)
+    skipped = []
     if csv_contacts is not None:
         if not isinstance(csv_contacts, list):
             raise HTTPException(status_code=400, detail="Invalid contact list")
@@ -119,12 +120,15 @@ def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_con
         for c in csv_contacts:
             if not isinstance(c, dict):
                 continue
-            phone = _valid_phone(c.get("phone"))
-            if not phone or phone in seen:
+            name = c.get("name")
+            phone, reason = phones.normalize(c.get("phone"), region)
+            if not phone:
+                _skip(skipped, c.get("phone"), name, reason)
+                continue
+            if phone in seen:
                 continue
             seen.add(phone)
-            name = c.get("name")
-            contacts.append({"phone": phone, "name": (name if isinstance(name, str) else "")[:120]})
+            contacts.append({"phone": "+" + phone, "name": (name if isinstance(name, str) else "")[:120]})
 
         # Save to leads table (upsert) — happens immediately at creation
         # time even for a scheduled campaign, so they show up in Leads
@@ -143,7 +147,7 @@ def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_con
             def _count_failure(e):
                 nonlocal contact_save_failures
                 contact_save_failures += 1
-            upsert_contact(project_id, c["phone"], c.get("name") or None, channel="whatsapp", on_error=_count_failure)
+            upsert_contact(project_id, c["phone"].lstrip("+"), c.get("name") or None, channel="whatsapp", on_error=_count_failure)
 
         if contact_save_failures:
             sentry_sdk.capture_message(
@@ -152,10 +156,10 @@ def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_con
                 level="warning",
             )
 
-        return contacts
+        return contacts, skipped
 
     query = supabase.table("leads") \
-        .select("phone, name") \
+        .select("phone, name, channel") \
         .eq("project_id", project_id) \
         .neq("phone", "")
 
@@ -173,16 +177,26 @@ def resolve_contacts(project_id: str, recipient_filter: str, tag_filter, csv_con
     contacts = []
     seen = set()
     for c in (contacts_res.data or []):
-        phone = _valid_phone(c.get("phone"))
-        if not phone or phone in seen:
+        # A WhatsApp contact's number came from WhatsApp itself, so it already
+        # starts with its country code; anything else was typed by a person.
+        phone, reason = phones.normalize(c.get("phone"), region,
+                                         international_first=c.get("channel") == "whatsapp")
+        if not phone:
+            _skip(skipped, c.get("phone"), c.get("name"), reason)
+            continue
+        if phone in seen:
             continue
         seen.add(phone)
-        contacts.append({"phone": phone, "name": c.get("name") or ""})
-    return contacts
+        contacts.append({"phone": "+" + phone, "name": c.get("name") or ""})
+    return contacts, skipped
 
 
-def _enforce_recipient_cap(contacts):
+def _enforce_recipient_cap(contacts, skipped=()):
     if not contacts:
+        if skipped:
+            raise HTTPException(status_code=400, detail=(
+                f"None of the {len(skipped)} number(s) could be used - they're missing a country code or "
+                "aren't valid. Fix them and try again."))
         raise HTTPException(status_code=400, detail="No contacts found for this filter")
     if len(contacts) > MAX_CAMPAIGN_RECIPIENTS:
         raise HTTPException(
@@ -251,11 +265,56 @@ def recipient_count(
     require_project_access(user.id, project_id, tab="campaigns")
     if recipient_filter not in VALID_RECIPIENT_FILTERS:
         raise HTTPException(status_code=400, detail="Invalid recipient filter")
-    contacts = resolve_contacts(project_id, recipient_filter, tag_filter, None)
+    contacts, skipped = resolve_contacts(project_id, recipient_filter, tag_filter, None)
     return {
         "count": len(contacts),
+        "skipped_count": len(skipped),
+        "skipped": skipped[:_MAX_SKIPPED_SHOWN],
         "max": MAX_CAMPAIGN_RECIPIENTS,
         "over_limit": len(contacts) > MAX_CAMPAIGN_RECIPIENTS,
+    }
+
+
+class CheckNumbersRequest(BaseModel):
+    project_id: str
+    contacts: list = Field(default_factory=list)
+    region: Optional[str] = Field(default=None, max_length=2)
+
+
+@router.post("/campaigns/check-numbers")
+def check_numbers(req: CheckNumbersRequest, user=Depends(verify_token)):
+    """Preview for an uploaded file: exactly which numbers will be used (in
+    their final form) and which are skipped and why - before anything is
+    sent or saved. Same rules as the send itself (phones.normalize)."""
+    require_project_access(user.id, req.project_id, tab="campaigns")
+    if len(req.contacts) > MAX_CAMPAIGN_RECIPIENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"That file has {len(req.contacts)} contacts. A campaign can reach at most {MAX_CAMPAIGN_RECIPIENTS} people.",
+        )
+    region = phones.valid_region(req.region) or phones.default_region_for_project(req.project_id)
+    ready, skipped, seen, duplicates = [], [], set(), 0
+    for c in req.contacts:
+        if not isinstance(c, dict):
+            continue
+        phone, reason = phones.normalize(c.get("phone"), region)
+        if not phone:
+            _skip(skipped, c.get("phone"), c.get("name"), reason)
+            continue
+        if phone in seen:
+            duplicates += 1
+            continue
+        seen.add(phone)
+        name = c.get("name")
+        ready.append({"phone": phones.pretty(phone), "name": (name if isinstance(name, str) else "")[:120]})
+    return {
+        "region": region,
+        "calling_code": phones.calling_code(region),
+        "ready_count": len(ready),
+        "ready": ready[:5],
+        "skipped_count": len(skipped),
+        "skipped": skipped[:200],
+        "duplicates": duplicates,
     }
 
 
@@ -274,6 +333,9 @@ class CampaignRequest(BaseModel):
     recipient_filter: str = Field(default="all", max_length=20)
     tag_filter: Optional[str] = Field(default=None, max_length=40)
     csv_contacts: Optional[list] = None
+    # Country for CSV numbers written without a code (ISO code like "IN").
+    # Empty = the business's own WhatsApp number's country.
+    csv_region: Optional[str] = Field(default=None, max_length=2)
     scheduled_at: Optional[str] = Field(default=None, max_length=64)
     recurrence: Optional[str] = Field(default=None, max_length=16)
     # Idempotency key, minted once per form session by the browser. A
@@ -376,8 +438,9 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
     # scheduled campaign sends to is locked in at creation time. Recurring
     # campaigns re-resolve fresh on every occurrence instead (see
     # dispatch_scheduled_campaigns) so new matching leads get included.
-    contacts = resolve_contacts(req.project_id, req.recipient_filter, req.tag_filter, req.csv_contacts)
-    _enforce_recipient_cap(contacts)
+    contacts, skipped = resolve_contacts(req.project_id, req.recipient_filter, req.tag_filter,
+                                         req.csv_contacts, req.csv_region)
+    _enforce_recipient_cap(contacts, skipped)
 
     wa = _wa_integration(req.project_id)
     if not wa["phone_number_id"]:
@@ -438,15 +501,16 @@ def create_campaign(req: CampaignRequest, background_tasks: BackgroundTasks, use
     campaign_id = campaign_res.data[0]["id"]
 
     if is_future:
-        return {"id": campaign_id, "total": len(contacts), "status": "scheduled", "scheduled_at": scheduled_dt_iso}
+        return {"id": campaign_id, "total": len(contacts), "status": "scheduled", "scheduled_at": scheduled_dt_iso,
+                "skipped_count": len(skipped)}
 
     background_tasks.add_task(
         send_campaign_messages,
         campaign_id, contacts, req.template_name, req.template_language,
-        req.variables, wa["phone_number_id"], wa["token"], header,
+        req.variables, wa["phone_number_id"], wa["token"], header, req.project_id,
     )
 
-    return {"id": campaign_id, "total": len(contacts), "status": "sending"}
+    return {"id": campaign_id, "total": len(contacts), "status": "sending", "skipped_count": len(skipped)}
 
 
 # -------------------------------------------------
@@ -471,8 +535,9 @@ def update_campaign(campaign_id: str, req: CampaignRequest, user=Depends(verify_
         raise HTTPException(status_code=400, detail="Scheduled time is required when editing a scheduled campaign")
 
     # Re-resolve recipients — leads/tags may have changed since it was first created.
-    contacts = resolve_contacts(project_id, req.recipient_filter, req.tag_filter, req.csv_contacts)
-    _enforce_recipient_cap(contacts)
+    contacts, skipped = resolve_contacts(project_id, req.recipient_filter, req.tag_filter,
+                                         req.csv_contacts, req.csv_region)
+    _enforce_recipient_cap(contacts, skipped)
 
     wa = _wa_integration(project_id)
     header = None
@@ -537,7 +602,7 @@ def _fill_name(value, contact) -> str:
 
 def send_campaign_messages(
     campaign_id, contacts, template_name, template_lang,
-    variables, phone_number_id, token=None, header=None
+    variables, phone_number_id, token=None, header=None, project_id=None
 ):
     """Send template messages to all contacts.
 
@@ -558,6 +623,8 @@ def send_campaign_messages(
     # via the campaign's own failed_count column. This counts only raw
     # exceptions, purely to size the single Sentry report below.
     send_exceptions = 0
+    wa_id_mismatch = 0
+    region = phones.default_region_for_project(project_id) if project_id else phones.FALLBACK_REGION
     token = token or WHATSAPP_TOKEN
 
     # Same for every recipient except where a value uses {name}.
@@ -594,12 +661,13 @@ def send_campaign_messages(
                 print(f"Campaign {campaign_id} stopped after {sent} sends")
                 break
 
-        phone = str(contact.get("phone") or "").strip().replace(" ", "").replace("-", "")
-        if not phone:
+        # New contacts are already "+<digits>" (exact). Campaigns scheduled
+        # before that change hold the raw numbers - normalised the same way.
+        digits, _reason = phones.normalize(contact.get("phone"), region)
+        if not digits:
             failed += 1
             continue
-        if not phone.startswith("+"):
-            phone = f"+{phone}"
+        phone = "+" + digits
 
         try:
             # `http` is whatsapp.py's _TimeoutSession — the bare requests.post
@@ -625,6 +693,16 @@ def send_campaign_messages(
 
             if res.ok:
                 sent += 1
+                # Tripwire: Meta says which WhatsApp account it delivered to.
+                # Some countries legitimately differ (e.g. Brazil's extra 9),
+                # so this is only counted and reported, never acted on.
+                try:
+                    wa_id = ((res.json().get("contacts") or [{}])[0] or {}).get("wa_id")
+                    if wa_id and wa_id != digits:
+                        wa_id_mismatch += 1
+                        print(f"Campaign {campaign_id}: sent to {phone}, WhatsApp delivered to {wa_id}")
+                except Exception:
+                    pass
             else:
                 failed += 1
                 print(f"Campaign send error to {phone}: {res.text}")
@@ -644,6 +722,12 @@ def send_campaign_messages(
         # Rate limiting — WhatsApp allows ~80 messages/sec on low tier
         time.sleep(0.05)
 
+    if wa_id_mismatch:
+        sentry_sdk.capture_message(
+            f"send_campaign_messages: {wa_id_mismatch} recipient(s) of campaign {campaign_id} "
+            "were delivered to a different WhatsApp number than sent",
+            level="warning",
+        )
     if send_exceptions:
         sentry_sdk.capture_message(
             f"send_campaign_messages: {send_exceptions} of {len(contacts)} send(s) raised an "
@@ -750,7 +834,7 @@ def dispatch_scheduled_campaigns():
                 # for the whole campaign.
                 completed = send_campaign_messages(
                     camp["id"], contacts, camp["template_name"], template_lang,
-                    variables, phone_number_id, wa_token, tv.get("header"),
+                    variables, phone_number_id, wa_token, tv.get("header"), camp["project_id"],
                 )
 
                 recurrence = camp.get("recurrence")
@@ -760,7 +844,7 @@ def dispatch_scheduled_campaigns():
                     try:
                         current_dt = datetime.fromisoformat(str(camp["scheduled_at"]).replace("Z", "+00:00"))
                         next_dt = _next_occurrence(current_dt, recurrence)
-                        fresh_contacts = resolve_contacts(
+                        fresh_contacts, _skipped = resolve_contacts(
                             camp["project_id"], camp.get("recipient_filter", "all"), camp.get("tag_filter"), None
                         )
                         supabase.table("campaigns").update({
