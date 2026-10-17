@@ -275,6 +275,44 @@ TEMPLATE_LIBRARY = [
         "variables": ["Customer name", "Product name", "Delivery date"],
         "language": "en_US",
     },
+    # Sent by shop.notify_order_status when the merchant changes an order's
+    # status in Shop > Orders. The names must match shop_rules.
+    {
+        "id": "order_status_update",
+        "category": "UTILITY",
+        "industry": "Restaurants / Retail",
+        "name": "order_status_update",
+        "display_name": "Order Status Update",
+        "description": "Tells the customer their shop order's new status when you update it in Shop > Orders",
+        "preview": "Hi {Name}, here is an update on your order {Order ID} from {Branch}. Status: {Status}. Thank you for ordering with us!",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}, here is an update on your order {{2}} from {{3}}. Status: {{4}}. Thank you for ordering with us!",
+            }
+        ],
+        "example_body": ["Asha", "A1B2C3D4", "Geetham Velachery", "Out for delivery"],
+        "variables": ["Customer name", "Order ID", "Branch name", "Status"],
+        "language": "en_US",
+    },
+    {
+        "id": "order_cancelled",
+        "category": "UTILITY",
+        "industry": "Restaurants / Retail",
+        "name": "order_cancelled",
+        "display_name": "Order Cancelled",
+        "description": "Tells the customer their shop order was cancelled (Shop > Orders)",
+        "preview": "Hi {Name}, your order {Order ID} from {Branch} has been cancelled. If you have already paid or have any questions, please contact us at {Phone}.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}, your order {{2}} from {{3}} has been cancelled. If you have already paid or have any questions, please contact us at {{4}}.",
+            }
+        ],
+        "example_body": ["Asha", "A1B2C3D4", "Geetham Velachery", "+91 98765 43210"],
+        "variables": ["Customer name", "Order ID", "Branch name", "Contact phone"],
+        "language": "en_US",
+    },
 ]
 
 
