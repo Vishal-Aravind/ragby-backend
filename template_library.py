@@ -302,11 +302,11 @@ TEMPLATE_LIBRARY = [
         "name": "order_cancelled",
         "display_name": "Order Cancelled",
         "description": "Tells the customer their shop order was cancelled (Shop > Orders)",
-        "preview": "Hi {Name}, your order {Order ID} from {Branch} has been cancelled. If you have already paid or have any questions, please contact us at {Phone}.",
+        "preview": "Hi {Name}, your order {Order ID} from {Branch} has been cancelled. If you have already paid or have any questions, please contact us at {Phone} and we will help you.",
         "components": [
             {
                 "type": "BODY",
-                "text": "Hi {{1}}, your order {{2}} from {{3}} has been cancelled. If you have already paid or have any questions, please contact us at {{4}}.",
+                "text": "Hi {{1}}, your order {{2}} from {{3}} has been cancelled. If you have already paid or have any questions, please contact us at {{4}} and we will help you.",
             }
         ],
         "example_body": ["Asha", "A1B2C3D4", "Geetham Velachery", "+91 98765 43210"],
