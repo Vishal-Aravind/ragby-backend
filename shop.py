@@ -65,6 +65,8 @@ class ShopConfigUpdate(BaseModel):
     is_enabled: Optional[bool] = None
     bot_can_assist: Optional[bool] = None
     bot_can_order: Optional[bool] = None
+    # WhatsApp a new-order alert to the branch / store phone (default on).
+    notify_owner_whatsapp: Optional[bool] = None
 
 class CatalogCreate(BaseModel):
     project_id: str
@@ -248,7 +250,7 @@ def get_active_catalog_summary(project_id: str) -> list:
 _SHOP_CONFIG_SAFE_COLUMNS = (
     "project_id, store_name, store_phone, gst_percent, currency, currency_code, "
     "accent_color, delivery_types, terms_note, razorpay_key_id, is_enabled, "
-    "bot_can_assist, bot_can_order, cover_image_url, logo_url"
+    "bot_can_assist, bot_can_order, cover_image_url, logo_url, notify_owner_whatsapp"
 )
 
 
@@ -2024,14 +2026,42 @@ def send_order_placed_message(order: dict, branch: Optional[dict], config: dict)
     return "failed"
 
 
+def _owner_window_open(project_id: str, phone: str) -> bool:
+    """True when this phone messaged the business number in the last 24
+    hours - the only time a free-text message reaches it. Any doubt (no
+    chat, a lookup error) counts as closed, so the template goes out."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if not digits:
+        return False
+    try:
+        chat = supabase.table("chats").select("id") \
+            .eq("project_id", project_id).eq("external_id", digits).eq("channel", "whatsapp") \
+            .limit(1).execute()
+        if not chat.data:
+            return False
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        last = supabase.table("chat_messages").select("id") \
+            .eq("chat_id", chat.data[0]["id"]).eq("role", "user").gte("created_at", since) \
+            .limit(1).execute()
+        return bool(last.data)
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        return False
+
+
 def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, phone_number_id: str, token: str,
-                           header: str = "🔔 *New Order Paid!*") -> None:
+                           header: str = "🔔 *New Order Paid!*", payment_note: Optional[str] = None) -> None:
     """New-order alert to the branch phone (else store_phone). Best-effort.
-    Free text, so it only reaches an owner inside the 24-hour window, as
-    it always has."""
+    Inside the 24-hour window: the full text (free). Outside it: the approved
+    shop_new_order_alert template, which reaches the owner regardless; if the
+    template isn't added/approved yet, the text is still tried. Skipped when
+    the merchant turned the WhatsApp alert off (they use the dashboard bell)."""
     from whatsapp import send_whatsapp_message
     from shop_branches import contact_phone
 
+    # Missing key (older row / column not added yet) means on.
+    if config.get("notify_owner_whatsapp") is False:
+        return
     owner_phone = contact_phone(branch, config)
     if not owner_phone:
         return
@@ -2087,6 +2117,16 @@ def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, ph
     msg += f"Order ID: #{order['id'][:8].upper()}"
 
     try:
+        if order.get("project_id") and not _owner_window_open(order["project_id"], owner_phone):
+            branch_name = (branch or {}).get("name") or config.get("store_name") or "your store"
+            sent = _send_order_template(
+                owner_phone, shop_rules.OWNER_ALERT_TEMPLATE,
+                [order["id"][:8].upper(), branch_name, order.get("customer_name") or "a customer",
+                 f"{currency}{float(order['total']):.2f}", "delivery" if is_delivery else "pickup",
+                 payment_note or pay_label],
+                phone_number_id, token)
+            if sent:
+                return
         send_whatsapp_message(to=owner_phone, text=msg, phone_number_id=phone_number_id, token=token)
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -2364,7 +2404,8 @@ def _handle_paid_after_cancel(order: dict, config: dict):
     config = {**(config or {}), "project_id": order["project_id"]}
     paid = {**order, "payment_status": "paid"}
     send_owner_order_alert(paid, branch, config, phone_number_id, token,
-                           header="⚠️ *Paid after cancel — refund or fulfil*")
+                           header="⚠️ *Paid after cancel — refund or fulfil*",
+                           payment_note="paid after the order was cancelled - refund or fulfil")
     try:
         send_whatsapp_message(
             to=order["phone_number"],

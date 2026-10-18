@@ -313,6 +313,24 @@ TEMPLATE_LIBRARY = [
         "variables": ["Customer name", "Order ID", "Branch name", "Contact phone"],
         "language": "en_US",
     },
+    {
+        "id": "shop_new_order_alert",
+        "category": "UTILITY",
+        "industry": "Restaurants / Retail",
+        "name": "shop_new_order_alert",
+        "display_name": "Shop New Order Alert (for you)",
+        "description": "Tells YOU (the shop owner) about a new order, even when your phone hasn't messaged this number in 24 hours (Shop > Orders)",
+        "preview": "New order #{Order ID} received at {Branch} from {Customer}. Order total: {Total}. This is a {Pickup or delivery} order and the payment status is: {Payment}. Open the Orders tab in your Zavo dashboard to see the items and update the order.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "New order #{{1}} received at {{2}} from {{3}}. Order total: {{4}}. This is a {{5}} order and the payment status is: {{6}}. Open the Orders tab in your Zavo dashboard to see the items and update the order.",
+            }
+        ],
+        "example_body": ["A1B2C3D4", "Geetham Velachery", "Asha", "₹582.00", "pickup", "Collect payment"],
+        "variables": ["Order ID", "Branch name", "Customer name", "Order total", "Pickup or delivery", "Payment status"],
+        "language": "en_US",
+    },
 ]
 
 

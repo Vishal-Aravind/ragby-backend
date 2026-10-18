@@ -348,6 +348,7 @@ def money(value) -> str:
 
 ORDER_STATUS_TEMPLATE = "order_status_update"
 ORDER_CANCELLED_TEMPLATE = "order_cancelled"
+OWNER_ALERT_TEMPLATE = "shop_new_order_alert"
 
 _MULTISPACE_RE = re.compile(r" {4,}")
 
