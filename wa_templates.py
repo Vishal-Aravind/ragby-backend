@@ -83,10 +83,13 @@ def _check_variables(text: str, where: str, errors: list) -> int:
     if distinct != list(range(1, len(distinct) + 1)):
         errors.append(f"{where}: number the variables {{{{1}}}}, {{{{2}}}}, ... in order, without gaps.")
     stripped = text.strip()
-    if VAR_RE.match(stripped):
-        errors.append(f"{where}: can't start with a variable - put a word before it.")
-    if re.search(r"\{\{\s*\d+\s*\}\}$", stripped):
-        errors.append(f"{where}: can't end with a variable - put a word or a full stop after it.")
+    # Punctuation next to a variable doesn't count as text for Meta: "{{1}}."
+    # is still a variable at the end ("Variables can't be at the start or end
+    # of the template"), so only real words before/after make it acceptable.
+    if re.match(r"[\s.,;:!?'\"(\[\-\u2013\u2014\u2026]*\{\{\s*\d+\s*\}\}", stripped):
+        errors.append(f"{where}: can't start with a variable - put a few words before it.")
+    if re.search(r"\{\{\s*\d+\s*\}\}[\s.,;:!?'\")\]\-\u2013\u2014\u2026]*$", stripped):
+        errors.append(f"{where}: can't end with a variable - a full stop after it doesn't help, add a few words after it.")
     if re.search(r"\}\}\s*\{\{", stripped):
         errors.append(f"{where}: two variables can't be right next to each other - put a word between them.")
     return len(distinct)

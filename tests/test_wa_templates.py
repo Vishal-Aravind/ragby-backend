@@ -50,8 +50,10 @@ class TemplateRulesTests(unittest.TestCase):
         for body, phrase in cases.items():
             errors, _ = build_components(spec(body=body, body_examples=["a", "b", "c"]))
             self.assertTrue(any(phrase in e for e in errors), (body, errors))
-        # a full stop after the last variable is fine
+        # Meta treats "{{1}}." as a variable at the end - punctuation isn't text
         errors, _ = build_components(spec(body="Hi there, your code is {{1}}.", body_examples=["X1"]))
+        self.assertTrue(any("end" in e for e in errors), errors)
+        errors, _ = build_components(spec(body="Hi there, your code is {{1}}. Thank you!", body_examples=["X1"]))
         self.assertEqual(errors, [])
 
     def test_missing_examples(self):
