@@ -6,6 +6,8 @@ every money and open-state decision the server makes can be unit tested
 The customer page only ever displays what these return. It never decides
 by itself whether a branch is open or what delivery costs.
 """
+import hashlib
+import json
 import math
 import re
 from datetime import datetime, time, timedelta
@@ -406,3 +408,305 @@ def order_status_message(new_status: str, fulfilment: str, ctx: dict) -> Optiona
         return None
 
     return {"template": ORDER_STATUS_TEMPLATE, "params": [name, oid, branch, status_text], "text": text}
+
+
+# ─────────────────────────────────────────────
+# OFFERS & COUPONS (pure maths; DB loading is in shop_offers.py)
+# ─────────────────────────────────────────────
+
+OFFER_KINDS = ("percent", "flat", "free_delivery")
+OFFER_APPLICATIONS = ("automatic", "code")
+OFFER_FULFILMENTS = ("any", "pickup", "delivery")
+SOLD_OUT_PREFS = ("remove_item", "call_me", "merchant_choice")
+CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{3,19}$")
+
+OFFER_REASON_MESSAGES = {
+    "invalid_code": "This code isn't valid.",
+    "expired": "This offer has expired.",
+    "not_started": "This offer starts on {date}.",
+    "paused": "This offer isn't available right now.",
+    "branch": "This offer isn't valid at {branch}.",
+    "fulfilment": "This offer is only for {fulfilment} orders.",
+    "login_required": "Open the menu from your WhatsApp chat to use this offer.",
+    "min_order": "Add {short} more to use this offer (min order {min}).",
+    "limit_reached": "This offer has been fully claimed.",
+    "already_used": "You've already used this offer.",
+    "not_first_order": "This offer is for your first order only.",
+    "no_saving": "This offer doesn't lower your total yet.",
+    "not_better": "Your code saves {a}, but \"{title}\" saves {b} — we applied the better one.",
+    "rate_limited": "Too many code attempts. Please try again in 15 minutes.",
+}
+
+
+def normalize_code(raw) -> Optional[str]:
+    """Strip, remove inner spaces, uppercase. None when it isn't a valid
+    code shape (4-20 of A-Z 0-9 _ -, not starting with _ or -)."""
+    if raw is None:
+        return None
+    text = "".join(str(raw).split()).upper()
+    return text if CODE_RE.match(text) else None
+
+
+def parse_ts(value) -> Optional[datetime]:
+    """An aware datetime from a DB/ISO value, or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=ZoneInfo("UTC"))
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        # Postgres may send fractional seconds with other than 6 digits.
+        m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", text)
+        if not m:
+            return None
+        try:
+            dt = datetime.fromisoformat(f"{m.group(1)}.{(m.group(2) + '000000')[:6]}{m.group(3)}")
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=ZoneInfo("UTC"))
+
+
+def _f(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def offer_label(offer: dict, currency: str = "₹") -> str:
+    kind = offer.get("kind")
+    if kind == "percent":
+        label = f"{money(offer.get('value'))}% off"
+        if offer.get("max_discount") is not None and _f(offer.get("max_discount")) > 0:
+            label += f" up to {currency}{money(offer['max_discount'])}"
+    elif kind == "flat":
+        label = f"{currency}{money(offer.get('value'))} off"
+    else:
+        label = "Free delivery"
+    if _f(offer.get("min_order_value")) > 0:
+        label += f" on orders above {currency}{money(offer['min_order_value'])}"
+    if offer.get("first_order_only"):
+        label += " · first order"
+    if offer.get("application") == "code":
+        if offer.get("is_visible", True) and offer.get("code"):
+            label += f" · use {offer['code']}"
+    else:
+        label += " · auto-applied"
+    return label
+
+
+def offer_saving(offer: dict, subtotal, delivery_fee) -> dict:
+    subtotal = round(_f(subtotal), 2)
+    kind = offer.get("kind")
+    if kind == "percent":
+        d = round(subtotal * _f(offer.get("value")) / 100, 2)
+        if offer.get("max_discount") is not None and _f(offer.get("max_discount")) > 0:
+            d = min(d, round(_f(offer["max_discount"]), 2))
+        d = min(d, subtotal)
+        return {"items_discount": round(max(d, 0.0), 2), "delivery_discount": 0.0}
+    if kind == "flat":
+        d = min(round(_f(offer.get("value")), 2), subtotal)
+        return {"items_discount": round(max(d, 0.0), 2), "delivery_discount": 0.0}
+    if kind == "free_delivery":
+        return {"items_discount": 0.0, "delivery_discount": round(max(_f(delivery_fee), 0.0), 2)}
+    return {"items_discount": 0.0, "delivery_discount": 0.0}
+
+
+def saving_total(s: dict) -> float:
+    return round(s["items_discount"] + s["delivery_discount"], 2)
+
+
+def offer_ineligibility(offer: dict, ctx: dict) -> Optional[str]:
+    """The first reason this offer can't apply, or None. ctx: now,
+    branch_id, fulfilment, subtotal, delivery_fee, verified, used_total,
+    used_by_customer, has_prior_order."""
+    now = ctx.get("now")
+    if not offer.get("is_active", True) or offer.get("archived_at"):
+        return "paused"
+    starts, ends = parse_ts(offer.get("starts_at")), parse_ts(offer.get("ends_at"))
+    if starts and now and now < starts:
+        return "not_started"
+    if ends and now and now >= ends:
+        return "expired"
+    branch_ids = [str(b) for b in (offer.get("branch_ids") or [])]
+    if branch_ids and str(ctx.get("branch_id")) not in branch_ids:
+        return "branch"
+    scope = offer.get("fulfilment") or "any"
+    if scope != "any" and scope != ctx.get("fulfilment"):
+        return "fulfilment"
+    if (offer.get("first_order_only") or offer.get("per_customer_limit") is not None) and not ctx.get("verified"):
+        return "login_required"
+    if _f(ctx.get("subtotal")) < _f(offer.get("min_order_value")):
+        return "min_order"
+    if offer.get("usage_limit") is not None and int(ctx.get("used_total") or 0) >= int(offer["usage_limit"]):
+        return "limit_reached"
+    if offer.get("per_customer_limit") is not None and \
+            int(ctx.get("used_by_customer") or 0) >= int(offer["per_customer_limit"]):
+        return "already_used"
+    if offer.get("first_order_only") and ctx.get("has_prior_order"):
+        return "not_first_order"
+    if saving_total(offer_saving(offer, ctx.get("subtotal"), ctx.get("delivery_fee"))) <= 0:
+        return "no_saving"
+    return None
+
+
+def _format_local(dt: datetime, tz_name: Optional[str]) -> str:
+    local = dt.astimezone(resolve_timezone(tz_name)) if tz_name else dt
+    return f"{local.day} {local.strftime('%b')}, {format_time(local.hour, local.minute)}"
+
+
+def offer_reason_message(reason: Optional[str], offer: Optional[dict] = None, ctx: Optional[dict] = None,
+                         currency: str = "₹") -> Optional[str]:
+    """The customer-facing text for a reason code (OFFER_REASON_MESSAGES)."""
+    if not reason:
+        return None
+    template = OFFER_REASON_MESSAGES.get(reason)
+    if not template:
+        return None
+    offer, ctx = offer or {}, ctx or {}
+    if reason == "not_started":
+        starts = parse_ts(offer.get("starts_at"))
+        return template.format(date=_format_local(starts, ctx.get("timezone")) if starts else "a later date")
+    if reason == "branch":
+        return template.format(branch=ctx.get("branch_name") or "this branch")
+    if reason == "fulfilment":
+        return template.format(fulfilment="delivery" if offer.get("fulfilment") == "delivery" else "pickup")
+    if reason == "min_order":
+        min_v = _f(offer.get("min_order_value"))
+        short = max(0.0, round(min_v - _f(ctx.get("subtotal")), 2))
+        return template.format(short=f"{currency}{money(short)}", min=f"{currency}{money(min_v)}")
+    if reason == "not_better":
+        return template.format(a=f"{currency}{money(ctx.get('code_saving'))}",
+                               title=" ".join(str(ctx.get("better_title") or "").split()),
+                               b=f"{currency}{money(ctx.get('better_saving'))}")
+    return template
+
+
+_FAR_FUTURE = datetime(9999, 12, 31, tzinfo=ZoneInfo("UTC"))
+
+
+def _tie_key(candidate: dict):
+    offer = candidate["offer"]
+    ends = parse_ts(offer.get("ends_at"))
+    created = parse_ts(offer.get("created_at"))
+    return (-candidate["saving"], ends is None, ends or _FAR_FUTURE, created or _FAR_FUTURE)
+
+
+def choose_offer(auto_candidates: list, code_candidate: Optional[dict]):
+    """(chosen candidate | None, coupon_status | None).
+
+    Candidates are ELIGIBLE offers as {"offer", "saving", "items_discount",
+    "delivery_discount"}. Best automatic = biggest saving; tie -> earliest
+    ends_at (no end date last), then oldest. An eligible code wins when it
+    saves at least as much as the best automatic offer ("applied"),
+    otherwise the automatic offer is used and the coupon is "not_better".
+    """
+    best_auto = min(auto_candidates, key=_tie_key) if auto_candidates else None
+    if code_candidate is not None:
+        if best_auto is None or code_candidate["saving"] >= best_auto["saving"]:
+            return code_candidate, "applied"
+        return best_auto, "not_better"
+    return best_auto, None
+
+
+def apply_offer_totals(subtotal, gst_percent, delivery_fee, items_discount, delivery_discount) -> dict:
+    """GST on the discounted item value; the delivery fee stays untaxed."""
+    taxable = round(_f(subtotal) - _f(items_discount), 2)
+    gst = round(taxable * _f(gst_percent) / 100, 2)
+    total = round(taxable + gst + _f(delivery_fee) - _f(delivery_discount), 2)
+    return {"taxable_subtotal": taxable, "gst_amount": gst, "total": max(total, 0.0)}
+
+
+def checkout_fingerprint(d: dict) -> str:
+    """sha256 hex of the canonical checkout: same cart, same details, same
+    coupon = same fingerprint (an unexpired payment link can be reused)."""
+    merged = {}
+    for it in (d.get("items") or []):
+        pid = str((it.get("product_id") if isinstance(it, dict) else getattr(it, "product_id", "")) or "")
+        qty = int((it.get("quantity") if isinstance(it, dict) else getattr(it, "quantity", 0)) or 0)
+        merged[pid] = merged.get(pid, 0) + qty
+
+    def s(v):
+        if v is None:
+            return None
+        text = " ".join(str(v).split())
+        return text or None
+
+    def num(v):
+        return None if v is None else round(float(v), 6)
+
+    delivery = d.get("fulfilment") == "delivery"
+    canonical = {
+        "branch_id": s(d.get("branch_id")),
+        "items": sorted([[k, v] for k, v in merged.items()]),
+        "fulfilment": s(d.get("fulfilment")),
+        "name": s(d.get("name")),
+        "line1": s(d.get("line1")) if delivery else None,
+        "line2": s(d.get("line2")) if delivery else None,
+        "city": s(d.get("city")) if delivery else None,
+        "pincode": s(d.get("pincode")) if delivery else None,
+        "lat": num(d.get("lat")) if delivery else None,
+        "lng": num(d.get("lng")) if delivery else None,
+        "coupon": normalize_code(d.get("coupon")) if d.get("coupon") else None,
+        "sold_out_preference": s(d.get("sold_out_preference")),
+        "note": s(d.get("note")),
+    }
+    blob = json.dumps(canonical, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def offer_state(offer: dict, now: datetime, used_total: int = 0) -> str:
+    """Dashboard badge: active | scheduled | expired | paused | limit_reached | archived."""
+    if offer.get("archived_at"):
+        return "archived"
+    ends = parse_ts(offer.get("ends_at"))
+    if ends and now >= ends:
+        return "expired"
+    if not offer.get("is_active", True):
+        return "paused"
+    starts = parse_ts(offer.get("starts_at"))
+    if starts and now < starts:
+        return "scheduled"
+    if offer.get("usage_limit") is not None and int(used_total or 0) >= int(offer["usage_limit"]):
+        return "limit_reached"
+    return "active"
+
+
+def _num(v):
+    if v is None:
+        return None
+    v = round(float(v), 2)
+    return int(v) if v == int(v) else v
+
+
+def public_offer(offer: dict, currency: str = "₹") -> dict:
+    """The PublicOffer shape (no usage counts, limits or internal fields)."""
+    return {
+        "id": offer["id"],
+        "title": offer.get("title"),
+        "description": offer.get("description"),
+        "kind": offer.get("kind"),
+        "value": _num(offer.get("value")),
+        "max_discount": _num(offer.get("max_discount")),
+        "min_order_value": _num(offer.get("min_order_value") or 0),
+        "application": offer.get("application"),
+        "code": offer.get("code") if offer.get("application") == "code" else None,
+        "fulfilment": offer.get("fulfilment") or "any",
+        "first_order_only": bool(offer.get("first_order_only")),
+        "ends_at": offer.get("ends_at"),
+        "label": offer_label(offer, currency),
+    }
+
+
+def valid_media_url(url, supabase_url: Optional[str]) -> bool:
+    """A public flow-media object of this project's Supabase, in the
+    shop-branding or products folder, png/jpg/webp."""
+    if not url or not supabase_url or not isinstance(url, str) or len(url) > 1000:
+        return False
+    pattern = (rf"^{re.escape(supabase_url.rstrip('/'))}/storage/v1/object/public/flow-media/"
+               r"[0-9a-f-]{36}/(shop-branding|products)/\d{10,16}\.(png|jpe?g|webp)$")
+    return re.match(pattern, url) is not None

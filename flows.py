@@ -473,7 +473,8 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
     elif t == "message_shop":
         catalog_id = c.get("catalog_id", "")
         proj_id = project_id or ""
-        shop_url = f"{FRONTEND_URL}/shop/{proj_id}?catalog={catalog_id}&phone={to}"
+        from shop_identity import build_shop_url
+        shop_url = build_shop_url(proj_id, to, catalog_id=catalog_id)
 
         send_whatsapp_cta_url(
             to,
@@ -927,9 +928,9 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         order_id = (session.get("metadata") or {}).get("order_id")
         catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
         branch_id = (session.get("metadata") or {}).get("branch_id")
-        branch_q = f"&branch={branch_id}" if branch_id else ""
+        from shop_identity import build_shop_url
         # Pass order_id so the shop page can pre-load existing cart items
-        shop_url = f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}&order_id={order_id}{branch_q}"
+        shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id, branch_id=branch_id)
 
         if "continue" in text.lower():
             send_whatsapp_buttons(
@@ -952,8 +953,13 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             )
         elif "clear cart" in text.lower():
             if order_id:
-                supabase.table("orders").delete().eq("id", order_id).execute()
-            shop_url_fresh = f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}{branch_q}"
+                # Only an unplaced cart of this customer: a stale button must
+                # never delete a paid or placed order. Nothing deleted is
+                # fine, the customer still gets the fresh link.
+                supabase.table("orders").delete().eq("id", order_id).eq("project_id", project_id) \
+                    .eq("phone_number", phone_number).eq("status", "pending") \
+                    .eq("payment_status", "unpaid").execute()
+            shop_url_fresh = build_shop_url(project_id, phone_number, catalog_id=catalog_id, branch_id=branch_id)
             send_whatsapp_cta_url(
                 phone_number,
                 "Your cart has been cleared. Start fresh! 🛒",
@@ -979,7 +985,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         return
 
     if session and session.get("mode") == "awaiting_special_request":
-        from shop import order_fulfilment_lines
+        from shop import order_fulfilment_lines, order_money_lines
         from shop_branches import get_branch, contact_phone
         from phones import pretty
         order_id = (session.get("metadata") or {}).get("order_id")
@@ -987,7 +993,8 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         special_request = None if text.lower().strip() in ("skip", "skip_special_req") else text
 
         if order_id and special_request:
-            supabase.table("orders").update({"special_request": special_request}).eq("id", order_id).execute()
+            supabase.table("orders").update({"special_request": special_request}).eq("id", order_id) \
+                .eq("project_id", project_id).eq("status", "pending").eq("payment_status", "unpaid").execute()
 
         order_res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
         order = order_res.data
@@ -1009,13 +1016,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         summary = f"🎉 *All set! You've picked your menu.*\nHere's a quick summary:\n\n"
         summary += f"🧾 *Booked Items*\n\n{items_text}\n\n"
         summary += f"{'─' * 20}\n"
-        summary += f"Subtotal: {currency}{int(order['subtotal'])}\n"
-        if order["gst_amount"] > 0:
-            gst_pct = config.get("gst_percent", 0)
-            summary += f"GST ({gst_pct}%): {currency}{order['gst_amount']:.2f}\n"
-        if order.get("fulfilment") == "delivery":
-            fee = float(order.get("delivery_fee") or 0)
-            summary += f"Delivery fee: {currency}{fee:.2f}\n" if fee > 0 else "Delivery: FREE\n"
+        summary += order_money_lines(order, currency) + "\n"
         # order.total already includes the delivery fee (set by the server).
         summary += f"\n*Total Amount: {currency}{float(order['total']):.2f}*\n\n"
         branch_name = (branch or {}).get("name") or store_name
@@ -1046,12 +1047,13 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         return
 
     if session and session.get("mode") == "awaiting_payment_confirm":
-        from shop import generate_razorpay_link, send_owner_order_alert, OrderChangedError
+        from shop import (generate_razorpay_link, send_owner_order_alert, OrderChangedError,
+                          send_order_placed_message, release_offer, cancel_payment_link)
         from shop_branches import get_branch, get_default_branch, status_for
+        from shop_identity import build_shop_url
         order_id = (session.get("metadata") or {}).get("order_id")
         catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
         branch_id = (session.get("metadata") or {}).get("branch_id")
-        branch_q = f"&branch={branch_id}" if branch_id else ""
 
         if "confirm" in text.lower() or "pay" in text.lower():
             # Re-read: the merchant (or another tap) may have moved it on.
@@ -1077,7 +1079,8 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                         f"😔 Sorry, {branch['name']} is {label[:1].lower() + label[1:]}. "
                         "Your cart is saved — tap below to order when we're open.",
                         "View Menu",
-                        f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}&order_id={order_id}&branch={branch['id']}",
+                        build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id,
+                                       branch_id=branch["id"]),
                         phone_number_id, token,
                     )
                     return
@@ -1106,13 +1109,23 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                     "metadata": {"order_id": order_id, "branch_id": branch_id},
                 })
             else:
-                send_whatsapp_message(
-                    phone_number,
-                    "✅ *Order Confirmed!*\n\nThank you! We'll contact you shortly to arrange payment.",
-                    phone_number_id, token,
-                )
-                # Without Razorpay nobody told the owner about this order.
+                # No Razorpay: the order is placed for offline payment. The
+                # write is conditional, so it leaves the editable cart state
+                # exactly once (an old Add More link can't change it after
+                # the owner was alerted).
+                from datetime import datetime as _dt, timezone as _tz
+                placed = supabase.table("orders").update({
+                    "status": "confirmed", "payment_method": "offline",
+                    "placed_at": _dt.now(_tz.utc).isoformat(),
+                }).eq("id", order_id).eq("project_id", project_id) \
+                    .eq("status", "pending").eq("payment_status", "unpaid").execute()
+                if not placed.data:
+                    send_whatsapp_message(phone_number, "This order is already being processed.", phone_number_id, token)
+                    return
+                order = placed.data[0]
                 config.setdefault("project_id", project_id)
+                send_order_placed_message(order, branch, config)
+                # Without Razorpay nobody told the owner about this order.
                 send_owner_order_alert(order, branch, config, phone_number_id, token,
                                        header="🔔 *New Order (collect payment)*")
                 upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
@@ -1120,7 +1133,8 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             # Same pre-load pattern "Add More" already uses one stage
             # earlier — an explicit, unambiguous link rather than trying to
             # guess what to modify from free text.
-            shop_url = f"{FRONTEND_URL}/shop/{project_id}?catalog={catalog_id}&phone={phone_number}&order_id={order_id}{branch_q}"
+            shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id,
+                                      branch_id=branch_id)
             send_whatsapp_cta_url(
                 phone_number,
                 "Sure! Tap below to change your order 🛍️",
@@ -1129,8 +1143,24 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 phone_number_id, token,
             )
         elif "cancel" in text.lower():
+            cancelled = None
             if order_id:
-                supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
+                # Only an order that hasn't been paid or placed: a stale
+                # Cancel button must never cancel a paid order.
+                cancelled = supabase.table("orders").update({"status": "cancelled"}) \
+                    .eq("id", order_id).eq("project_id", project_id).eq("phone_number", phone_number) \
+                    .eq("status", "pending").in_("payment_status", ["unpaid", "link_sent"]).execute()
+            if not cancelled or not cancelled.data:
+                send_whatsapp_message(
+                    phone_number,
+                    "This order is already being processed — please contact the store.",
+                    phone_number_id, token,
+                )
+                return
+            row = cancelled.data[0]
+            release_offer(order_id)
+            if row.get("payment_status") == "link_sent":
+                cancel_payment_link(project_id, row.get("payment_id"))
             send_whatsapp_message(
                 phone_number,
                 "No problem, your order has been cancelled. 😊",

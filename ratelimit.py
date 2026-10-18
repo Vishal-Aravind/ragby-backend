@@ -82,6 +82,22 @@ def is_rate_limited(key: str, limit: int, window_seconds: int = 60) -> bool:
     return _in_memory_is_rate_limited(key, limit, window_seconds)
 
 
+def is_blocked(key: str, limit: int, window_seconds: int = 60) -> bool:
+    """True if `key` already has `limit` or more events in the window.
+    Does NOT count as an attempt (the peek_rate_limit RPC only reads), so a
+    blocked caller can be given the same answer for every input. On any
+    RPC failure this returns False: the incrementing limits still apply."""
+    try:
+        res = supabase.rpc(
+            "peek_rate_limit",
+            {"p_key": key, "p_limit": limit, "p_window_seconds": window_seconds},
+        ).execute()
+        return bool(res.data)
+    except Exception as e:
+        _capture_with_cooldown(e)
+        return False
+
+
 def client_ip(request) -> str:
     """The caller's real IP, for rate-limit keys.
 

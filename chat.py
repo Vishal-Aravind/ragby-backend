@@ -768,9 +768,9 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
 
         if name == "browse_shop_catalog":
             products = get_active_catalog_summary(project_id)
-            shop_link = f"{FRONTEND_URL}/shop/{project_id}"
-            if channel == "whatsapp" and external_id:
-                shop_link += f"?phone={external_id}"
+            from shop_identity import build_shop_url
+            # A signed customer token only for a verified WhatsApp sender.
+            shop_link = build_shop_url(project_id, external_id if channel == "whatsapp" and external_id else None)
             if not products:
                 return {"shop_link": shop_link, "message": "No products currently available."}
             return {"shop_link": shop_link, "products": products}

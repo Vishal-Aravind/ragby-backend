@@ -1,4 +1,5 @@
 import sentry_sdk
+from sentry_sdk.scrubber import EventScrubber, DEFAULT_DENYLIST
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +20,11 @@ if SENTRY_DSN:
         dsn=SENTRY_DSN,
         traces_sample_rate=0.1,
         send_default_pii=False,
+        # Shop customer tokens and order receipts are bearer credentials that
+        # ride in public request bodies; the default list only matches exact
+        # key names like "token", so name them explicitly.
+        event_scrubber=EventScrubber(
+            denylist=DEFAULT_DENYLIST + ["customer_token", "receipt", "t", "r"], recursive=True),
     )
 else:
     # Say so out loud. Every capture_exception() in this codebase is a
@@ -43,6 +49,7 @@ from template_library import router as template_library_router
 from wa_templates import router as wa_templates_router
 from shop import router as shop_router
 from shop_branches import router as shop_branches_router
+from shop_offers import router as shop_offers_router
 from appointments import router as appointments_router
 from events import router as events_router
 from content_gaps import router as content_gaps_router
@@ -369,6 +376,7 @@ app.include_router(template_library_router)
 app.include_router(wa_templates_router)
 app.include_router(shop_router)
 app.include_router(shop_branches_router)
+app.include_router(shop_offers_router)
 app.include_router(appointments_router)
 app.include_router(events_router)
 app.include_router(content_gaps_router)

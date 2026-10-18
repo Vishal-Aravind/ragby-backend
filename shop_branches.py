@@ -20,11 +20,14 @@ import phones
 import shop_rules
 from auth import verify_token, require_project_access
 from clients import supabase
+from config import SUPABASE_URL
 from ratelimit import is_rate_limited, client_ip
 from shop import (
     CartItem, MAX_CART_LINES, shop_error, _public_shop_guard, _assert_shop_enabled,
-    _price_items, load_shop_config,
+    _price_items, load_shop_config, checkout_mode,
 )
+from shop_identity import resolve_identity
+from shop_offers import evaluate_offers
 
 router = APIRouter()
 
@@ -59,6 +62,7 @@ class BranchUpsert(BaseModel):
     prep_minutes: Optional[int] = None
     sort_order: Optional[int] = None
     make_default: Optional[bool] = None
+    image_url: Optional[str] = Field(default=None, max_length=2000)
 
 
 class CopyMenuBody(BaseModel):
@@ -81,6 +85,8 @@ class QuoteRequest(BaseModel):
     customer_lat: Optional[float] = None
     customer_lng: Optional[float] = None
     customer_pincode: Optional[Union[str, int]] = None
+    customer_token: Optional[str] = Field(default=None, max_length=1024)
+    coupon_code: Optional[str] = Field(default=None, max_length=64)
 
 
 # ─────────────────────────────────────────────
@@ -211,18 +217,26 @@ SUBMIT_ERROR_STATUS = {
 
 def price_order(project_id: str, branch: dict, items: list, fulfilment: str,
                 cust_lat=None, cust_lng=None, pincode=None, catalog_id: Optional[str] = None,
-                config: Optional[dict] = None, now_utc: Optional[datetime] = None) -> dict:
+                config: Optional[dict] = None, now_utc: Optional[datetime] = None,
+                coupon_code: Optional[str] = None, identity: Optional[dict] = None, ip: Optional[str] = None,
+                offers_enabled: bool = False, exclude_order_id: Optional[str] = None,
+                exclude_offer_ids=()) -> dict:
     """Server-side pricing and every order rule, in one place.
 
     Never raises for business rules: they come back in `errors`, in check
     order (shop, branch, open state, fulfilment, items, minimum, delivery).
     /quote returns them as-is; /submit-cart raises the first one.
+
+    Offers (v3) apply only with offers_enabled=True; offer problems never
+    go into `errors`, they are reported in `coupon` / `available_offers`.
+    GST is charged on the discounted item value.
     """
     if config is None:
         config = load_shop_config(project_id)
+    now = now_utc or datetime.now(timezone.utc)
     currency = config.get("currency") or "₹"
     gst_percent = float(config.get("gst_percent") or 0)
-    status = status_for(branch, config, now_utc)
+    status = status_for(branch, config, now)
     errors = []
 
     if not shop_is_enabled(config):
@@ -275,8 +289,11 @@ def price_order(project_id: str, branch: dict, items: list, fulfilment: str,
                 msg = "This branch doesn't deliver to your location."
             errors.append(_err(reason, msg))
 
-    gst_amount = round(subtotal * gst_percent / 100, 2)
-    total = round(subtotal + gst_amount + delivery_fee, 2)
+    ev = evaluate_offers(project_id, branch, fulfilment, subtotal if items_data else 0,
+                         delivery_fee, identity or {}, coupon_code, ip, now,
+                         exclude_order_id, exclude_offer_ids, enabled=offers_enabled, currency=currency)
+    t = shop_rules.apply_offer_totals(subtotal, gst_percent, delivery_fee,
+                                      ev["items_discount"], ev["delivery_discount"])
 
     free_above = branch.get("free_delivery_above")
     amount_to_free = None
@@ -293,10 +310,17 @@ def price_order(project_id: str, branch: dict, items: list, fulfilment: str,
         "price_changed": price_changed,
         "subtotal": subtotal,
         "gst_percent": gst_percent,
-        "gst_amount": gst_amount,
+        "gst_amount": t["gst_amount"],
         "delivery_fee": delivery_fee,
         "delivery_distance_km": distance,
-        "total": total,
+        "total": t["total"],
+        "taxable_subtotal": t["taxable_subtotal"],
+        "items_discount": ev["items_discount"],
+        "delivery_discount": ev["delivery_discount"],
+        "discount_amount": round(ev["items_discount"] + ev["delivery_discount"], 2),
+        "offer": ev["offer"],
+        "coupon": ev["coupon"],
+        "available_offers": ev["available_offers"],
         "min_order_value": min_order,
         "free_delivery_above": float(free_above) if free_above is not None else None,
         "amount_to_free_delivery": amount_to_free,
@@ -415,6 +439,15 @@ def _branch_fields(data: dict, project_id: str, creating: bool) -> dict:
             if not isinstance(data[key], bool):
                 raise _bad(f"{key} must be true or false")
             out[key] = data[key]
+
+    if "image_url" in data:
+        url = data.get("image_url")
+        if url is None or (isinstance(url, str) and not url.strip()):
+            out["image_url"] = None
+        elif not shop_rules.valid_media_url(str(url).strip(), SUPABASE_URL):
+            raise shop_error(400, "invalid_image_url", "Upload the image from the dashboard (PNG, JPG or WEBP).")
+        else:
+            out["image_url"] = str(url).strip()
 
     limits = {
         # key: (label, lo, hi, nullable, integer)
@@ -714,6 +747,7 @@ def public_branches(project_id: str, body: BranchSearch, request: Request):
             "min_order_value": float(b.get("min_order_value") or 0),
             "free_delivery_above": float(b["free_delivery_above"]) if b.get("free_delivery_above") is not None else None,
             "prep_minutes": b.get("prep_minutes"),
+            "image_url": b.get("image_url"),
             "status": status_for(b, config, now),
             "_sort": b.get("sort_order") or 0,
         })
@@ -783,9 +817,43 @@ def public_quote(project_id: str, body: QuoteRequest, request: Request):
     lat, lng, pin = parse_customer_location(body.customer_lat, body.customer_lng, body.customer_pincode,
                                             phones.default_region_for_project(project_id))
 
-    priced = price_order(project_id, branch, body.items, fulfilment, lat, lng, pin, catalog_id=catalog_id)
+    # Legacy phone not accepted here: only a signed token is an identity.
+    identity = resolve_identity(project_id, body.customer_token, None)
+    config = load_shop_config(project_id)
+    priced, mode = price_with_mode(project_id, branch, body.items, fulfilment, lat, lng, pin,
+                                   catalog_id=catalog_id, config=config, identity=identity,
+                                   coupon_code=body.coupon_code, ip=client_ip(request))
+    return quote_view(priced, mode, identity["verified"])
+
+
+def price_with_mode(project_id: str, branch: dict, items: list, fulfilment: str, lat, lng, pin,
+                    catalog_id: Optional[str], config: dict, identity: dict, coupon_code: Optional[str],
+                    ip: Optional[str], exclude_order_id: Optional[str] = None, exclude_offer_ids=()):
+    """(priced, checkout_mode), shared by /quote and /place-order so both
+    always agree. Offers are on unless the mode is confirm_in_whatsapp. A
+    free order (total 0) needs a verified token like an offline one; an
+    unverified free checkout falls back to confirm_in_whatsapp, re-priced
+    with offers off (that flow never applies offers)."""
+    mode = checkout_mode(project_id, config, identity.get("verified"))
+    kw = dict(catalog_id=catalog_id, config=config, coupon_code=coupon_code, identity=identity, ip=ip,
+              exclude_order_id=exclude_order_id, exclude_offer_ids=exclude_offer_ids)
+    priced = price_order(project_id, branch, items, fulfilment, lat, lng, pin,
+                         offers_enabled=mode != "confirm_in_whatsapp", **kw)
+    if not priced["errors"] and priced["total"] == 0 and mode == "pay_online":
+        if identity.get("verified"):
+            mode = "place_offline"
+        else:
+            mode = "confirm_in_whatsapp"
+            priced = price_order(project_id, branch, items, fulfilment, lat, lng, pin, offers_enabled=False, **kw)
+    return priced, mode
+
+
+def quote_view(priced: dict, mode: str, verified: bool) -> dict:
+    """The /quote response shape (also the `quote` in place-order 409s)."""
     return {
         "ok": not priced["errors"],
+        "checkout_mode": mode,
+        "verified": verified,
         "currency": priced["currency"],
         "items": priced["items"],
         "subtotal": priced["subtotal"],
@@ -800,4 +868,11 @@ def public_quote(project_id: str, body: QuoteRequest, request: Request):
         "status": priced["status"],
         "delivery": priced["delivery"],
         "errors": priced["errors"],
+        "taxable_subtotal": priced["taxable_subtotal"],
+        "items_discount": priced["items_discount"],
+        "delivery_discount": priced["delivery_discount"],
+        "discount_amount": priced["discount_amount"],
+        "offer": priced["offer"],
+        "coupon": priced["coupon"],
+        "available_offers": priced["available_offers"],
     }
