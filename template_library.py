@@ -396,7 +396,15 @@ def add_template_to_waba(data: dict, user=Depends(verify_token)):
         # Meta's raw error text can name internal ids and token state — log
         # it, don't return it.
         print(f"Meta template submit failed: {resp_data}")
-        raise HTTPException(status_code=400, detail="Could not submit that template to WhatsApp.")
+        # error_user_msg / error_user_title are the texts Meta writes for the
+        # person managing the template (e.g. "Content is too similar to an
+        # existing template") - safe to show, unlike the raw error.
+        err = (resp_data.get("error") if isinstance(resp_data, dict) else None) or {}
+        reason = str(err.get("error_user_msg") or err.get("error_user_title") or "").strip()[:300]
+        detail = "Could not submit that template to WhatsApp."
+        if reason:
+            detail = f"WhatsApp didn't accept this template: {reason}"
+        raise HTTPException(status_code=400, detail=detail)
 
 
 # -------------------------------------------------
