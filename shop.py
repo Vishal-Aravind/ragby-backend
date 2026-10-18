@@ -65,8 +65,6 @@ class ShopConfigUpdate(BaseModel):
     is_enabled: Optional[bool] = None
     bot_can_assist: Optional[bool] = None
     bot_can_order: Optional[bool] = None
-    # WhatsApp a new-order alert to the branch / store phone (default on).
-    notify_owner_whatsapp: Optional[bool] = None
 
 class CatalogCreate(BaseModel):
     project_id: str
@@ -250,7 +248,7 @@ def get_active_catalog_summary(project_id: str) -> list:
 _SHOP_CONFIG_SAFE_COLUMNS = (
     "project_id, store_name, store_phone, gst_percent, currency, currency_code, "
     "accent_color, delivery_types, terms_note, razorpay_key_id, is_enabled, "
-    "bot_can_assist, bot_can_order, cover_image_url, logo_url, notify_owner_whatsapp"
+    "bot_can_assist, bot_can_order, cover_image_url, logo_url"
 )
 
 
@@ -2051,18 +2049,22 @@ def _owner_window_open(project_id: str, phone: str) -> bool:
 
 def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, phone_number_id: str, token: str,
                            header: str = "🔔 *New Order Paid!*", payment_note: Optional[str] = None) -> None:
-    """New-order alert to the branch phone (else store_phone). Best-effort.
+    """New-order alert to the BRANCH's phone. Best-effort.
     Inside the 24-hour window: the full text (free). Outside it: the approved
     shop_new_order_alert template, which reaches the owner regardless; if the
-    template isn't added/approved yet, the text is still tried. Skipped when
-    the merchant turned the WhatsApp alert off (they use the dashboard bell)."""
+    template isn't added/approved yet, the text is still tried. Each branch
+    has its own phone and its own on/off switch (off = the dashboard bell
+    only); a branch without a phone sends nothing."""
     from whatsapp import send_whatsapp_message
     from shop_branches import contact_phone
 
-    # Missing key (older row / column not added yet) means on.
-    if config.get("notify_owner_whatsapp") is False:
-        return
-    owner_phone = contact_phone(branch, config)
+    if branch is not None:
+        # Missing key (column not added yet) means on.
+        if branch.get("notify_owner_whatsapp") is False:
+            return
+        owner_phone = branch.get("phone")
+    else:
+        owner_phone = contact_phone(None, config)
     if not owner_phone:
         return
     currency = config.get("currency") or "₹"

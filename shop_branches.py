@@ -52,6 +52,7 @@ class BranchUpsert(BaseModel):
     timezone: Optional[str] = Field(default=None, max_length=64)
     is_active: Optional[bool] = None
     accepting_orders: Optional[bool] = None
+    notify_owner_whatsapp: Optional[bool] = None
     pickup_enabled: Optional[bool] = None
     delivery_enabled: Optional[bool] = None
     delivery_per_km: Optional[float] = None
@@ -434,7 +435,7 @@ def _branch_fields(data: dict, project_id: str, creating: bool) -> dict:
         except ValueError as e:
             raise _bad(str(e))
 
-    for key in ("is_active", "accepting_orders", "pickup_enabled", "delivery_enabled"):
+    for key in ("is_active", "accepting_orders", "notify_owner_whatsapp", "pickup_enabled", "delivery_enabled"):
         if key in data:
             if not isinstance(data[key], bool):
                 raise _bad(f"{key} must be true or false")
