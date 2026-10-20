@@ -376,51 +376,11 @@ SHOP_READONLY_TOOLS = [
     },
 ]
 
-# Only ever added to active_tools when channel == "whatsapp" (see run_chat) —
-# the confirm/payment flow this hands off to (Continue/Add More/Clear Cart
-# buttons + Razorpay) only exists on WhatsApp today.
-SHOP_ORDER_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "place_order",
-            "description": (
-                "Create a new order from items the customer has explicitly confirmed. Always call "
-                "browse_shop_catalog first if you haven't already, so item names and prices are accurate. "
-                "Read back the exact items, quantities, and total price to the customer and get their "
-                "explicit yes BEFORE calling this — never call it on a first mention of wanting to order, "
-                "and never guess an item or quantity they haven't confirmed. After this runs, the customer "
-                "gets WhatsApp buttons to finish confirming and pay — tell them to check those."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "product_name": {"type": "string", "description": "Exact product name as shown by browse_shop_catalog"},
-                                "quantity": {"type": "integer"},
-                            },
-                            "required": ["product_name", "quantity"],
-                        },
-                    },
-                    "delivery_type": {"type": "string", "description": "One of the store's delivery options, only if the customer specified one"},
-                },
-                "required": ["items"],
-            },
-        },
-    },
-]
-
 # Only ever added to active_tools when channel == "shopify" (see run_chat) —
 # the Shopify storefront widget's checkout hands off to Shopify's own
 # hosted checkout via a real Storefront API cart, NOT Razorpay — Shopify's
 # API License prohibits an app-hosted alternative to Shopify Checkout on a
-# merchant's own storefront. This is why it's a separate tool set from
-# SHOP_ORDER_TOOLS rather than that tool simply being allowed on more
-# channels — the two have genuinely different completion mechanisms.
+# merchant's own storefront.
 SHOPIFY_CART_TOOLS = [
     {
         "type": "function",
@@ -647,11 +607,10 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
             if not service:
                 return {"error": f"Couldn't find a service called '{args['service_name']}'. Call list_appointment_services to see the exact names, or ask the customer to clarify."}
 
-            # Paid services complete the same confirm/pay-link flow Shop's
-            # place_order uses, which only exists on WhatsApp today — mirrors
-            # SHOP_ORDER_TOOLS' exact restriction. Never trust the model
-            # alone on this; re-checked here regardless of what channel-gated
-            # tool list it was offered. Free services keep working everywhere.
+            # Paid services complete a confirm/pay-link flow that only exists
+            # on WhatsApp today. Never trust the model alone on this;
+            # re-checked here regardless of what channel-gated tool list it
+            # was offered. Free services keep working everywhere.
             if service.get("payment_mode", "free") != "free" and channel != "whatsapp":
                 return {"error": "Booking this service requires payment, which is currently only supported on WhatsApp — direct the customer to the booking page link instead."}
 
@@ -752,7 +711,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
 
 
 def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, external_id: str) -> dict:
-    from shop import get_recent_orders_for_phone, get_active_catalog_summary, create_order_from_chat
+    from shop import get_recent_orders_for_phone, get_active_catalog_summary
 
     try:
         if name == "check_order_status":
@@ -774,17 +733,6 @@ def execute_shop_tool(name: str, args: dict, project_id: str, channel: str, exte
             if not products:
                 return {"shop_link": shop_link, "message": "No products currently available."}
             return {"shop_link": shop_link, "products": products}
-
-        if name == "place_order":
-            # Belt-and-suspenders: only ever reachable when channel ==
-            # "whatsapp" since that's the only case SHOP_ORDER_TOOLS gets
-            # added to active_tools (see run_chat), but never trust that
-            # alone — re-check here too.
-            if channel != "whatsapp":
-                return {"error": "Ordering in chat is currently only available on WhatsApp — direct the customer to the shop link instead."}
-            if not external_id:
-                return {"error": "Missing the customer's phone number."}
-            return create_order_from_chat(project_id, external_id, args["items"], args.get("delivery_type"))
 
         return {"error": f"Unknown tool {name}"}
     except ValueError as e:
@@ -920,7 +868,7 @@ def execute_shopify_cart_tool(name: str, args: dict, project_id: str, channel: s
 def execute_tool(name: str, args: dict, project_id: str, channel: str, external_id: str, chat_id: str = None) -> dict:
     if name in ("list_appointment_services", "check_appointment_availability", "book_appointment", "cancel_appointment", "check_my_appointments"):
         return execute_appointment_tool(name, args, project_id, channel, external_id)
-    if name in ("check_order_status", "browse_shop_catalog", "place_order"):
+    if name in ("check_order_status", "browse_shop_catalog"):
         return execute_shop_tool(name, args, project_id, channel, external_id)
     if name in ("browse_upcoming_events", "get_event_registration_link", "check_my_event_registrations", "cancel_event_registration"):
         return execute_event_tool(name, args, project_id, channel, external_id)
@@ -1241,14 +1189,13 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
                 "preference at all), ask ONE clarifying question (budget, dietary need, occasion) before "
                 "recommending, rather than immediately listing items."
             )
-            if shop_settings.get("bot_can_order") and channel == "whatsapp":
-                active_tools += SHOP_ORDER_TOOLS
+            if channel != "shopify":
                 system_prompt += (
-                    "\n- You can also place a new order once the customer has explicitly confirmed the exact "
-                    "items, quantities, and total price — always check the catalog and read the order back "
-                    "to them first, never guess or assume what they want."
+                    "\n- You cannot place orders in this chat. When the customer wants to order, send them the "
+                    "menu link that browse_shop_catalog returns and tell them they can pick items, choose "
+                    "pickup or delivery and pay there."
                 )
-            elif shop_settings.get("bot_can_order") and channel == "shopify":
+            if shop_settings.get("bot_can_order") and channel == "shopify":
                 active_tools += SHOPIFY_CART_TOOLS
                 system_prompt += (
                     "\n- You can also generate a real Shopify checkout link once the customer has explicitly "

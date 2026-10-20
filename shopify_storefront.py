@@ -59,9 +59,8 @@ mutation cartCreate($input: CartInput!) {
 def create_checkout_from_chat(project_id: str, chat_id: str, requested_items: list) -> dict:
     """Builds a real Shopify cart from items the AI understood in
     conversation and returns its checkout URL. Every item is re-resolved
-    against the real synced catalog here — mirrors shop.py's
-    create_order_from_chat, which never trusts a model-supplied price
-    either. Items with no shopify_variant_id (manually-added, non-Shopify
+    against the real synced catalog here - a model-supplied price is never
+    trusted. Items with no shopify_variant_id (manually-added, non-Shopify
     products) can't be checked out this way — Shopify's own checkout can
     only sell real Shopify variants, so those are called out as a distinct
     error rather than silently dropped or guessed at."""
