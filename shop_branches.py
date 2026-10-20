@@ -880,6 +880,7 @@ def quote_view(priced: dict, mode: str, verified: bool) -> dict:
         "subtotal": priced["subtotal"],
         "gst_percent": priced["gst_percent"],
         "gst_amount": priced["gst_amount"],
+        "gst_breakdown": priced.get("gst_breakdown") or [],
         "delivery_fee": priced["delivery_fee"],
         "delivery_distance_km": priced["delivery_distance_km"],
         "total": priced["total"],
