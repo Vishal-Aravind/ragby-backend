@@ -476,6 +476,13 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         from shop_identity import build_shop_url
         shop_url = build_shop_url(proj_id, to, catalog_id=catalog_id)
 
+        # Shop switched off → the link would 403, so say so instead.
+        from shop_branches import shop_is_enabled
+        cfg_res = supabase.table("shop_config").select("is_enabled").eq("project_id", proj_id).maybe_single().execute() if proj_id else None
+        if not shop_is_enabled(cfg_res.data if cfg_res else None):
+            send_whatsapp_message(to, "Sorry, our shop isn't taking orders right now. Please check back later.", phone_number_id, token)
+            return
+
         send_whatsapp_cta_url(
             to,
             c.get("body", "Browse our menu and add items to your cart 🛒\nSelect multiple items at once"),

@@ -1139,6 +1139,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 
         from shop import get_shop_settings_if_assistable
         shop_settings = get_shop_settings_if_assistable(project_id)
+        # Shop switched off → no shop tools, so the bot doesn't hand out a link
+        # that 403s. The Shopify widget is exempt: there the catalog is the
+        # merchant's Shopify store, which this switch doesn't control.
+        if shop_settings and channel != "shopify" and shop_settings.get("is_enabled") is False:
+            shop_settings = None
         if shop_settings:
             active_tools += SHOP_READONLY_TOOLS
             is_shopify_widget = channel == "shopify"
