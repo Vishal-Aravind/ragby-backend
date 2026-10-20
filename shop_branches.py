@@ -293,8 +293,13 @@ def price_order(project_id: str, branch: dict, items: list, fulfilment: str,
     ev = evaluate_offers(project_id, branch, fulfilment, subtotal if items_data else 0,
                          delivery_fee, identity or {}, coupon_code, ip, now,
                          exclude_order_id, exclude_offer_ids, enabled=offers_enabled, currency=currency)
-    t = shop_rules.apply_offer_totals(subtotal, gst_percent, delivery_fee,
-                                      ev["items_discount"], ev["delivery_discount"])
+    # GST per item rate (an item without its own rate uses the shop rate).
+    t = shop_rules.compute_totals(
+        [{"line_total": round(it["price"] * it["quantity"], 2), "gst_percent": it.get("gst_percent")}
+         for it in items_data],
+        gst_percent, delivery_fee, ev["items_discount"], ev["delivery_discount"])
+    for it, rate in zip(items_data, t["line_rates"]):
+        it["gst_percent"] = rate          # saved with the order: the rate actually charged
 
     free_above = branch.get("free_delivery_above")
     amount_to_free = None
@@ -307,10 +312,12 @@ def price_order(project_id: str, branch: dict, items: list, fulfilment: str,
         "items": [{
             "product_id": it["product_id"], "name": it["name"], "price": it["price"],
             "quantity": it["quantity"], "line_total": round(it["price"] * it["quantity"], 2),
+            "gst_percent": it.get("gst_percent"),
         } for it in items_data],
         "price_changed": price_changed,
         "subtotal": subtotal,
         "gst_percent": gst_percent,
+        "gst_breakdown": t["gst_breakdown"],
         "gst_amount": t["gst_amount"],
         "delivery_fee": delivery_fee,
         "delivery_distance_km": distance,

@@ -160,7 +160,7 @@ def _upsert_variant_rows(project_id: str, catalog_id: str, product: dict, sort_o
             update_fields = {k: v for k, v in row.items() if k in _SHOPIFY_OWNED_FIELDS}
             supabase.table("products").update(update_fields).eq("id", existing.data["id"]).execute()
         else:
-            supabase.table("products").insert({**row, "category": "General", "gst_percent": 0}).execute()
+            supabase.table("products").insert({**row, "category": "General"}).execute()
 
     # Any variant that existed before this sync but is no longer present in
     # Shopify's current variant list gets soft-disabled, never hard-deleted —

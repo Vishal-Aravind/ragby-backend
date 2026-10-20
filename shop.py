@@ -86,7 +86,7 @@ class ProductCreate(BaseModel):
     price: float
     image_url: Optional[str] = None
     category: Optional[str] = "General"
-    gst_percent: Optional[float] = 0
+    gst_percent: Optional[float] = Field(default=None, ge=0, le=100)   # None = the shop rate
     is_available: bool = True
     sort_order: int = 0
 
@@ -755,7 +755,7 @@ def _price_items(project_id: str, branch_id: str, catalog_id: Optional[str], ite
     on_menu = {c["id"] for c in (cats.data or [])}
 
     res = supabase.table("products") \
-        .select("id, name, price, image_url, shopify_variant_id, is_available, catalog_id") \
+        .select("id, name, price, image_url, shopify_variant_id, is_available, catalog_id, gst_percent") \
         .eq("project_id", project_id) \
         .in_("id", list(wanted.keys())) \
         .execute()
@@ -784,6 +784,9 @@ def _price_items(project_id: str, branch_id: str, catalog_id: Optional[str], ite
             "quantity": quantity,
             "image_url": product.get("image_url"),
             "shopify_variant_id": product.get("shopify_variant_id"),
+            # The item's own GST rate; None = the shop rate (price_order fills
+            # in the rate actually used before the order is saved).
+            "gst_percent": product.get("gst_percent"),
         })
     return items_data, round(subtotal, 2), price_changed, errors
 
@@ -862,8 +865,8 @@ def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data
     items_text = "\n".join(lines)
     header = f"🛒 *Your Cart* — {branch['name']}" if branch and branch.get("name") else "🛒 *Your Cart*"
     summary = f"{header}\n\n{items_text}\n\nSubtotal: {currency}{shop_rules.money(subtotal)}"
-    if gst_amount > 0:
-        summary += f"\nGST: {currency}{gst_amount}"
+    for gst_line in shop_rules.gst_text_lines(order.get("gst_breakdown"), gst_amount, currency):
+        summary += f"\n{gst_line}"
     is_delivery = order.get("fulfilment") == "delivery"
     if is_delivery:
         fee = float(order.get("delivery_fee") or 0)
@@ -1056,6 +1059,7 @@ def submit_cart(body: CartSubmit, request: Request):
         "items": items_data,
         "subtotal": subtotal,
         "gst_amount": gst_amount,
+        "gst_breakdown": priced.get("gst_breakdown") or [],
         "total": total,
         "fulfilment": fulfilment,
         "delivery_type": "Delivery" if fulfilment == "delivery" else "Pickup",
@@ -1412,6 +1416,7 @@ def _totals(order: dict) -> dict:
     def f(k):
         return float(order.get(k) or 0)
     return {"subtotal": f("subtotal"), "items_discount": f("items_discount"), "gst_amount": f("gst_amount"),
+            "gst_breakdown": order.get("gst_breakdown") or [],
             "delivery_fee": f("delivery_fee"), "delivery_discount": f("delivery_discount"),
             "discount_amount": f("discount_amount"), "total": f("total")}
 
@@ -1447,6 +1452,7 @@ def _money_columns(priced: dict) -> dict:
     return {
         "subtotal": priced["subtotal"],
         "gst_amount": priced["gst_amount"],
+        "gst_breakdown": priced.get("gst_breakdown") or [],
         "total": priced["total"],
         "delivery_fee": priced["delivery_fee"],
         "offer_id": offer.get("id"),
@@ -1851,8 +1857,7 @@ def order_money_lines(order: dict, currency: str = "₹") -> str:
     if items_discount > 0:
         name = one_line(order.get("offer_code") or order.get("offer_title") or "")
         lines.append(f"Discount{f' ({name})' if name else ''}: −{currency}{items_discount:.2f}")
-    if float(order.get("gst_amount") or 0) > 0:
-        lines.append(f"GST: {currency}{float(order['gst_amount']):.2f}")
+    lines.extend(shop_rules.gst_text_lines(order.get("gst_breakdown"), order.get("gst_amount"), currency))
     if order.get("fulfilment") == "delivery":
         fee = float(order.get("delivery_fee") or 0)
         delivery_discount = float(order.get("delivery_discount") or 0)
@@ -1990,8 +1995,7 @@ def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, ph
     offer_name = one_line(order.get("offer_code") or order.get("offer_title") or "")
     if items_discount > 0:
         money_parts.append(f"Discount {currency}{items_discount:.2f}" + (f" ({offer_name})" if offer_name else ""))
-    if float(order.get("gst_amount") or 0) > 0:
-        money_parts.append(f"GST {currency}{float(order['gst_amount']):.2f}")
+    money_parts.extend(shop_rules.gst_text_lines(order.get("gst_breakdown"), order.get("gst_amount"), currency))
     if is_delivery:
         fee = float(order.get("delivery_fee") or 0)
         money_parts.append(f"Delivery {currency}{shop_rules.money(fee)}" if fee > 0 else "Delivery FREE")

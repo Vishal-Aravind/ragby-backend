@@ -622,6 +622,57 @@ def apply_offer_totals(subtotal, gst_percent, delivery_fee, items_discount, deli
     return {"taxable_subtotal": taxable, "gst_amount": gst, "total": max(total, 0.0)}
 
 
+def compute_totals(lines: list, default_rate, delivery_fee, items_discount, delivery_discount) -> dict:
+    """Totals with GST per item rate.
+
+    lines: [{"line_total": price * qty, "gst_percent": rate or None}] - None
+    means "use default_rate" (the shop rate), 0 means exempt. The item
+    discount is shared across the lines in proportion to their value, GST is
+    charged on each line's discounted value, and the tax is worked out per
+    rate (the way a tax invoice groups it). The delivery fee stays untaxed.
+
+    Returns taxable_subtotal, gst_amount, gst_breakdown
+    ([{"rate", "taxable", "tax"}], one row per rate), total, and line_rates
+    (the rate used for each line, in order).
+    """
+    default = _f(default_rate)
+    lines = list(lines or [])
+    subtotal = round(sum(_f(l.get("line_total")) for l in lines), 2)
+    discount = min(max(_f(items_discount), 0.0), subtotal)
+    taxable_lines, allocated = [], 0.0
+    for i, l in enumerate(lines):
+        value = round(_f(l.get("line_total")), 2)
+        if i == len(lines) - 1:
+            share = round(discount - allocated, 2)     # the last line takes the rounding rest
+        else:
+            share = round(discount * value / subtotal, 2) if subtotal > 0 else 0.0
+            allocated += share
+        raw = l.get("gst_percent")
+        rate = default if raw is None else _f(raw)
+        taxable_lines.append((rate, max(round(value - share, 2), 0.0)))
+    groups = {}
+    for rate, taxable in taxable_lines:
+        groups[rate] = round(groups.get(rate, 0.0) + taxable, 2)
+    breakdown = [{"rate": r, "taxable": t, "tax": round(t * r / 100, 2)} for r, t in sorted(groups.items())]
+    gst = round(sum(b["tax"] for b in breakdown), 2)
+    taxable_subtotal = round(sum(t for _, t in taxable_lines), 2)
+    total = round(taxable_subtotal + gst + _f(delivery_fee) - _f(delivery_discount), 2)
+    return {"taxable_subtotal": taxable_subtotal, "gst_amount": gst, "gst_breakdown": breakdown,
+            "total": max(total, 0.0), "line_rates": [r for r, _ in taxable_lines]}
+
+
+def gst_text_lines(breakdown, gst_amount, currency: str) -> list:
+    """GST line(s) for a WhatsApp message / receipt: one line per rate, or a
+    single "GST (18%)" line when every item has the same rate. Orders made
+    before per-item GST have no breakdown, so they show the plain total."""
+    rows = [b for b in (breakdown or []) if _f(b.get("tax")) > 0]
+    if not rows:
+        return [f"GST: {currency}{_f(gst_amount):.2f}"] if _f(gst_amount) > 0 else []
+    if len(rows) == 1:
+        return [f"GST ({rows[0]['rate']:g}%): {currency}{_f(rows[0]['tax']):.2f}"]
+    return [f"GST {b['rate']:g}%: {currency}{_f(b['tax']):.2f}" for b in rows]
+
+
 def checkout_fingerprint(d: dict) -> str:
     """sha256 hex of the canonical checkout: same cart, same details, same
     coupon = same fingerprint (an unexpired payment link can be reused)."""
