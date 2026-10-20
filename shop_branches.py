@@ -64,6 +64,11 @@ class BranchUpsert(BaseModel):
     sort_order: Optional[int] = None
     make_default: Optional[bool] = None
     image_url: Optional[str] = Field(default=None, max_length=2000)
+    # Tax invoice override (empty = use the shop's)
+    gstin: Optional[str] = Field(default=None, max_length=40)
+    legal_name: Optional[str] = Field(default=None, max_length=400)
+    registered_address: Optional[str] = Field(default=None, max_length=1000)
+    state: Optional[str] = Field(default=None, max_length=100)
 
 
 class CopyMenuBody(BaseModel):
@@ -456,6 +461,14 @@ def _branch_fields(data: dict, project_id: str, creating: bool) -> dict:
             raise shop_error(400, "invalid_image_url", "Upload the image from the dashboard (PNG, JPG or WEBP).")
         else:
             out["image_url"] = str(url).strip()
+
+    seller = {k: data[k] for k in ("gstin", "legal_name", "registered_address", "state") if k in data}
+    if seller:
+        from shop_invoice import clean_seller_fields
+        try:
+            out.update(clean_seller_fields(seller))
+        except ValueError as e:
+            raise _bad(str(e))
 
     limits = {
         # key: (label, lo, hi, nullable, integer)

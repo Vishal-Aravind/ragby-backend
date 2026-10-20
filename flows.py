@@ -1131,6 +1131,8 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                     return
                 order = placed.data[0]
                 config.setdefault("project_id", project_id)
+                from shop import with_invoice
+                order = with_invoice(order, config, branch)
                 send_order_placed_message(order, branch, config)
                 # Without Razorpay nobody told the owner about this order.
                 send_owner_order_alert(order, branch, config, phone_number_id, token,

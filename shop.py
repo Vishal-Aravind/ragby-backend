@@ -1198,7 +1198,7 @@ def public_my_orders(project_id: str, body: MyOrdersBody, request: Request):
     limit = max(1, min(int(body.limit or 20), 20))
     res = supabase.table("orders").select(
         "id, created_at, placed_at, status, payment_status, payment_method, branch_id, fulfilment, items, "
-        "total, discount_amount, offer_code, payment_link_url, payment_link_expires_at"
+        "total, discount_amount, offer_code, payment_link_url, payment_link_expires_at, invoice_number"
     ).eq("project_id", project_id).eq("phone_number", phone) \
         .or_("placed_at.not.is.null,status.neq.pending") \
         .order("created_at", desc=True).limit(limit).execute()
@@ -1226,6 +1226,7 @@ def public_my_orders(project_id: str, body: MyOrdersBody, request: Request):
             "offer_code": o.get("offer_code"),
             "pay_url": pay_url,
             "pay_expires_at": pay_expires,
+            "invoice_number": o.get("invoice_number"),
         })
     return {"orders": out}
 
@@ -1266,6 +1267,7 @@ def public_order_status(project_id: str, order_id: str, body: OrderAuthBody, req
         "branch_name": names.get(order.get("branch_id")),
         "pay_url": pay_url,
         "pay_expires_at": pay_expires,
+        "invoice_number": order.get("invoice_number"),
     }
 
 
@@ -1438,6 +1440,7 @@ def _place_summary(order: dict, state: str, branch_name: Optional[str] = None, p
         "payment_expires_at": payment_expires_at if state == "payment_required" else None,
         "payment_method": order.get("payment_method") or ("online" if state == "payment_required" else None),
         "receipt": shop_identity.order_receipt(order["id"]),
+        "invoice_number": order.get("invoice_number"),
         "branch_name": branch_name,
         "fulfilment": order.get("fulfilment") or "pickup",
         "totals": _totals(order),
@@ -1663,6 +1666,7 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
             return _place_summary((again.data or [order])[0], "already_placed", branch_name=branch.get("name"))
         order = u.data[0]
         confirm_offer(order["id"])
+        order = with_invoice(order, config, branch)
         wa = send_order_placed_message(order, branch, config)
         phone_number_id, token = _wa_creds(project_id)
         if phone_number_id:
@@ -1685,6 +1689,13 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
     order = {**order, "payment_method": "online", "payment_status": "link_sent"}
     return _place_summary(order, "payment_required", branch_name=branch.get("name"), payment_url=link["url"],
                           payment_expires_at=link["expires_at"], notice=notice)
+
+
+def with_invoice(order: dict, config: Optional[dict] = None, branch: Optional[dict] = None) -> dict:
+    """The order with its invoice number issued (paid / confirmed orders).
+    Best-effort: on any failure the order comes back unchanged."""
+    from shop_invoice import issue_invoice
+    return issue_invoice(order, config, branch) or order
 
 
 def _set_session(project_id: str, phone: str, data: dict):
@@ -1768,7 +1779,12 @@ def update_order(order_id: str, body: OrderStatusUpdate, user=Depends(verify_tok
             notification = "failed"
 
     res = supabase.table("orders").select("*").eq("id", order_id).single().execute()
-    return {**res.data, "notification": notification}
+    fresh = res.data
+    if update and not fresh.get("invoice_number"):
+        # Confirmed or marked paid by staff (e.g. older chat orders): the
+        # invoice is issued here. No-op for pending / cancelled orders.
+        fresh = with_invoice(fresh)
+    return {**fresh, "notification": notification}
 
 
 # ─────────────────────────────────────────────
@@ -1921,6 +1937,8 @@ def send_order_placed_message(order: dict, branch: Optional[dict], config: dict)
     if contact:
         msg += f"📞 Contact: {phones.pretty(contact)}\n"
     msg += f"📦 Your orders: {shop_identity.build_shop_url(project_id, order['phone_number'], branch_id=order.get('branch_id'), view='orders')}\n"
+    from shop_invoice import invoice_line
+    msg += invoice_line(order)
     msg += "\nThe store will contact you if anything changes."
 
     try:
@@ -2230,6 +2248,7 @@ async def razorpay_webhook(request: Request):
             return {"status": "ok"}
         order = {**order, **paid_fields}
         confirm_offer(order["id"])
+        order = with_invoice(order, config)
 
         try:
             push_order_to_shopify(order["id"])
@@ -2278,6 +2297,8 @@ async def razorpay_webhook(request: Request):
         orders_url = shop_identity.build_shop_url(order["project_id"], order["phone_number"],
                                                   branch_id=order.get("branch_id"), view="orders")
         msg += f"📦 Your orders: {orders_url}\n"
+        from shop_invoice import invoice_line
+        msg += invoice_line(order)
         msg += "\nWe'll keep you posted on WhatsApp! 🎉"
 
         sent_ok = False
