@@ -1177,6 +1177,11 @@ def run_chat(project_id: str, chat_id: str, message: str, history: list):
 
             system_prompt += (
                 "\n\nShop:\n"
+                "- IMPORTANT: the menu, product prices and the customer's own orders NEVER live in your "
+                "documents — they only exist through the tools below. If a message is about the menu, an "
+                "item, a price, ordering, or the customer's orders, always call the matching tool "
+                "(browse_shop_catalog or check_order_status) first. Never respond with 'I couldn't find "
+                "that' or ask generic clarifying questions for this category without calling the tool.\n"
                 "- You can look up the customer's own past orders and browse the product catalog using the "
                 "tools provided.\n"
                 + browse_guidance +
