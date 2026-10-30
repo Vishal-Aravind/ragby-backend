@@ -1001,12 +1001,18 @@ def book_appointment(body: BookingCreate, request: Request):
         raise HTTPException(status_code=429, detail="Too many booking attempts — please wait a moment and try again.")
     if not body.service_id and not body.reschedule_id:
         raise HTTPException(status_code=400, detail="A service must be selected")
+    customer_phone = body.customer_phone
+    if not body.reschedule_id:
+        from phones import normalize, default_region_for_project
+        customer_phone, reason = normalize(customer_phone, default_region_for_project(body.project_id))
+        if not customer_phone:
+            raise HTTPException(status_code=400, detail=reason or "Please enter a valid phone number.")
     try:
         return create_appointment(
             project_id=body.project_id,
             service_id=body.service_id,
             customer_name=body.customer_name,
-            customer_phone=body.customer_phone,
+            customer_phone=customer_phone,
             appointment_date=body.appointment_date,
             start_time=body.start_time,
             notes=body.notes,
