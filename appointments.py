@@ -236,7 +236,7 @@ def generate_slots(date_str: str, settings: dict, service: dict, busy_slots: Lis
         .select("start_time, end_time") \
         .eq("project_id", settings.get("project_id", "")) \
         .eq("appointment_date", date_str) \
-        .or_(f"status.in.(confirmed,rescheduled),and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
+        .or_(f"status.eq.confirmed,and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
         .execute()
 
     booking_ranges = []
@@ -1113,7 +1113,7 @@ def get_upcoming_appointments(project_id: str, phone: str, limit: int = 5) -> li
         .select("*") \
         .eq("project_id", project_id) \
         .eq("customer_phone", clean_phone) \
-        .in_("status", ["confirmed", "rescheduled"]) \
+        .eq("status", "confirmed") \
         .gte("appointment_date", today) \
         .order("appointment_date", desc=False) \
         .order("start_time", desc=False) \
@@ -1475,7 +1475,7 @@ def is_appointment_slot_still_available(appointment: dict, settings: dict) -> bo
         .eq("project_id", appointment["project_id"]) \
         .eq("appointment_date", date_str) \
         .neq("id", appointment["id"]) \
-        .or_(f"status.in.(confirmed,rescheduled),and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
+        .or_(f"status.eq.confirmed,and(status.eq.pending_payment,hold_expires_at.gt.{now_iso})") \
         .execute()
 
     overlap_count = 0
