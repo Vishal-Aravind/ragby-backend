@@ -1036,7 +1036,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         summary += f"\n*Total Amount: {currency}{float(order['total']):.2f}*\n\n"
         branch_name = (branch or {}).get("name") or store_name
         if branch_name:
-            summary += f"🏪 Branch - *{branch_name}*\n"
+            summary += f"🏪 *{branch_name}*\n"
         if contact:
             summary += f"📞 Contact - {pretty(contact)}\n\n"
         if terms_note:

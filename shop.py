@@ -285,6 +285,17 @@ async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depen
         supabase.table("shop_config").update(update).eq("project_id", project_id).execute()
     else:
         supabase.table("shop_config").insert({"project_id": project_id, **update}).execute()
+    name = shop_rules.clean_text(update.get("store_name"), 80) if update.get("store_name") else None
+    if name:
+        # One store: its branch carries the same name (see only_branch).
+        try:
+            from shop_branches import only_branch
+            single = only_branch(project_id)
+            if single and single.get("name") != name:
+                supabase.table("shop_branches").update({"name": name}) \
+                    .eq("id", single["id"]).eq("project_id", project_id).execute()
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
     res = supabase.table("shop_config").select(_SHOP_CONFIG_SAFE_COLUMNS).eq("project_id", project_id).single().execute()
     return res.data
 

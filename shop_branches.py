@@ -111,6 +111,16 @@ def ensure_default_branch(project_id: str) -> Optional[str]:
     return res.data if isinstance(res.data, str) else None
 
 
+def only_branch(project_id: str) -> Optional[dict]:
+    """The project's branch when it has exactly one, else None. A one-store
+    shop has a single name: the branch name and shop_config.store_name are
+    kept the same, so customers never see the placeholder "Main"."""
+    res = supabase.table("shop_branches").select("id, name") \
+        .eq("project_id", project_id).limit(2).execute()
+    rows = res.data or []
+    return rows[0] if len(rows) == 1 else None
+
+
 def get_branch(project_id: str, branch_id: str) -> Optional[dict]:
     """The branch row, only if it belongs to project_id."""
     if not branch_id or not shop_rules.UUID_RE.match(str(branch_id)):
@@ -609,6 +619,14 @@ def update_branch(branch_id: str, body: BranchUpsert, user=Depends(verify_token)
     if fields:
         fields["updated_at"] = datetime.now(timezone.utc).isoformat()
         supabase.table("shop_branches").update(fields).eq("id", branch_id).eq("project_id", project_id).execute()
+        if fields.get("name"):
+            try:
+                single = only_branch(project_id)
+                if single and single["id"] == branch_id:
+                    supabase.table("shop_config").update({"store_name": fields["name"]}) \
+                        .eq("project_id", project_id).execute()
+            except Exception as e:
+                sentry_sdk.capture_exception(e)
 
     if make_default and not branch.get("is_default"):
         # Clear the old default first: the unique index allows one per project.
