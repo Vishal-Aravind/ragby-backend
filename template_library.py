@@ -17,7 +17,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_reminder",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_reminder",
         "display_name": "Appointment Reminder",
         "description": "Remind customers about upcoming appointments",
@@ -110,7 +110,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_confirmed",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_confirmed",
         "display_name": "Appointment Confirmed",
         "description": "Confirms a booking made on your booking page, with Reschedule / Cancel buttons",
@@ -132,7 +132,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_confirmed_details",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_confirmed_details",
         "display_name": "Appointment Confirmed (with details)",
         "description": "Like Appointment Confirmed, plus the location and note you set on a service. Used instead of it when the service has them",
@@ -154,7 +154,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_request_received",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_request_received",
         "display_name": "Appointment Request Received",
         "description": "Tells the customer their booking request was received and will be confirmed (for services that need your approval)",
@@ -172,7 +172,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_followup",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_followup",
         "display_name": "Appointment Follow-up",
         "description": "A thank-you sent some hours after the appointment, with your own message such as a review link (Appointments > Settings)",
@@ -190,7 +190,7 @@ TEMPLATE_LIBRARY = [
     {
         "id": "appointment_cancelled",
         "category": "UTILITY",
-        "industry": "Healthcare / Services",
+        "industry": "Appointments",
         "name": "appointment_cancelled",
         "display_name": "Appointment Cancelled",
         "description": "Tells the customer their appointment was cancelled",
