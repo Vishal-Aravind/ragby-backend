@@ -589,7 +589,7 @@ def execute_appointment_tool(name: str, args: dict, project_id: str, channel: st
 
     try:
         if name == "list_appointment_services":
-            res = supabase.table("appointment_services").select("name, description, duration_minutes").eq("project_id", project_id).eq("is_active", True).order("sort_order", desc=False).execute()
+            res = supabase.table("appointment_services").select("name, description, duration_minutes").eq("project_id", project_id).eq("is_active", True).eq("is_hidden", False).order("sort_order", desc=False).execute()
             services = res.data or []
             if not services:
                 return {"message": "No bookable services are configured yet."}

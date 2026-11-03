@@ -130,6 +130,64 @@ TEMPLATE_LIBRARY = [
         "language": "en_US",
     },
     {
+        "id": "appointment_confirmed_details",
+        "category": "UTILITY",
+        "industry": "Healthcare / Services",
+        "name": "appointment_confirmed_details",
+        "display_name": "Appointment Confirmed (with details)",
+        "description": "Like Appointment Confirmed, plus the location and note you set on a service. Used instead of it when the service has them",
+        "preview": "Hi {Name}! Your {Service} is confirmed for {Date} at {Time}. {Details} Booking ID: {Booking ID}. Tap below if you need to change it.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}! Your {{2}} is confirmed for {{3}} at {{4}}. {{5}} Booking ID: {{6}}. Tap below if you need to change it.",
+            },
+            {
+                "type": "BUTTONS",
+                "buttons": [{"type": "QUICK_REPLY", "text": "Reschedule"}, {"type": "QUICK_REPLY", "text": "Cancel"}],
+            },
+        ],
+        "example_body": ["Asha", "Consultation", "14 November 2026", "10:30", "Where: Main Street clinic. Bring your reports.", "A1B2C3D4"],
+        "variables": ["Customer name", "Service", "Date", "Time", "Location and note", "Booking ID"],
+        "language": "en_US",
+    },
+    {
+        "id": "appointment_request_received",
+        "category": "UTILITY",
+        "industry": "Healthcare / Services",
+        "name": "appointment_request_received",
+        "display_name": "Appointment Request Received",
+        "description": "Tells the customer their booking request was received and will be confirmed (for services that need your approval)",
+        "preview": "Hi {Name}! We received your request for {Service} on {Date} at {Time}. We will confirm it shortly.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}! We received your request for {{2}} on {{3}} at {{4}}. We will confirm it shortly.",
+            }
+        ],
+        "example_body": ["Asha", "Consultation", "14 November 2026", "10:30"],
+        "variables": ["Customer name", "Service", "Date", "Time"],
+        "language": "en_US",
+    },
+    {
+        "id": "appointment_followup",
+        "category": "UTILITY",
+        "industry": "Healthcare / Services",
+        "name": "appointment_followup",
+        "display_name": "Appointment Follow-up",
+        "description": "A thank-you sent some hours after the appointment, with your own message such as a review link (Appointments > Settings)",
+        "preview": "Hi {Name}! Thank you for your {Service} appointment. {Your message} We hope to see you again.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Hi {{1}}! Thank you for your {{2}} appointment. {{3}} We hope to see you again.",
+            }
+        ],
+        "example_body": ["Asha", "Consultation", "We would love to hear how it went."],
+        "variables": ["Customer name", "Service", "Your message"],
+        "language": "en_US",
+    },
+    {
         "id": "appointment_cancelled",
         "category": "UTILITY",
         "industry": "Healthcare / Services",
@@ -329,6 +387,24 @@ TEMPLATE_LIBRARY = [
         ],
         "example_body": ["A1B2C3D4", "Geetham Velachery", "Asha", "₹582.00", "pickup", "Collect payment"],
         "variables": ["Order ID", "Branch name", "Customer name", "Order total", "Pickup or delivery", "Payment status"],
+        "language": "en_US",
+    },
+    {
+        "id": "appointment_new_booking_alert",
+        "category": "UTILITY",
+        "industry": "Appointments",
+        "name": "appointment_new_booking_alert",
+        "display_name": "Appointment New Booking Alert (for you)",
+        "description": "Tells YOU (the business owner) when someone books, even when your phone hasn't messaged this number in 24 hours (Appointments > Settings)",
+        "preview": "Zavo alert: {Event} - {Service} for {Customer} on {Date} at {Time}. Open the Appointments tab in your Zavo dashboard for the details.",
+        "components": [
+            {
+                "type": "BODY",
+                "text": "Zavo alert: {{1}} - {{2}} for {{3}} on {{4}} at {{5}}. Open the Appointments tab in your Zavo dashboard for the details.",
+            }
+        ],
+        "example_body": ["New booking", "Dental checkup", "Asha", "Tuesday, 03 November 2026", "12:00"],
+        "variables": ["Event", "Service", "Customer name", "Date", "Time"],
         "language": "en_US",
     },
 ]

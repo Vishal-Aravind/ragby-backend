@@ -154,6 +154,20 @@ def run_appointment_reminders():
         _record_job_run("appointment_reminders", started_at, "failure", {"error": str(e)})
 
 
+def run_appointment_followups():
+    """Runs every hour — the optional thank-you message after an appointment."""
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
+    try:
+        from appointments import send_followups_job
+        send_followups_job()
+        _record_job_run("appointment_followups", started_at, "success")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Scheduler: follow-up job error: {e}")
+        _record_job_run("appointment_followups", started_at, "failure", {"error": str(e)})
+
+
 def run_scheduled_campaigns():
     """Runs every 30 seconds — sends any campaign whose scheduled time has arrived."""
     from datetime import datetime, timezone
@@ -278,6 +292,7 @@ async def lifespan(app: FastAPI):
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
         scheduler.add_job(run_appointment_reminders, 'interval', hours=1, id='appointment_reminders')
+        scheduler.add_job(run_appointment_followups, 'interval', hours=1, id='appointment_followups')
         scheduler.add_job(run_scheduled_campaigns, 'interval', seconds=30, id='scheduled_campaigns')
         scheduler.add_job(run_shopify_reconciliation, 'interval', hours=6, id='shopify_reconciliation')
         scheduler.add_job(run_release_expired_holds, 'interval', minutes=2, id='appointment_hold_release')

@@ -774,6 +774,11 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
     # Handle appointment reschedule/cancel button triggers
     if trigger.startswith("reschedule_"):
         appointment_id = trigger.replace("reschedule_", "")
+        from appointments import appointment_change_problem
+        problem = appointment_change_problem(appointment_id, project_id, phone_number)
+        if problem:
+            send_whatsapp_message(phone_number, problem, phone_number_id, token)
+            return
         booking_url = f"{FRONTEND_URL}/book/{project_id}?phone={phone_number}&reschedule={appointment_id}"
         send_whatsapp_cta_url(
             phone_number,
@@ -785,7 +790,7 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
         return
 
     if trigger.startswith("cancel_appt_"):
-        from appointments import cancel_appointment
+        from appointments import cancel_appointment, ChangeNotAllowed
         appointment_id = trigger.replace("cancel_appt_", "")
 
         # FIX: previously cancelled whatever appointment_id was embedded in
@@ -804,6 +809,9 @@ def handle_interactive(session: dict, trigger: str, phone_number: str, phone_num
             # them; reuses the same logic that also cleans up the Google
             # Calendar event, which this button previously skipped.
             cancel_appointment(appointment_id, notify_customer=False)
+        except ChangeNotAllowed as e:
+            send_whatsapp_message(phone_number, str(e), phone_number_id, token)
+            return
         except ValueError:
             pass
         send_whatsapp_message(
