@@ -111,7 +111,7 @@ class Issue(unittest.TestCase):
     def setUp(self):
         self.db = FakeSupabase(tables={
             "orders": [
-                {"id": OID, "project_id": PID, "status": "confirmed", "payment_status": "paid", "branch_id": None},
+                {"id": OID, "project_id": PID, "status": "confirmed", "payment_status": "paid"},
                 {"id": "33333333-3333-3333-3333-333333333333", "project_id": PID, "status": "pending",
                  "payment_status": "unpaid"},
                 {"id": "44444444-4444-4444-4444-444444444444", "project_id": PID, "status": "confirmed",

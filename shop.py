@@ -64,6 +64,23 @@ class ShopConfigUpdate(BaseModel):
     razorpay_key_secret: Optional[str] = None
     is_enabled: Optional[bool] = None
     bot_can_assist: Optional[bool] = None
+    notify_owner_whatsapp: Optional[bool] = None
+    # Store settings (validated by shop_store.store_fields)
+    address: Optional[str] = Field(default=None, max_length=2000)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    pincodes: Optional[List[Union[str, int]]] = Field(default=None, max_length=2000)
+    hours: Optional[dict] = None
+    timezone: Optional[str] = Field(default=None, max_length=64)
+    accepting_orders: Optional[bool] = None
+    pickup_enabled: Optional[bool] = None
+    delivery_enabled: Optional[bool] = None
+    delivery_per_km: Optional[float] = None
+    delivery_base_fee: Optional[float] = None
+    free_delivery_above: Optional[float] = None
+    max_delivery_km: Optional[float] = None
+    min_order_value: Optional[float] = None
+    prep_minutes: Optional[int] = None
     bot_can_order: Optional[bool] = None
 
 class CatalogCreate(BaseModel):
@@ -71,7 +88,6 @@ class CatalogCreate(BaseModel):
     name: str
     description: Optional[str] = None
     is_active: bool = True
-    branch_id: Optional[str] = Field(default=None, max_length=64)   # default branch when omitted
 
 class CatalogUpdate(BaseModel):
     name: Optional[str] = None
@@ -120,10 +136,9 @@ class CartItem(BaseModel):
 
 class CartSubmit(BaseModel):
     """No prices, fees, totals, distance or open state: the server works
-    all of those out (shop_branches.price_order)."""
+    all of those out (shop_store.price_order)."""
     phone: str = Field(max_length=32)
     project_id: str = Field(max_length=64)
-    branch_id: Optional[str] = Field(default=None, max_length=64)
     catalog_id: Optional[str] = Field(default=None, max_length=64)
     items: List[CartItem] = Field(max_length=MAX_CART_LINES)
     fulfilment: Optional[str] = Field(default="pickup", max_length=16)
@@ -161,13 +176,9 @@ def load_shop_config(project_id: str) -> dict:
         return {}
 
 
-def _default_branch_catalog_ids(project_id: str) -> list:
-    """The chat bot sells from the default branch only. After a menu copy
-    every item exists once per branch, so a project-wide lookup would match
-    each name twice and find_product_by_name would find nothing."""
-    from shop_branches import get_default_branch, active_catalog_ids
-    branch = get_default_branch(project_id)
-    return active_catalog_ids(project_id, branch["id"]) if branch else []
+def _active_catalog_ids(project_id: str) -> list:
+    from shop_store import active_catalog_ids
+    return active_catalog_ids(project_id)
 
 
 # -------------------------------------------------
@@ -208,7 +219,7 @@ def get_recent_orders_for_phone(project_id: str, phone: str, limit: int = 3) -> 
 
 def get_active_catalog_summary(project_id: str) -> list:
     """Used by the in-chat 'what do you sell' tool — read-only, no writes."""
-    catalog_ids = _default_branch_catalog_ids(project_id)
+    catalog_ids = _active_catalog_ids(project_id)
     if not catalog_ids:
         return []
     catalogs = supabase.table("catalogs").select("id, name").eq("project_id", project_id).in_("id", catalog_ids).execute()
@@ -248,8 +259,18 @@ def get_active_catalog_summary(project_id: str) -> list:
 _SHOP_CONFIG_SAFE_COLUMNS = (
     "project_id, store_name, store_phone, gst_percent, currency, currency_code, "
     "accent_color, delivery_types, terms_note, razorpay_key_id, is_enabled, "
-    "bot_can_assist, bot_can_order, cover_image_url, logo_url"
+    "bot_can_assist, bot_can_order, cover_image_url, logo_url, notify_owner_whatsapp, "
+    "address, lat, lng, pincodes, hours, timezone, accepting_orders, pickup_enabled, "
+    "delivery_enabled, delivery_per_km, delivery_base_fee, free_delivery_above, "
+    "max_delivery_km, min_order_value, prep_minutes"
 )
+
+
+def _config_with_store(row: dict) -> dict:
+    """The settings plus store status and setup warnings for the dashboard."""
+    from shop_store import store_view, status_for, store_warnings
+    store = store_view(row)
+    return {**row, "status": status_for(store, row), "warnings": store_warnings(store)}
 
 
 @router.get("/shop-config/{project_id}")
@@ -273,31 +294,37 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
             "bot_can_order": False,
             "cover_image_url": None,
             "logo_url": None,
+            "notify_owner_whatsapp": True,
+            "pickup_enabled": True,
+            "delivery_enabled": False,
+            "accepting_orders": True,
+            "timezone": "Asia/Kolkata",
+            "pincodes": [],
+            "hours": None,
+            "min_order_value": 0,
+            "delivery_per_km": 0,
+            "delivery_base_fee": 0,
+            "warnings": [],
         }
-    return res.data
+    return _config_with_store(res.data)
 
 @router.put("/shop-config/{project_id}")
 async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="shop")
     existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
-    update = {k: v for k, v in body.dict().items() if v is not None}
+    from shop_store import STORE_KEYS, store_fields
+    sent = body.model_fields_set
+    update = {k: v for k, v in body.dict().items() if v is not None and k not in STORE_KEYS}
+    # Store keys: an explicit null clears (e.g. hours = always open).
+    update.update(store_fields({k: getattr(body, k) for k in STORE_KEYS if k in sent}, project_id))
+    if "store_phone" in update:
+        update["store_phone"] = (update["store_phone"] or "").strip()
     if existing and existing.data:
         supabase.table("shop_config").update(update).eq("project_id", project_id).execute()
     else:
         supabase.table("shop_config").insert({"project_id": project_id, **update}).execute()
-    name = shop_rules.clean_text(update.get("store_name"), 80) if update.get("store_name") else None
-    if name:
-        # One store: its branch carries the same name (see only_branch).
-        try:
-            from shop_branches import only_branch
-            single = only_branch(project_id)
-            if single and single.get("name") != name:
-                supabase.table("shop_branches").update({"name": name}) \
-                    .eq("id", single["id"]).eq("project_id", project_id).execute()
-        except Exception as e:
-            sentry_sdk.capture_exception(e)
     res = supabase.table("shop_config").select(_SHOP_CONFIG_SAFE_COLUMNS).eq("project_id", project_id).single().execute()
-    return res.data
+    return _config_with_store(res.data)
 
 
 class BrandingUpdate(BaseModel):
@@ -341,25 +368,17 @@ def update_shop_branding(project_id: str, body: BrandingUpdate, user=Depends(ver
 # ─────────────────────────────────────────────
 
 @router.get("/catalogs")
-async def list_catalogs(project_id: str, branch_id: Optional[str] = None, user=Depends(verify_token)):
+async def list_catalogs(project_id: str, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="shop")
-    query = supabase.table("catalogs").select("*").eq("project_id", project_id)
-    if branch_id:
-        if not _UUID_RE.match(branch_id):
-            raise shop_error(400, "invalid_request", "Invalid branch id")
-        query = query.eq("branch_id", branch_id)
-    res = query.order("created_at", desc=False).execute()
+    res = supabase.table("catalogs").select("*").eq("project_id", project_id) \
+        .order("created_at", desc=False).execute()
     return res.data or []
 
 @router.post("/catalogs")
 def create_catalog(body: CatalogCreate, user=Depends(verify_token)):
-    from shop_branches import resolve_branch
     require_project_access(user.id, body.project_id, tab="shop")
-    # Must be this project's branch; the default one when not given.
-    branch = resolve_branch(body.project_id, body.branch_id)
     inserted = supabase.table("catalogs").insert({
         "project_id": body.project_id,
-        "branch_id": branch["id"],
         "name": body.name,
         "description": body.description,
         "is_active": body.is_active,
@@ -474,21 +493,6 @@ def _assert_shop_enabled(project_id: str):
         raise shop_error(403, "shop_disabled", "This shop isn't available right now.")
 
 
-def _public_branch_summary(project_id: str, config: dict) -> dict:
-    """How many active branches the page has to choose from. 404/403 for
-    an unknown project or one with no shop (see public_default_branch);
-    otherwise best-effort: on a DB error the page behaves like a
-    single-branch shop."""
-    from shop_branches import public_default_branch
-    default_id = public_default_branch(project_id, config)["id"]
-    try:
-        res = supabase.table("shop_branches").select("id").eq("project_id", project_id).eq("is_active", True).execute()
-        return {"branch_count": len(res.data or []), "default_branch_id": default_id}
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        return {"branch_count": 1, "default_branch_id": default_id}
-
-
 @router.get("/public/shop/{project_id}/config")
 def public_shop_config(project_id: str, request: Request):
     _public_shop_guard(project_id, request, "shop-config")
@@ -511,37 +515,31 @@ def public_shop_config(project_id: str, request: Request):
         }
     else:
         data = dict(res.data)
-    data["online_payment"] = online_payments_available(project_id, load_shop_config(project_id))
-    return {**data, **_public_branch_summary(project_id, (res.data if res else None) or {})}
+    from shop_store import public_store, public_store_info
+    full = load_shop_config(project_id)
+    data["online_payment"] = online_payments_available(project_id, full)
+    # 404 / 403 for an unknown project or one with no shop.
+    store = public_store(project_id, full)
+    return {**data, "store": public_store_info(store, full)}
 
 @router.get("/public/shop/{project_id}/catalogs")
-def public_catalogs(project_id: str, request: Request, branch_id: Optional[str] = None):
-    from shop_branches import resolve_branch
+def public_catalogs(project_id: str, request: Request):
     _public_shop_guard(project_id, request, "shop-catalogs")
     _assert_shop_enabled(project_id)
-    branch = resolve_branch(project_id, branch_id, public=True)
     # Named columns rather than select("*") — this is an anonymous read.
     res = supabase.table("catalogs").select("id,name,description").eq("project_id", project_id) \
-        .eq("branch_id", branch["id"]).eq("is_active", True).order("created_at", desc=False).execute()
+        .eq("is_active", True).order("created_at", desc=False).execute()
     return res.data or []
 
 @router.get("/public/shop/{project_id}/products")
-def public_products(project_id: str, request: Request, branch_id: Optional[str] = None, catalog_id: Optional[str] = None):
-    from shop_branches import resolve_branch, active_catalog_ids
+def public_products(project_id: str, request: Request, catalog_id: Optional[str] = None):
     _public_shop_guard(project_id, request, "shop-products")
     _assert_shop_enabled(project_id)
     if catalog_id and not _UUID_RE.match(catalog_id):
         raise shop_error(400, "invalid_request", "Invalid catalog id")
-    if catalog_id and not branch_id:
-        # Old links carry only ?catalog=, so the branch comes from the catalog.
-        cat = supabase.table("catalogs").select("branch_id").eq("id", catalog_id).eq("project_id", project_id).limit(1).execute()
-        if not cat.data:
-            return []
-        branch_id = cat.data[0].get("branch_id")
-    branch = resolve_branch(project_id, branch_id, public=True)
-    # Only the branch's ACTIVE catalogs: products of a switched-off catalog
-    # used to stay publicly listed.
-    catalog_ids = active_catalog_ids(project_id, branch["id"])
+    # Only ACTIVE catalogs: products of a switched-off catalog used to stay
+    # publicly listed.
+    catalog_ids = _active_catalog_ids(project_id)
     if catalog_id:
         catalog_ids = [c for c in catalog_ids if c == catalog_id]
     if not catalog_ids:
@@ -574,7 +572,7 @@ def public_get_order(order_id: str, request: Request, phone: str = ""):
     if not _UUID_RE.match(order_id or ""):
         return {"items": []}
     res = supabase.table("orders").select(
-        "items, delivery_type, branch_id, fulfilment, customer_name, delivery_address, "
+        "items, delivery_type, fulfilment, customer_name, delivery_address, "
         "customer_pincode, customer_lat, customer_lng, status, payment_status, "
         "address_line1, address_line2, address_city, sold_out_preference, special_request"
     ).eq("id", order_id).eq("phone_number", clean_phone).maybe_single().execute()
@@ -584,7 +582,6 @@ def public_get_order(order_id: str, request: Request, phone: str = ""):
     return {
         "items": o.get("items", []),
         "delivery_type": o.get("delivery_type", "Takeaway"),
-        "branch_id": o.get("branch_id"),
         "fulfilment": o.get("fulfilment") or "pickup",
         "customer_name": o.get("customer_name"),
         "delivery_address": o.get("delivery_address"),
@@ -735,12 +732,12 @@ def live_pay_link(order: dict, margin_seconds: int = 0):
 # CART SUBMIT — called from web shop page
 # ─────────────────────────────────────────────
 
-def _price_items(project_id: str, branch_id: str, catalog_id: Optional[str], items: List[CartItem]):
+def _price_items(project_id: str, catalog_id: Optional[str], items: List[CartItem]):
     """Price the cart from the products table, collecting problems instead
     of raising (see _price_cart_server_side for why prices are never taken
     from the browser).
 
-    A product must be available and in one of the branch's ACTIVE catalogs
+    A product must be available and in one of the shop's ACTIVE catalogs
     (and in catalog_id, when given). Returns (items_data, subtotal,
     price_changed, error_codes); items with a problem are left out.
     """
@@ -761,9 +758,7 @@ def _price_items(project_id: str, branch_id: str, catalog_id: Optional[str], ite
     if not wanted:
         return [], 0.0, False, errors
 
-    cats = supabase.table("catalogs").select("id") \
-        .eq("project_id", project_id).eq("branch_id", branch_id).eq("is_active", True).execute()
-    on_menu = {c["id"] for c in (cats.data or [])}
+    on_menu = set(_active_catalog_ids(project_id))
 
     res = supabase.table("products") \
         .select("id, name, price, image_url, shopify_variant_id, is_available, catalog_id, gst_percent") \
@@ -802,7 +797,7 @@ def _price_items(project_id: str, branch_id: str, catalog_id: Optional[str], ite
     return items_data, round(subtotal, 2), price_changed, errors
 
 
-def _price_cart_server_side(project_id: str, branch_id: str, catalog_id: Optional[str], items: List[CartItem]):
+def _price_cart_server_side(project_id: str, catalog_id: Optional[str], items: List[CartItem]):
     """Rebuild the cart from the products table, ignoring the browser.
 
     THE fix for this file. submit_cart used to compute the order total from
@@ -820,9 +815,9 @@ def _price_cart_server_side(project_id: str, branch_id: str, catalog_id: Optiona
     """
     if not items:
         raise shop_error(400, "cart_empty", "Your cart is empty.")
-    # Scoped to this project AND this branch's active menu: a product id from
-    # another project, branch or catalog is refused rather than silently priced.
-    items_data, subtotal, price_changed, errors = _price_items(project_id, branch_id, catalog_id, items)
+    # Scoped to this project's active menu: a product id from another
+    # project or catalog is refused rather than silently priced.
+    items_data, subtotal, price_changed, errors = _price_items(project_id, catalog_id, items)
     if "item_unavailable" in errors:
         raise shop_error(400, "item_unavailable", "One of the items in your cart is no longer available. Please refresh the menu.")
     if "item_not_on_menu" in errors:
@@ -842,27 +837,27 @@ def _where(order: dict) -> str:
     return ", ".join(one_line(x) for x in (order.get("delivery_address"), order.get("customer_pincode")) if x)
 
 
-def order_fulfilment_lines(order: dict, branch: Optional[dict], currency: str = "₹") -> str:
-    """The branch + pickup/delivery block shared by the cart summary, the
+def order_fulfilment_lines(order: dict, store: Optional[dict], currency: str = "₹") -> str:
+    """The shop + pickup/delivery block shared by the cart summary, the
     pre-payment summary and the payment confirmation."""
-    branch = branch or {}
+    store = store or {}
     lines = []
-    if branch.get("name"):
-        lines.append(f"🏪 {branch['name']}")
+    if store.get("name"):
+        lines.append(f"🏪 {store['name']}")
     if order.get("fulfilment") == "delivery":
         where = _where(order)
         lines.append(f"🛵 Delivery to: {where}" if where else "🛵 Delivery")
         if order.get("delivery_distance_km") is not None:
             lines.append(f"📏 {float(order['delivery_distance_km']):g} km")
     else:
-        prep = branch.get("prep_minutes")
+        prep = store.get("prep_minutes")
         lines.append("🏃 Pickup" + (f" · ready in ~{prep} min" if prep else ""))
-        if branch.get("address"):
-            lines.append(f"📍 {branch['address']}")
+        if store.get("address"):
+            lines.append(f"📍 {store['address']}")
     return "\n".join(lines)
 
 
-def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data: list, currency: str, subtotal: float, gst_amount: float, total: float, catalog_id: Optional[str], price_changed: bool = False, branch: Optional[dict] = None) -> dict:
+def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data: list, currency: str, subtotal: float, gst_amount: float, total: float, catalog_id: Optional[str], price_changed: bool = False, store: Optional[dict] = None) -> dict:
     """Shared by the web-shop-page checkout AND the in-chat ordering tool —
     single source of truth for the cart summary text + Continue/Add
     More/Clear Cart buttons + session handoff, so both paths land the
@@ -874,7 +869,7 @@ def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data
     for i, item in enumerate(items_data, 1):
         lines.append(f"{i}. {item['name']} x{item['quantity']} - {currency}{int(item['price'] * item['quantity'])}")
     items_text = "\n".join(lines)
-    header = f"🛒 *Your Cart* — {branch['name']}" if branch and branch.get("name") else "🛒 *Your Cart*"
+    header = f"🛒 *Your Cart* — {store['name']}" if store and store.get("name") else "🛒 *Your Cart*"
     summary = f"{header}\n\n{items_text}\n\nSubtotal: {currency}{shop_rules.money(subtotal)}"
     for gst_line in shop_rules.gst_text_lines(order.get("gst_breakdown"), gst_amount, currency):
         summary += f"\n{gst_line}"
@@ -901,9 +896,7 @@ def _send_cart_confirmation(project_id: str, phone: str, order: dict, items_data
         print(f"whatsapp_integrations fetch error: {e}")
         wa_data = None
 
-    # branch_id rides along so every later link (Add More, Change Order)
-    # reopens the same branch.
-    metadata = {"order_id": order["id"], "catalog_id": catalog_id, "branch_id": order.get("branch_id")}
+    metadata = {"order_id": order["id"], "catalog_id": catalog_id}
 
     if not wa_data:
         supabase.table("whatsapp_sessions").upsert({
@@ -945,7 +938,7 @@ def find_product_by_name(project_id: str, name: str) -> Optional[dict]:
     name/price supplied by the model as final; this looks up the real row.
     Returns None if there's no match OR more than one equally-good match
     (ambiguous — caller should ask the customer to clarify rather than guess)."""
-    catalog_ids = _default_branch_catalog_ids(project_id)
+    catalog_ids = _active_catalog_ids(project_id)
     if not catalog_ids:
         return None
     res = supabase.table("products").select("*").eq("project_id", project_id).eq("is_available", True) \
@@ -967,7 +960,7 @@ def find_product_by_name(project_id: str, name: str) -> Optional[dict]:
 @router.post("/public/shop/submit-cart")
 def submit_cart(body: CartSubmit, request: Request):
     # Plain def: it is all blocking DB and WhatsApp calls.
-    from shop_branches import resolve_branch, price_order, raise_first_error, parse_customer_location, shop_is_enabled
+    from shop_store import get_store, price_order, raise_first_error, parse_customer_location, shop_is_enabled
 
     project_id = body.project_id
     phone = body.phone.replace("+", "").replace(" ", "")
@@ -991,12 +984,9 @@ def submit_cart(body: CartSubmit, request: Request):
     catalog_id = body.catalog_id or None     # old links send ?catalog= empty
     if catalog_id and not _UUID_RE.match(catalog_id):
         raise shop_error(400, "invalid_request", "Invalid catalog id")
-    if body.branch_id and not _UUID_RE.match(body.branch_id):
-        raise shop_error(400, "invalid_request", "Invalid branch id")
 
     # ── Existing order (Add More / Change Order) ──
     existing = None
-    branch_id = body.branch_id
     if body.order_id:
         # FIX: this endpoint is public/unauthenticated by design (it's the
         # web shop checkout) — previously it updated ANY order by id with
@@ -1016,21 +1006,13 @@ def submit_cart(body: CartSubmit, request: Request):
         # its payment link went out (it then read as underpaid).
         if existing.get("status") != "pending" or existing.get("payment_status") != "unpaid":
             raise shop_error(409, "order_not_editable", "This order is already being processed. Please place a new order.")
-        if body.branch_id and existing.get("branch_id") and body.branch_id != existing["branch_id"]:
-            raise shop_error(400, "invalid_request", "An order can't move to another branch. Please place a new order.")
-        branch_id = existing.get("branch_id") or body.branch_id
 
-    if not branch_id and catalog_id:
-        cat = supabase.table("catalogs").select("branch_id").eq("id", catalog_id).eq("project_id", project_id).limit(1).execute()
-        if not cat.data:
-            raise shop_error(400, "invalid_request", "This menu isn't available any more. Please refresh.")
-        branch_id = cat.data[0].get("branch_id")
-    branch = resolve_branch(project_id, branch_id, public=True)
+    store = get_store(project_id, config)
     if catalog_id:
         cat = supabase.table("catalogs").select("id").eq("id", catalog_id).eq("project_id", project_id) \
-            .eq("branch_id", branch["id"]).limit(1).execute()
+            .limit(1).execute()
         if not cat.data:
-            raise shop_error(400, "invalid_request", "This menu isn't part of that branch. Please refresh.")
+            raise shop_error(400, "invalid_request", "This menu isn't available any more. Please refresh.")
 
     # ── Customer details ──
     try:
@@ -1058,7 +1040,7 @@ def submit_cart(body: CartSubmit, request: Request):
             raise shop_error(400, "invalid_request", "Please enter your pincode.")
 
     # Prices, fee, open state: all from the server. See price_order.
-    priced = price_order(project_id, branch, body.items, fulfilment, lat, lng, pincode,
+    priced = price_order(project_id, store, body.items, fulfilment, lat, lng, pincode,
                          catalog_id=catalog_id, config=config)
     raise_first_error(priced)
     items_data = priced["items_data"]
@@ -1066,7 +1048,6 @@ def submit_cart(body: CartSubmit, request: Request):
     currency = priced["currency"]
 
     row = {
-        "branch_id": branch["id"],
         "items": items_data,
         "subtotal": subtotal,
         "gst_amount": gst_amount,
@@ -1114,7 +1095,7 @@ def submit_cart(body: CartSubmit, request: Request):
         order = inserted.data[0]
 
     result = _send_cart_confirmation(project_id, phone, order, items_data, currency, subtotal, gst_amount, total,
-                                     catalog_id, priced["price_changed"], branch=branch)
+                                     catalog_id, priced["price_changed"], store=store)
     return {
         "status": result["status"],
         "order_id": order["id"],
@@ -1187,18 +1168,6 @@ def public_shop_me(project_id: str, body: TokenBody, request: Request):
     }
 
 
-def _branch_names(project_id: str, ids) -> dict:
-    ids = [i for i in set(ids) if i]
-    if not ids:
-        return {}
-    try:
-        res = supabase.table("shop_branches").select("id, name").eq("project_id", project_id).in_("id", ids).execute()
-        return {b["id"]: b.get("name") for b in (res.data or [])}
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        return {}
-
-
 @router.post("/public/shop/{project_id}/my-orders")
 def public_my_orders(project_id: str, body: MyOrdersBody, request: Request):
     _public_shop_guard(project_id, request, "shop-my-orders", limit=20)
@@ -1208,13 +1177,12 @@ def public_my_orders(project_id: str, body: MyOrdersBody, request: Request):
         raise shop_error(401, "token_required", "Open the menu from your WhatsApp chat to see your orders.")
     limit = max(1, min(int(body.limit or 20), 20))
     res = supabase.table("orders").select(
-        "id, created_at, placed_at, status, payment_status, payment_method, branch_id, fulfilment, items, "
+        "id, created_at, placed_at, status, payment_status, payment_method, fulfilment, items, "
         "total, discount_amount, offer_code, payment_link_url, payment_link_expires_at, invoice_number"
     ).eq("project_id", project_id).eq("phone_number", phone) \
         .or_("placed_at.not.is.null,status.neq.pending") \
         .order("created_at", desc=True).limit(limit).execute()
     rows = res.data or []
-    names = _branch_names(project_id, [o.get("branch_id") for o in rows])
     out = []
     for o in rows:
         pay_url, pay_expires = live_pay_link(o)
@@ -1227,8 +1195,6 @@ def public_my_orders(project_id: str, body: MyOrdersBody, request: Request):
             "payment_status": o.get("payment_status"),
             "payment_method": o.get("payment_method"),
             "status_label": order_status_label(o),
-            "branch_id": o.get("branch_id"),
-            "branch_name": names.get(o.get("branch_id")),
             "fulfilment": o.get("fulfilment") or "pickup",
             "items": [{"product_id": it.get("product_id"), "name": it.get("name"),
                        "quantity": it.get("quantity"), "price": it.get("price")} for it in (o.get("items") or [])],
@@ -1265,7 +1231,6 @@ def public_order_status(project_id: str, order_id: str, body: OrderAuthBody, req
     _public_shop_guard(project_id, request, "shop-order-status", limit=40)
     order = _order_for_customer(project_id, order_id, body)
     pay_url, pay_expires = live_pay_link(order)
-    names = _branch_names(project_id, [order.get("branch_id")])
     return {
         "order_id": order["id"],
         "short_id": order["id"][:8].upper(),
@@ -1275,7 +1240,6 @@ def public_order_status(project_id: str, order_id: str, body: OrderAuthBody, req
         "status_label": order_status_label(order),
         "total": float(order.get("total") or 0),
         "fulfilment": order.get("fulfilment") or "pickup",
-        "branch_name": names.get(order.get("branch_id")),
         "pay_url": pay_url,
         "pay_expires_at": pay_expires,
         "invoice_number": order.get("invoice_number"),
@@ -1318,7 +1282,6 @@ class PlaceOrderBody(BaseModel):
     phone: Optional[str] = Field(default=None, max_length=32)            # legacy, only without a valid token
     idempotency_key: Optional[str] = Field(default=None, max_length=64)
     order_id: Optional[str] = Field(default=None, max_length=64)
-    branch_id: Optional[str] = Field(default=None, max_length=64)
     catalog_id: Optional[str] = Field(default=None, max_length=64)
     items: List[CartItem] = Field(default_factory=list, max_length=MAX_CART_LINES)
     fulfilment: Optional[str] = Field(default="pickup", max_length=16)
@@ -1373,8 +1336,6 @@ def _validate_place_body(project_id: str, body: PlaceOrderBody) -> dict:
         raise _bad_request("Missing or invalid idempotency key. Please refresh and try again.")
     if body.order_id and not _UUID_RE.match(body.order_id):
         raise shop_error(404, "order_not_found", "Order not found")
-    if body.branch_id and not _UUID_RE.match(body.branch_id):
-        raise _bad_request("Invalid branch id")
     catalog_id = body.catalog_id or None
     if catalog_id and not _UUID_RE.match(catalog_id):
         raise _bad_request("Invalid catalog id")
@@ -1434,11 +1395,9 @@ def _totals(order: dict) -> dict:
             "discount_amount": f("discount_amount"), "total": f("total")}
 
 
-def _place_summary(order: dict, state: str, branch_name: Optional[str] = None, payment_url: Optional[str] = None,
+def _place_summary(order: dict, state: str, payment_url: Optional[str] = None,
                    payment_expires_at: Optional[str] = None, notice: Optional[str] = None,
                    whatsapp: Optional[str] = None) -> dict:
-    if branch_name is None and order.get("branch_id"):
-        branch_name = _branch_names(order["project_id"], [order["branch_id"]]).get(order["branch_id"])
     offer = None
     if order.get("offer_id"):
         offer = {"id": order["offer_id"], "title": order.get("offer_title"), "code": order.get("offer_code"),
@@ -1452,7 +1411,6 @@ def _place_summary(order: dict, state: str, branch_name: Optional[str] = None, p
         "payment_method": order.get("payment_method") or ("online" if state == "payment_required" else None),
         "receipt": shop_identity.order_receipt(order["id"]),
         "invoice_number": order.get("invoice_number"),
-        "branch_name": branch_name,
         "fulfilment": order.get("fulfilment") or "pickup",
         "totals": _totals(order),
         "offer": offer,
@@ -1510,7 +1468,7 @@ def place_order(project_id: str, body: PlaceOrderBody, request: Request):
 
 def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request, config: dict,
                          ident: dict, v: dict) -> dict:
-    from shop_branches import resolve_branch, price_with_mode, raise_first_error, quote_view
+    from shop_store import get_store, price_with_mode, raise_first_error, quote_view
 
     phone, verified, key = ident["phone"], ident["verified"], v["key"]
     now = datetime.now(timezone.utc)
@@ -1528,9 +1486,8 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
         if existing and existing.get("phone_number") != phone:
             raise shop_error(409, "idempotency_conflict", "This checkout belongs to another order. Please refresh.")
 
-    branch_for_fp = (existing or {}).get("branch_id") or body.branch_id
     fp = shop_rules.checkout_fingerprint({
-        "branch_id": branch_for_fp, "items": [i.model_dump() for i in body.items], "fulfilment": v["fulfilment"],
+        "items": [i.model_dump() for i in body.items], "fulfilment": v["fulfilment"],
         "name": v["name"], "line1": v["line1"], "line2": v["line2"], "city": v["city"], "pincode": v["pincode"],
         "lat": v["lat"], "lng": v["lng"], "coupon": body.coupon_code,
         "sold_out_preference": v["sold_out_preference"], "note": v["note"],
@@ -1558,22 +1515,13 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
                                         payment_expires_at=live_expires)
             regen_from = existing.get("payment_id")   # same cart, link expired: new link on the same order
 
-    # ── Branch ──
-    if existing and body.branch_id and existing.get("branch_id") and body.branch_id != existing["branch_id"]:
-        raise _bad_request("An order can't move to another branch. Please place a new order.")
-    branch_id = (existing or {}).get("branch_id") or body.branch_id
     catalog_id = v["catalog_id"]
-    if not branch_id and catalog_id:
-        cat = supabase.table("catalogs").select("branch_id").eq("id", catalog_id).eq("project_id", project_id).limit(1).execute()
-        if not cat.data:
-            raise _bad_request("This menu isn't available any more. Please refresh.")
-        branch_id = cat.data[0].get("branch_id")
-    branch = resolve_branch(project_id, branch_id, public=True)
+    store = get_store(project_id, config)
 
     # ── Price (server is the only source of money) ──
     price_args = dict(catalog_id=catalog_id, config=config, identity=ident, coupon_code=body.coupon_code,
                       ip=client_ip(request), exclude_order_id=existing["id"] if existing else None)
-    priced, mode = price_with_mode(project_id, branch, body.items, v["fulfilment"], v["lat"], v["lng"],
+    priced, mode = price_with_mode(project_id, store, body.items, v["fulfilment"], v["lat"], v["lng"],
                                    v["pincode"], **price_args)
     raise_first_error(priced)
     coupon = priced.get("coupon")
@@ -1586,7 +1534,6 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
 
     delivery = v["fulfilment"] == "delivery"
     row = {
-        "branch_id": branch["id"],
         "items": priced["items_data"],
         "fulfilment": v["fulfilment"],
         "delivery_type": "Delivery" if delivery else "Pickup",
@@ -1635,7 +1582,7 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
         claim = claim_offer(order["id"], offer["id"], phone, verified, hold, priced["discount_amount"])
         if not claim.get("ok"):
             reason = claim.get("reason") or "offer_unavailable"
-            p2, mode2 = price_with_mode(project_id, branch, body.items, v["fulfilment"], v["lat"], v["lng"],
+            p2, mode2 = price_with_mode(project_id, store, body.items, v["fulfilment"], v["lat"], v["lng"],
                                         v["pincode"], exclude_offer_ids=(offer["id"],), **price_args)
             message = shop_rules.offer_reason_message(reason) or "This offer is no longer available."
             if p2.get("coupon") and p2["coupon"].get("code") and p2["coupon"].get("status") == "rejected":
@@ -1658,12 +1605,11 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
         if existing and existing.get("client_ref") == key and existing.get("checkout_hash") == fp:
             # A pure retry (same key, unchanged checkout): the cart message
             # already went out, so don't send it again.
-            return _place_summary(order, "confirm_in_whatsapp", branch_name=branch.get("name"), notice=notice,
-                                  whatsapp="skipped")
+            return _place_summary(order, "confirm_in_whatsapp", notice=notice, whatsapp="skipped")
         res = _send_cart_confirmation(project_id, phone, order, priced["items_data"], currency,
                                       priced["subtotal"], priced["gst_amount"], priced["total"],
-                                      catalog_id, priced["price_changed"], branch=branch)
-        return _place_summary(order, "confirm_in_whatsapp", branch_name=branch.get("name"), notice=notice,
+                                      catalog_id, priced["price_changed"], store=store)
+        return _place_summary(order, "confirm_in_whatsapp", notice=notice,
                               whatsapp="skipped" if res.get("warning") else "text")
 
     if mode == "place_offline":
@@ -1674,17 +1620,17 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
             .eq("status", "pending").eq("payment_status", "unpaid").execute()
         if not u.data:
             again = supabase.table("orders").select("*").eq("id", order["id"]).limit(1).execute()
-            return _place_summary((again.data or [order])[0], "already_placed", branch_name=branch.get("name"))
+            return _place_summary((again.data or [order])[0], "already_placed")
         order = u.data[0]
         confirm_offer(order["id"])
-        order = with_invoice(order, config, branch)
-        wa = send_order_placed_message(order, branch, config)
+        order = with_invoice(order, config)
+        wa = send_order_placed_message(order, store, config)
         phone_number_id, token = _wa_creds(project_id)
         if phone_number_id:
-            send_owner_order_alert(order, branch, {**config, "project_id": project_id}, phone_number_id, token,
+            send_owner_order_alert(order, store, {**config, "project_id": project_id}, phone_number_id, token,
                                    header="🔔 *New Order*" if free else "🔔 *New Order (collect payment)*")
         _set_session(project_id, phone, {"mode": "flow", "metadata": {}})
-        return _place_summary(order, "placed", branch_name=branch.get("name"), notice=notice, whatsapp=wa)
+        return _place_summary(order, "placed", notice=notice, whatsapp=wa)
 
     # pay_online
     try:
@@ -1696,17 +1642,17 @@ def _place_order_attempt(project_id: str, body: PlaceOrderBody, request: Request
         raise _shop_error_extra(502, "payment_unavailable", "Couldn't start the payment. Please try again.",
                                 order_id=order["id"])
     _set_session(project_id, phone, {"mode": "awaiting_payment",
-                                     "metadata": {"order_id": order["id"], "branch_id": branch["id"], "source": "web"}})
+                                     "metadata": {"order_id": order["id"], "source": "web"}})
     order = {**order, "payment_method": "online", "payment_status": "link_sent"}
-    return _place_summary(order, "payment_required", branch_name=branch.get("name"), payment_url=link["url"],
+    return _place_summary(order, "payment_required", payment_url=link["url"],
                           payment_expires_at=link["expires_at"], notice=notice)
 
 
-def with_invoice(order: dict, config: Optional[dict] = None, branch: Optional[dict] = None) -> dict:
+def with_invoice(order: dict, config: Optional[dict] = None) -> dict:
     """The order with its invoice number issued (paid / confirmed orders).
     Best-effort: on any failure the order comes back unchanged."""
     from shop_invoice import issue_invoice
-    return issue_invoice(order, config, branch) or order
+    return issue_invoice(order, config) or order
 
 
 def _set_session(project_id: str, phone: str, data: dict):
@@ -1724,12 +1670,10 @@ def _set_session(project_id: str, phone: str, data: dict):
 # ─────────────────────────────────────────────
 
 @router.get("/orders")
-async def list_orders(project_id: str, branch_id: Optional[str] = None, user=Depends(verify_token)):
+async def list_orders(project_id: str, user=Depends(verify_token)):
     require_project_access(user.id, project_id, tab="shop")
-    query = supabase.table("orders").select("*").eq("project_id", project_id)
-    if branch_id and _UUID_RE.match(branch_id):
-        query = query.eq("branch_id", branch_id)
-    res = query.order("created_at", desc=True).execute()
+    res = supabase.table("orders").select("*").eq("project_id", project_id) \
+        .order("created_at", desc=True).execute()
     return res.data or []
 
 @router.put("/orders/{order_id}")
@@ -1838,7 +1782,7 @@ def notify_order_status(order: dict, new_status: str) -> str:
     "text", "skipped" or "failed". Never raises for a send problem."""
     from whatsapp import send_whatsapp_message
     from config import WHATSAPP_TOKEN
-    from shop_branches import get_branch, contact_phone
+    from shop_store import get_store
 
     project_id = order["project_id"]
     wa_res = supabase.table("whatsapp_integrations").select("phone_number_id, access_token") \
@@ -1847,16 +1791,15 @@ def notify_order_status(order: dict, new_status: str) -> str:
     if not wa or not order.get("phone_number"):
         return "skipped"
 
-    config = load_shop_config(project_id)
-    branch = get_branch(project_id, order.get("branch_id")) if order.get("branch_id") else None
-    contact = contact_phone(branch, config)
+    store = get_store(project_id)
+    contact = store.get("phone")
     msg = shop_rules.order_status_message(new_status, order.get("fulfilment") or "pickup", {
         "name": order.get("customer_name"),
         "oid": order["id"][:8].upper(),
-        "branch": (branch or {}).get("name") or config.get("store_name") or "our store",
+        "shop": store.get("name") or "our store",
         "contact": phones.pretty(contact) if contact else "our store",
-        "prep": (branch or {}).get("prep_minutes"),
-        "address": (branch or {}).get("address"),
+        "prep": store.get("prep_minutes"),
+        "address": store.get("address"),
     })
     if not msg:
         return "skipped"
@@ -1913,11 +1856,11 @@ def _wa_creds(project_id: str):
     return wa["phone_number_id"], wa.get("access_token") or WHATSAPP_TOKEN
 
 
-def send_order_placed_message(order: dict, branch: Optional[dict], config: dict) -> str:
+def send_order_placed_message(order: dict, store: Optional[dict], config: dict) -> str:
     """C.3: an order placed without online payment. Text first, then the
     order_status_update template. "text" | "template" | "failed" | "skipped"."""
     from whatsapp import send_whatsapp_message
-    from shop_branches import contact_phone
+    from shop_store import get_store
 
     project_id = order["project_id"]
     phone_number_id, token = _wa_creds(project_id)
@@ -1929,7 +1872,8 @@ def send_order_placed_message(order: dict, branch: Optional[dict], config: dict)
 
     currency = config.get("currency") or "₹"
     config = {**config, "project_id": project_id}
-    contact = contact_phone(branch, config)
+    store = store or get_store(project_id, config)
+    contact = store.get("phone")
     oid = order["id"][:8].upper()
     free = order.get("payment_status") == "not_required" or float(order.get("total") or 0) <= 0
     pickup = (order.get("fulfilment") or "pickup") != "delivery"
@@ -1944,10 +1888,10 @@ def send_order_placed_message(order: dict, branch: Optional[dict], config: dict)
     msg += f"Order ID: #{oid}\n"
     msg += order_money_lines(order, currency) + "\n"
     msg += f"*Total: {currency}{float(order.get('total') or 0):.2f}* — {pay_text}\n"
-    msg += order_fulfilment_lines(order, branch, currency) + "\n"
+    msg += order_fulfilment_lines(order, store, currency) + "\n"
     if contact:
         msg += f"📞 Contact: {phones.pretty(contact)}\n"
-    msg += f"📦 Your orders: {shop_identity.build_shop_url(project_id, order['phone_number'], branch_id=order.get('branch_id'), view='orders')}\n"
+    msg += f"📦 Your orders: {shop_identity.build_shop_url(project_id, order['phone_number'], view='orders')}\n"
     from shop_invoice import invoice_line
     msg += invoice_line(order)
     msg += "\nThe store will contact you if anything changes."
@@ -1958,9 +1902,8 @@ def send_order_placed_message(order: dict, branch: Optional[dict], config: dict)
             return "text"
     except Exception as e:
         sentry_sdk.capture_exception(e)
-    branch_name = (branch or {}).get("name") or config.get("store_name") or "our store"
     if _send_order_template(order["phone_number"], shop_rules.ORDER_STATUS_TEMPLATE,
-                            [order.get("customer_name") or "there", oid, branch_name, status_text],
+                            [order.get("customer_name") or "there", oid, store.get("name") or "our store", status_text],
                             phone_number_id, token):
         return "template"
     return "failed"
@@ -1989,28 +1932,25 @@ def _owner_window_open(project_id: str, phone: str) -> bool:
         return False
 
 
-def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, phone_number_id: str, token: str,
+def send_owner_order_alert(order: dict, store: Optional[dict], config: dict, phone_number_id: str, token: str,
                            header: str = "🔔 *New Order Paid!*", payment_note: Optional[str] = None) -> None:
-    """New-order alert to the BRANCH's phone. Best-effort.
+    """New-order alert to the shop's phone. Best-effort.
     Inside the 24-hour window: the full text (free). Outside it: the approved
     shop_new_order_alert template, which reaches the owner regardless; if the
-    template isn't added/approved yet, the text is still tried. Each branch
-    has its own phone and its own on/off switch (off = the dashboard bell
-    only); a branch without a phone sends nothing."""
+    template isn't added/approved yet, the text is still tried. The shop's
+    on/off switch turns it off (the dashboard bell only); a shop without a
+    phone sends nothing."""
     from whatsapp import send_whatsapp_message
-    from shop_branches import contact_phone
+    from shop_store import store_view
 
-    if branch is not None:
-        # Missing key (column not added yet) means on.
-        if branch.get("notify_owner_whatsapp") is False:
-            return
-        owner_phone = branch.get("phone")
-    else:
-        owner_phone = contact_phone(None, config)
+    store = store or store_view(config)
+    if config.get("notify_owner_whatsapp") is False:
+        return
+    owner_phone = store.get("phone")
     if not owner_phone:
         return
     currency = config.get("currency") or "₹"
-    title = f"{header} — {branch['name']}" if branch and branch.get("name") else header
+    title = header
     who = f"+{order['phone_number']}" + (f" ({one_line(order['customer_name'])})" if order.get("customer_name") else "")
 
     lines = []
@@ -2061,10 +2001,9 @@ def send_owner_order_alert(order: dict, branch: Optional[dict], config: dict, ph
 
     try:
         if order.get("project_id") and not _owner_window_open(order["project_id"], owner_phone):
-            branch_name = (branch or {}).get("name") or config.get("store_name") or "your store"
             sent = _send_order_template(
                 owner_phone, shop_rules.OWNER_ALERT_TEMPLATE,
-                [order["id"][:8].upper(), branch_name, order.get("customer_name") or "a customer",
+                [order["id"][:8].upper(), store.get("name") or "your store", order.get("customer_name") or "a customer",
                  f"{currency}{float(order['total']):.2f}", "delivery" if is_delivery else "pickup",
                  payment_note or pay_label],
                 phone_number_id, token)
@@ -2184,6 +2123,20 @@ async def razorpay_webhook(request: Request):
             appt_res = supabase.table("appointments").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
             appointment = appt_res.data if appt_res else None
             if not appointment:
+                reg_res = supabase.table("event_registrations").select("*").eq("payment_id", payment_link_id).maybe_single().execute()
+                registration = reg_res.data if reg_res else None
+                if not registration:
+                    return {"status": "ok"}
+                if not _verify_razorpay_signature(body_bytes, signature, registration["project_id"]):
+                    raise HTTPException(status_code=400, detail="Invalid signature")
+                if already_processed("razorpay-payment", payment_link_id):
+                    return {"status": "duplicate_ignored"}
+                from events import handle_registration_payment_paid
+                try:
+                    paid_paise = int(link_entity.get("amount_paid") or link_entity.get("amount") or 0)
+                except (TypeError, ValueError):
+                    paid_paise = 0
+                handle_registration_payment_paid(registration, paid_paise)
                 return {"status": "ok"}
 
             if not _verify_razorpay_signature(body_bytes, signature, appointment["project_id"]):
@@ -2284,17 +2237,10 @@ async def razorpay_webhook(request: Request):
         phone_number_id = wa_data["phone_number_id"]
         token = wa_data.get("access_token") or WHATSAPP_TOKEN
 
-        from shop_branches import get_branch, get_default_branch, contact_phone
-        try:
-            branch = (get_branch(order["project_id"], order.get("branch_id")) if order.get("branch_id")
-                      else get_default_branch(order["project_id"]))
-        except Exception as e:
-            # Money is already taken: send the messages without branch lines
-            # rather than not at all.
-            sentry_sdk.capture_exception(e)
-            branch = None
+        from shop_store import store_view
         config.setdefault("project_id", order["project_id"])
-        contact = contact_phone(branch, config)
+        store = store_view(config)
+        contact = store.get("phone")
 
         oid = order['id'][:8].upper()
         msg = f"✅ *Payment Confirmed!*\n\n"
@@ -2302,11 +2248,10 @@ async def razorpay_webhook(request: Request):
         msg += f"Order ID: #{oid}\n"
         msg += order_money_lines(order, currency) + "\n"
         msg += f"*Total paid: {currency}{float(order['total']):.2f}*\n"
-        msg += order_fulfilment_lines(order, branch, currency) + "\n"
+        msg += order_fulfilment_lines(order, store, currency) + "\n"
         if contact:
             msg += f"📞 Contact: {phones.pretty(contact)}\n"
-        orders_url = shop_identity.build_shop_url(order["project_id"], order["phone_number"],
-                                                  branch_id=order.get("branch_id"), view="orders")
+        orders_url = shop_identity.build_shop_url(order["project_id"], order["phone_number"], view="orders")
         msg += f"📦 Your orders: {orders_url}\n"
         from shop_invoice import invoice_line
         msg += invoice_line(order)
@@ -2319,12 +2264,12 @@ async def razorpay_webhook(request: Request):
         except Exception as e:
             sentry_sdk.capture_exception(e)
         if not sent_ok:
-            branch_name = (branch or {}).get("name") or config.get("store_name") or "our store"
             _send_order_template(order["phone_number"], shop_rules.ORDER_STATUS_TEMPLATE,
-                                 [order.get("customer_name") or "there", oid, branch_name, "Paid and confirmed"],
+                                 [order.get("customer_name") or "there", oid, store.get("name") or "our store",
+                                  "Paid and confirmed"],
                                  phone_number_id, token)
 
-        send_owner_order_alert(order, branch, config, phone_number_id, token)
+        send_owner_order_alert(order, store, config, phone_number_id, token)
 
         _advance_flow_after_payment(order["project_id"], order["phone_number"], phone_number_id, token)
 
@@ -2335,21 +2280,15 @@ def _handle_paid_after_cancel(order: dict, config: dict):
     """A link paid after its order was cancelled: record the money, keep the
     order cancelled, and tell the owner to refund or fulfil."""
     from whatsapp import send_whatsapp_message
-    from shop_branches import get_branch
 
     supabase.table("orders").update({"payment_status": "paid"}).eq("id", order["id"]).execute()
     sentry_sdk.capture_message(f"paid after cancel: order {order['id']}")
     phone_number_id, token = _wa_creds(order["project_id"])
     if not phone_number_id:
         return
-    try:
-        branch = get_branch(order["project_id"], order.get("branch_id")) if order.get("branch_id") else None
-    except Exception as e:
-        sentry_sdk.capture_exception(e)
-        branch = None
     config = {**(config or {}), "project_id": order["project_id"]}
     paid = {**order, "payment_status": "paid"}
-    send_owner_order_alert(paid, branch, config, phone_number_id, token,
+    send_owner_order_alert(paid, None, config, phone_number_id, token,
                            header="⚠️ *Paid after cancel — refund or fulfil*",
                            payment_note="paid after the order was cancelled - refund or fulfil")
     try:

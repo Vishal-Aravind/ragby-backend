@@ -1,7 +1,7 @@
 import unittest
 
 import shop
-import shop_branches
+import shop_store
 import shop_rules as r
 from tests.test_shop_offers import ShopHarness, PID, PROD, CAT
 
@@ -96,11 +96,11 @@ class PriceOrderPerItemGst(ShopHarness):
         prods.append({"id": "33333333-3333-4333-8333-333333333333", "project_id": PID, "catalog_id": CAT,
                       "name": "Milk", "price": 20.0, "is_available": True, "image_url": None,
                       "shopify_variant_id": None, "gst_percent": 0})         # exempt
-        branch = self.db.tables["shop_branches"][0]
+        store = shop_store.get_store(PID)
         items = [shop.CartItem(product_id=PROD, quantity=1),
                  shop.CartItem(product_id="22222222-2222-4222-8222-222222222222", quantity=2),
                  shop.CartItem(product_id="33333333-3333-4333-8333-333333333333", quantity=1)]
-        p = shop_branches.price_order(PID, branch, items, "pickup")
+        p = shop_store.price_order(PID, store, items, "pickup")
         self.assertEqual(p["subtotal"], 220.0)
         self.assertEqual({b["rate"]: b["tax"] for b in p["gst_breakdown"]}, {0.0: 0.0, 5.0: 5.0, 12.0: 12.0})
         self.assertEqual(p["gst_amount"], 17.0)

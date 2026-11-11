@@ -477,7 +477,7 @@ def send_node(node: dict, to: str, phone_number_id: str, token: str, project_id:
         shop_url = build_shop_url(proj_id, to, catalog_id=catalog_id)
 
         # Shop switched off → the link would 403, so say so instead.
-        from shop_branches import shop_is_enabled
+        from shop_store import shop_is_enabled
         cfg_res = supabase.table("shop_config").select("is_enabled").eq("project_id", proj_id).maybe_single().execute() if proj_id else None
         if not shop_is_enabled(cfg_res.data if cfg_res else None):
             send_whatsapp_message(to, "Sorry, our shop isn't taking orders right now. Please check back later.", phone_number_id, token)
@@ -942,10 +942,9 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
     if session and session.get("mode") == "awaiting_cart_confirm":
         order_id = (session.get("metadata") or {}).get("order_id")
         catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
-        branch_id = (session.get("metadata") or {}).get("branch_id")
         from shop_identity import build_shop_url
         # Pass order_id so the shop page can pre-load existing cart items
-        shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id, branch_id=branch_id)
+        shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id)
 
         if "continue" in text.lower():
             send_whatsapp_buttons(
@@ -956,7 +955,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             )
             upsert_session(project_id, phone_number, {
                 "mode": "awaiting_special_request",
-                "metadata": {"order_id": order_id, "catalog_id": catalog_id, "branch_id": branch_id},
+                "metadata": {"order_id": order_id, "catalog_id": catalog_id},
             })
         elif "add more" in text.lower():
             send_whatsapp_cta_url(
@@ -974,7 +973,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 supabase.table("orders").delete().eq("id", order_id).eq("project_id", project_id) \
                     .eq("phone_number", phone_number).eq("status", "pending") \
                     .eq("payment_status", "unpaid").execute()
-            shop_url_fresh = build_shop_url(project_id, phone_number, catalog_id=catalog_id, branch_id=branch_id)
+            shop_url_fresh = build_shop_url(project_id, phone_number, catalog_id=catalog_id)
             send_whatsapp_cta_url(
                 phone_number,
                 "Your cart has been cleared. Start fresh! 🛒",
@@ -984,7 +983,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             )
             upsert_session(project_id, phone_number, {
                 "mode": "shop_browsing",
-                "metadata": {"catalog_id": catalog_id, "branch_id": branch_id},
+                "metadata": {"catalog_id": catalog_id},
             })
         else:
             send_whatsapp_buttons(
@@ -1001,7 +1000,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
 
     if session and session.get("mode") == "awaiting_special_request":
         from shop import order_fulfilment_lines, order_money_lines
-        from shop_branches import get_branch, contact_phone
+        from shop_store import store_view
         from phones import pretty
         order_id = (session.get("metadata") or {}).get("order_id")
         catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
@@ -1016,12 +1015,10 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         config_res = supabase.table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
         config = (config_res.data if config_res else None) or {}
         currency = config.get("currency", "₹")
-        store_name = config.get("store_name", "")
         terms_note = config.get("terms_note", "")
-        branch_id = order.get("branch_id") or (session.get("metadata") or {}).get("branch_id")
-        branch = get_branch(project_id, branch_id) if branch_id else None
         config.setdefault("project_id", project_id)
-        contact = contact_phone(branch, config)
+        store = store_view(config)
+        contact = store.get("phone")
 
         lines = []
         for i, item in enumerate(order["items"], 1):
@@ -1034,15 +1031,14 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         summary += order_money_lines(order, currency) + "\n"
         # order.total already includes the delivery fee (set by the server).
         summary += f"\n*Total Amount: {currency}{float(order['total']):.2f}*\n\n"
-        branch_name = (branch or {}).get("name") or store_name
-        if branch_name:
-            summary += f"🏪 *{branch_name}*\n"
+        if store.get("name"):
+            summary += f"🏪 *{store['name']}*\n"
         if contact:
             summary += f"📞 Contact - {pretty(contact)}\n\n"
         if terms_note:
             summary += f"ℹ️ Note - {terms_note}\n"
-        # Branch name is already above, so only the pickup/delivery lines.
-        block = order_fulfilment_lines(order, branch, currency).split("\n")
+        # The shop name is already above, so only the pickup/delivery lines.
+        block = order_fulfilment_lines(order, store, currency).split("\n")
         summary += "\n".join(line for line in block if not line.startswith("🏪 "))
 
         send_whatsapp_buttons(
@@ -1057,18 +1053,17 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
         )
         upsert_session(project_id, phone_number, {
             "mode": "awaiting_payment_confirm",
-            "metadata": {"order_id": order_id, "catalog_id": catalog_id, "branch_id": branch_id},
+            "metadata": {"order_id": order_id, "catalog_id": catalog_id},
         })
         return
 
     if session and session.get("mode") == "awaiting_payment_confirm":
         from shop import (generate_razorpay_link, send_owner_order_alert, OrderChangedError,
                           send_order_placed_message, release_offer, cancel_payment_link)
-        from shop_branches import get_branch, get_default_branch, status_for
+        from shop_store import store_view, status_for
         from shop_identity import build_shop_url
         order_id = (session.get("metadata") or {}).get("order_id")
         catalog_id = (session.get("metadata") or {}).get("catalog_id", "")
-        branch_id = (session.get("metadata") or {}).get("branch_id")
 
         if "confirm" in text.lower() or "pay" in text.lower():
             # Re-read: the merchant (or another tap) may have moved it on.
@@ -1082,23 +1077,21 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
             currency = config.get("currency", "₹")
 
             # Open state is checked again here: the cart may have been built
-            # while the branch was open, hours ago.
-            branch = (get_branch(project_id, order["branch_id"]) if order.get("branch_id")
-                      else get_default_branch(project_id))
-            if branch:
-                status = status_for(branch, config)
-                if not status["can_order"]:
-                    label = status["label"]
-                    send_whatsapp_cta_url(
-                        phone_number,
-                        f"😔 Sorry, {branch['name']} is {label[:1].lower() + label[1:]}. "
-                        "Your cart is saved — tap below to order when we're open.",
-                        "View Menu",
-                        build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id,
-                                       branch_id=branch["id"]),
-                        phone_number_id, token,
-                    )
-                    return
+            # while the shop was open, hours ago.
+            store = store_view({**config, "project_id": project_id})
+            status = status_for(store, config)
+            if not status["can_order"]:
+                label = status["label"]
+                who = store.get("name") or "the shop"
+                send_whatsapp_cta_url(
+                    phone_number,
+                    f"😔 Sorry, {who} is {label[:1].lower() + label[1:]}. "
+                    "Your cart is saved — tap below to order when we're open.",
+                    "View Menu",
+                    build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id),
+                    phone_number_id, token,
+                )
+                return
 
             try:
                 payment_url = generate_razorpay_link(order, config)
@@ -1121,7 +1114,7 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 )
                 upsert_session(project_id, phone_number, {
                     "mode": "awaiting_payment",
-                    "metadata": {"order_id": order_id, "branch_id": branch_id},
+                    "metadata": {"order_id": order_id},
                 })
             else:
                 # No Razorpay: the order is placed for offline payment. The
@@ -1140,18 +1133,17 @@ def handle_text(session: Optional[dict], text: str, project_id: str, chat_id: st
                 order = placed.data[0]
                 config.setdefault("project_id", project_id)
                 from shop import with_invoice
-                order = with_invoice(order, config, branch)
-                send_order_placed_message(order, branch, config)
+                order = with_invoice(order, config)
+                send_order_placed_message(order, store, config)
                 # Without Razorpay nobody told the owner about this order.
-                send_owner_order_alert(order, branch, config, phone_number_id, token,
+                send_owner_order_alert(order, store, config, phone_number_id, token,
                                        header="🔔 *New Order (collect payment)*")
                 upsert_session(project_id, phone_number, {"mode": "flow", "metadata": {}})
         elif "change" in text.lower() or "edit" in text.lower() or "add" in text.lower():
             # Same pre-load pattern "Add More" already uses one stage
             # earlier — an explicit, unambiguous link rather than trying to
             # guess what to modify from free text.
-            shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id,
-                                      branch_id=branch_id)
+            shop_url = build_shop_url(project_id, phone_number, catalog_id=catalog_id, order_id=order_id)
             send_whatsapp_cta_url(
                 phone_number,
                 "Sure! Tap below to change your order 🛍️",

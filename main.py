@@ -48,7 +48,7 @@ from campaigns import router as campaigns_router
 from template_library import router as template_library_router
 from wa_templates import router as wa_templates_router
 from shop import router as shop_router
-from shop_branches import router as shop_branches_router
+from shop_store import router as shop_store_router
 from shop_offers import router as shop_offers_router
 from shop_invoice import router as shop_invoice_router
 from appointments import router as appointments_router
@@ -190,6 +190,8 @@ def run_release_expired_holds():
     try:
         from appointments import release_expired_holds
         release_expired_holds()
+        from events import release_expired_registration_holds
+        release_expired_registration_holds()
         _record_job_run("appointment_hold_release", started_at, "success")
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -391,7 +393,7 @@ app.include_router(campaigns_router)
 app.include_router(template_library_router)
 app.include_router(wa_templates_router)
 app.include_router(shop_router)
-app.include_router(shop_branches_router)
+app.include_router(shop_store_router)
 app.include_router(shop_offers_router)
 app.include_router(shop_invoice_router)
 app.include_router(appointments_router)

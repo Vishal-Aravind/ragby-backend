@@ -127,9 +127,9 @@ class ReceiptAndUrlTests(unittest.TestCase):
 
     def test_build_shop_url(self):
         with _env():
-            url = si.build_shop_url(PID, PHONE, catalog_id="c1", order_id=None, branch_id="b1", view="orders")
+            url = si.build_shop_url(PID, PHONE, catalog_id="c1", order_id=None, view="orders")
             q = parse_qs(urlparse(url).query)
-            self.assertEqual(list(q.keys()), ["catalog", "phone", "branch", "view", "t"])
+            self.assertEqual(list(q.keys()), ["catalog", "phone", "view", "t"])
             self.assertEqual(si.verify_customer_token(q["t"][0], PID), (PHONE, None))
             plain = si.build_shop_url(PID)
             self.assertTrue(plain.endswith(f"/shop/{PID}"))

@@ -14,15 +14,13 @@ from unittest import mock
 from fastapi import HTTPException
 
 import shop
-import shop_branches
+import shop_store
 import shop_identity
 import shop_offers
 import shop_rules as r
 from tests.fake_supabase import FakeSupabase
 
 PID = "11111111-1111-1111-1111-111111111111"
-BID = "33333333-3333-3333-3333-333333333333"
-BID2 = "44444444-4444-4444-4444-444444444444"
 CAT = "55555555-5555-5555-5555-555555555555"
 PROD = "66666666-6666-6666-6666-666666666666"
 PHONE = "919876543210"
@@ -32,7 +30,7 @@ NOW = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
 def offer(**kw):
     base = dict(id=str(uuid.uuid4()), project_id=PID, title="Offer", description=None, kind="percent", value=10,
                 max_discount=None, min_order_value=0, application="automatic", code=None, is_visible=True,
-                starts_at=None, ends_at=None, is_active=True, archived_at=None, branch_ids=[], fulfilment="any",
+                starts_at=None, ends_at=None, is_active=True, archived_at=None, fulfilment="any",
                 first_order_only=False, usage_limit=None, per_customer_limit=None, sort_order=0,
                 created_at="2026-10-01T00:00:00+00:00")
     base.update(kw)
@@ -40,7 +38,7 @@ def offer(**kw):
 
 
 def ctx(**kw):
-    base = dict(now=NOW, branch_id=BID, fulfilment="delivery", subtotal=500, delivery_fee=40, verified=True,
+    base = dict(now=NOW, fulfilment="delivery", subtotal=500, delivery_fee=40, verified=True,
                 used_total=0, used_by_customer=0, has_prior_order=False)
     base.update(kw)
     return base
@@ -87,8 +85,6 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(r.offer_ineligibility(o, ctx()), "paused")
         self.assertEqual(r.offer_ineligibility(offer(starts_at="2026-11-01T00:00:00Z"), ctx()), "not_started")
         self.assertEqual(r.offer_ineligibility(offer(ends_at="2026-10-17T12:00:00Z"), ctx()), "expired")
-        self.assertEqual(r.offer_ineligibility(offer(branch_ids=[BID2]), ctx()), "branch")
-        self.assertIsNone(r.offer_ineligibility(offer(branch_ids=[BID, BID2]), ctx()))
         self.assertEqual(r.offer_ineligibility(offer(fulfilment="pickup"), ctx()), "fulfilment")
         self.assertEqual(r.offer_ineligibility(offer(first_order_only=True), ctx(verified=False)), "login_required")
         self.assertEqual(r.offer_ineligibility(offer(per_customer_limit=1), ctx(verified=False)), "login_required")
@@ -109,7 +105,6 @@ class EligibilityTests(unittest.TestCase):
     def test_messages(self):
         self.assertEqual(r.offer_reason_message("fulfilment", offer(fulfilment="pickup")),
                          "This offer is only for pickup orders.")
-        self.assertIn("Velachery", r.offer_reason_message("branch", ctx={"branch_name": "Velachery"}))
         self.assertTrue(r.offer_reason_message("not_started", offer(starts_at="2026-11-01T03:30:00Z"),
                                                {"timezone": "Asia/Kolkata"}).endswith("1 Nov, 9:00 AM."))
 
@@ -159,7 +154,7 @@ class TotalsTests(unittest.TestCase):
         self.assertEqual(r.apply_offer_totals(100, 0, 0, 100, 0)["total"], 0.0)
 
     def test_fingerprint(self):
-        base = {"branch_id": BID, "items": [{"product_id": "p1", "quantity": 1}, {"product_id": "p1", "quantity": 1}],
+        base = {"items": [{"product_id": "p1", "quantity": 1}, {"product_id": "p1", "quantity": 1}],
                 "fulfilment": "pickup", "name": "Asha", "coupon": "welcome10", "line1": "ignored for pickup"}
         same = {**base, "items": [{"product_id": "p1", "quantity": 2}], "coupon": "WELCOME10", "line1": None}
         self.assertEqual(r.checkout_fingerprint(base), r.checkout_fingerprint(same))
@@ -208,7 +203,7 @@ class EvaluateTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def ev(self, code=None, subtotal=500, fulfilment="delivery", fee=40, verified=True, enabled=True, **kw):
-        return shop_offers.evaluate_offers(PID, {"id": BID, "name": "Velachery"}, fulfilment, subtotal, fee,
+        return shop_offers.evaluate_offers(PID, {"name": "Velachery"}, fulfilment, subtotal, fee,
                                            {"phone": PHONE, "verified": verified}, code, "1.2.3.4", NOW,
                                            enabled=enabled, **kw)
 
@@ -292,12 +287,11 @@ def _shop_db(online=True, offers=None, price=115.0):
     tables = {
         "shop_config": [{"project_id": PID, "is_enabled": True, "gst_percent": 5, "currency": "₹",
                          "currency_code": "INR", "razorpay_key_id": "rzp_k" if online else None,
-                         "razorpay_key_secret": "s" if online else None}],
-        "shop_branches": [{"id": BID, "project_id": PID, "name": "Velachery", "is_default": True, "is_active": True,
-                           "accepting_orders": True, "pickup_enabled": True, "delivery_enabled": False,
-                           "hours": None, "timezone": "Asia/Kolkata", "min_order_value": 0,
-                           "free_delivery_above": None, "pincodes": [], "max_delivery_km": None}],
-        "catalogs": [{"id": CAT, "project_id": PID, "branch_id": BID, "is_active": True}],
+                         "razorpay_key_secret": "s" if online else None, "store_name": "Velachery",
+                         "accepting_orders": True, "pickup_enabled": True, "delivery_enabled": False,
+                         "hours": None, "timezone": "Asia/Kolkata", "min_order_value": 0,
+                         "free_delivery_above": None, "pincodes": [], "max_delivery_km": None}],
+        "catalogs": [{"id": CAT, "project_id": PID, "is_active": True}],
         "products": [{"id": PROD, "project_id": PID, "catalog_id": CAT, "name": "Ghee Pongal", "price": price,
                       "is_available": True, "image_url": None, "shopify_variant_id": None}],
         "orders": [],
@@ -357,7 +351,7 @@ class ShopHarness(unittest.TestCase):
         patches = [
             mock.patch.dict(os.environ, {"SHOP_LINK_SECRET": "z" * 40, "SHOP_REQUIRE_CUSTOMER_TOKEN": ""}),
             mock.patch.object(shop, "supabase", self.db),
-            mock.patch.object(shop_branches, "supabase", self.db),
+            mock.patch.object(shop_store, "supabase", self.db),
             mock.patch.object(shop_offers, "supabase", self.db),
             mock.patch.object(shop, "is_rate_limited", lambda *a, **k: False),
             mock.patch.object(shop_offers, "is_rate_limited", lambda *a, **k: False),
@@ -379,7 +373,7 @@ class ShopHarness(unittest.TestCase):
 
     def body(self, **kw):
         base = dict(customer_token=shop_identity.issue_customer_token(PID, PHONE), idempotency_key=str(uuid.uuid4()),
-                    branch_id=BID, items=[{"product_id": PROD, "quantity": 2}], fulfilment="pickup",
+                    items=[{"product_id": PROD, "quantity": 2}], fulfilment="pickup",
                     customer_name="Asha", expected_total=241.5, sold_out_preference="call_me", note="Less spicy")
         base.update(kw)
         return shop.PlaceOrderBody(**base)
@@ -397,15 +391,15 @@ class PriceOrderTests(ShopHarness):
     offers = [offer(kind="percent", value=10, max_discount=100)]
 
     def test_v1_callers_get_no_discount(self):
-        branch = self.db.tables["shop_branches"][0]
-        p = shop_branches.price_order(PID, branch, [shop.CartItem(product_id=PROD, quantity=2)], "pickup")
+        store = shop_store.get_store(PID)
+        p = shop_store.price_order(PID, store, [shop.CartItem(product_id=PROD, quantity=2)], "pickup")
         self.assertEqual((p["subtotal"], p["gst_amount"], p["total"], p["discount_amount"]), (230, 11.5, 241.5, 0))
         self.assertIsNone(p["offer"])
 
     def test_v2_discount_and_gst(self):
-        branch = self.db.tables["shop_branches"][0]
-        p = shop_branches.price_order(PID, branch, [shop.CartItem(product_id=PROD, quantity=2)], "pickup",
-                                      offers_enabled=True, identity={"phone": PHONE, "verified": True}, now_utc=NOW)
+        store = shop_store.get_store(PID)
+        p = shop_store.price_order(PID, store, [shop.CartItem(product_id=PROD, quantity=2)], "pickup",
+                                   offers_enabled=True, identity={"phone": PHONE, "verified": True}, now_utc=NOW)
         self.assertEqual(p["items_discount"], 23)
         self.assertEqual(p["taxable_subtotal"], 207)
         self.assertEqual(p["gst_amount"], 10.35)

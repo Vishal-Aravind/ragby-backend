@@ -1,4 +1,4 @@
-"""Shop branch rules: hours, open state, delivery quote, status messages.
+"""Shop store rules: hours, open state, delivery quote, status messages.
 No network, no database.
 
 Run from backend/:  python -m unittest tests.test_shop_rules -v
@@ -17,8 +17,8 @@ def ist(y, mo, d, h, mi=0):
     return datetime(y, mo, d, h, mi, tzinfo=IST).astimezone(timezone.utc)
 
 
-def branch(**kw):
-    base = dict(id="b1", name="Velachery", timezone="Asia/Kolkata", hours=None, is_active=True,
+def store(**kw):
+    base = dict(name="Velachery", timezone="Asia/Kolkata", hours=None,
                 accepting_orders=True, pickup_enabled=True, delivery_enabled=True,
                 lat=12.9791, lng=80.2209, pincodes=[], max_delivery_km=None,
                 delivery_per_km=0, delivery_base_fee=0, free_delivery_above=None)
@@ -52,63 +52,63 @@ class HoursValidationTests(unittest.TestCase):
 
 class OpenStatusTests(unittest.TestCase):
     def test_null_hours_always_open(self):
-        s = r.branch_status(branch(), True, ist(2026, 10, 17, 3))
+        s = r.store_status(store(), True, ist(2026, 10, 17, 3))
         self.assertTrue(s["is_open"])
         self.assertTrue(s["can_order"])
         self.assertEqual(s["label"], "Open now")
 
     def test_regular_open_and_closed(self):
-        b = branch(hours=WEEK)
-        s = r.branch_status(b, True, ist(2026, 10, 17, 12))
+        b = store(hours=WEEK)
+        s = r.store_status(b, True, ist(2026, 10, 17, 12))
         self.assertEqual(s["label"], "Open now · closes 10:00 PM")
         self.assertEqual(s["closes_at_label"], "10:00 PM")
         self.assertEqual(s["today_hours_label"], "Today 9:00 AM – 10:00 PM")
 
-        s = r.branch_status(b, True, ist(2026, 10, 17, 7))
+        s = r.store_status(b, True, ist(2026, 10, 17, 7))
         self.assertFalse(s["can_order"])
         self.assertEqual(s["reason"], "closed")
         self.assertEqual(s["label"], "Closed now · opens at 9:00 AM")
 
-        s = r.branch_status(b, True, ist(2026, 10, 17, 23))
+        s = r.store_status(b, True, ist(2026, 10, 17, 23))
         self.assertEqual(s["label"], "Closed now · opens tomorrow at 9:00 AM")
         self.assertEqual(s["opens_at_label"], "tomorrow at 9:00 AM")
 
     def test_overnight(self):
         hours = {"fri": {"closed": False, "open": "18:00", "close": "02:00"}}
-        b = branch(hours=hours)
+        b = store(hours=hours)
         # Saturday 01:00 is still Friday's session.
-        s = r.branch_status(b, True, ist(2026, 10, 17, 1))
+        s = r.store_status(b, True, ist(2026, 10, 17, 1))
         self.assertTrue(s["is_open"])
         self.assertEqual(s["closes_at_label"], "2:00 AM")
         # Friday 23:00 open, closing tomorrow 2 AM.
-        self.assertTrue(r.branch_status(b, True, ist(2026, 10, 16, 23))["is_open"])
+        self.assertTrue(r.store_status(b, True, ist(2026, 10, 16, 23))["is_open"])
         # Saturday 03:00 closed; next opening is next Friday.
-        s = r.branch_status(b, True, ist(2026, 10, 17, 3))
+        s = r.store_status(b, True, ist(2026, 10, 17, 3))
         self.assertFalse(s["is_open"])
         self.assertEqual(s["label"], "Closed now · opens Fri at 6:00 PM")
 
     def test_overnight_reopens_same_day(self):
         hours = {k: {"closed": False, "open": "18:00", "close": "02:00"} for k in r.DAY_KEYS}
-        s = r.branch_status(branch(hours=hours), True, ist(2026, 10, 17, 3))
+        s = r.store_status(store(hours=hours), True, ist(2026, 10, 17, 3))
         self.assertEqual(s["label"], "Closed now · opens at 6:00 PM")
 
     def test_closed_day_and_missing_day(self):
         hours = {"sat": {"closed": True, "open": "09:00", "close": "22:00"},
                  "mon": dict(DAY)}
-        s = r.branch_status(branch(hours=hours), True, ist(2026, 10, 17, 12))
+        s = r.store_status(store(hours=hours), True, ist(2026, 10, 17, 12))
         self.assertFalse(s["is_open"])
         self.assertEqual(s["today_hours_label"], "Closed today")
         # Sunday has no key = closed, so Monday is next.
         self.assertEqual(s["label"], "Closed now · opens Mon at 9:00 AM")
 
     def test_no_open_day(self):
-        s = r.branch_status(branch(hours={}), True, ist(2026, 10, 17, 12))
+        s = r.store_status(store(hours={}), True, ist(2026, 10, 17, 12))
         self.assertEqual(s["label"], "Closed")
         self.assertIsNone(s["next_open_at"])
 
     def test_24h(self):
         hours = {"sat": {"closed": False, "open": "00:00", "close": "00:00"}}
-        s = r.branch_status(branch(hours=hours), True, ist(2026, 10, 17, 3))
+        s = r.store_status(store(hours=hours), True, ist(2026, 10, 17, 3))
         self.assertTrue(s["is_open"])
         self.assertEqual(s["label"], "Open 24 hours")
         self.assertEqual(s["today_hours_label"], "Open 24 hours")
@@ -117,24 +117,23 @@ class OpenStatusTests(unittest.TestCase):
         # 12:00 UTC is 16:00 in Dubai (open) but 21:00 in Tokyo... and
         # 12:00 UTC is 05:00 in Los Angeles (closed).
         now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
-        self.assertTrue(r.branch_status(branch(hours=WEEK, timezone="Asia/Dubai"), True, now)["is_open"])
-        s = r.branch_status(branch(hours=WEEK, timezone="America/Los_Angeles"), True, now)
+        self.assertTrue(r.store_status(store(hours=WEEK, timezone="Asia/Dubai"), True, now)["is_open"])
+        s = r.store_status(store(hours=WEEK, timezone="America/Los_Angeles"), True, now)
         self.assertFalse(s["is_open"])
         self.assertEqual(s["timezone"], "America/Los_Angeles")
 
     def test_bad_timezone_falls_back(self):
-        s = r.branch_status(branch(timezone="Nope/Nowhere"), True, ist(2026, 10, 17, 12))
+        s = r.store_status(store(timezone="Nope/Nowhere"), True, ist(2026, 10, 17, 12))
         self.assertEqual(s["timezone"], "Asia/Kolkata")
 
-    def test_paused_and_inactive(self):
-        s = r.branch_status(branch(accepting_orders=False), True, ist(2026, 10, 17, 12))
+    def test_paused_and_shop_off(self):
+        s = r.store_status(store(accepting_orders=False), True, ist(2026, 10, 17, 12))
         self.assertEqual((s["reason"], s["label"]), ("paused", "Not taking orders right now"))
         self.assertFalse(s["can_order"])
         # Closed beats paused.
-        s = r.branch_status(branch(hours=WEEK, accepting_orders=False), True, ist(2026, 10, 17, 7))
+        s = r.store_status(store(hours=WEEK, accepting_orders=False), True, ist(2026, 10, 17, 7))
         self.assertEqual(s["reason"], "closed")
-        self.assertEqual(r.branch_status(branch(is_active=False), True, ist(2026, 10, 17, 12))["reason"], "inactive")
-        self.assertEqual(r.branch_status(branch(), False, ist(2026, 10, 17, 12))["reason"], "inactive")
+        self.assertEqual(r.store_status(store(), False, ist(2026, 10, 17, 12))["reason"], "inactive")
 
     def test_format_time(self):
         self.assertEqual(r.format_time(0, 5), "12:05 AM")
@@ -143,22 +142,22 @@ class OpenStatusTests(unittest.TestCase):
 
 
 class DeliveryQuoteTests(unittest.TestCase):
-    # ~2.1 km north of the branch.
+    # ~2.1 km north of the shop.
     NEAR = (12.9791 + 2.1 / 111.2, 80.2209)
     FAR = (12.9791 + 8 / 111.2, 80.2209)
 
     def test_neither_pincodes_nor_radius_is_off(self):
-        q = r.quote_delivery(branch(), 100, *self.NEAR, "600042")
+        q = r.quote_delivery(store(), 100, *self.NEAR, "600042")
         self.assertEqual((q["available"], q["reason"]), (False, "delivery_off"))
-        q = r.quote_delivery(branch(delivery_enabled=False, max_delivery_km=6), 100, *self.NEAR, None)
+        q = r.quote_delivery(store(delivery_enabled=False, max_delivery_km=6), 100, *self.NEAR, None)
         self.assertEqual(q["reason"], "delivery_off")
 
     def test_location_required(self):
-        q = r.quote_delivery(branch(max_delivery_km=6), 100, None, None, "600042")
+        q = r.quote_delivery(store(max_delivery_km=6), 100, None, None, "600042")
         self.assertEqual(q["reason"], "location_required")
 
     def test_radius_fee_and_rounding(self):
-        b = branch(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10)
+        b = store(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10)
         q = r.quote_delivery(b, 100, *self.NEAR, None)
         self.assertTrue(q["available"])
         self.assertAlmostEqual(q["distance_km"], 2.1, places=1)
@@ -166,12 +165,12 @@ class DeliveryQuoteTests(unittest.TestCase):
         self.assertIsInstance(q["fee"], int)
 
     def test_ceil_up(self):
-        b = branch(max_delivery_km=6, delivery_base_fee=0, delivery_per_km=7, lat=0.0001, lng=10)
+        b = store(max_delivery_km=6, delivery_base_fee=0, delivery_per_km=7, lat=0.0001, lng=10)
         q = r.quote_delivery(b, 100, 0.0001 + 1.234 / 111.195, 10, None)
         self.assertEqual(q["fee"], 9)    # 7 * 1.23 = 8.61 -> 9
 
     def test_out_of_area_and_pincode_override(self):
-        b = branch(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10)
+        b = store(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10)
         q = r.quote_delivery(b, 100, *self.FAR, "600091")
         self.assertEqual(q["reason"], "out_of_area")
         b["pincodes"] = ["600091"]
@@ -179,8 +178,8 @@ class DeliveryQuoteTests(unittest.TestCase):
         self.assertTrue(q["available"])
         self.assertEqual(q["fee"], 100)  # fee still uses the real 8 km
 
-    def test_pincode_only_branch(self):
-        b = branch(pincodes=["600042"], lat=None, lng=None, delivery_base_fee=30)
+    def test_pincode_only_shop(self):
+        b = store(pincodes=["600042"], lat=None, lng=None, delivery_base_fee=30)
         q = r.quote_delivery(b, 100, *self.NEAR, "600042")
         self.assertEqual((q["available"], q["fee"], q["distance_km"]), (True, 30, None))
         q = r.quote_delivery(b, 100, *self.NEAR, "600001")
@@ -190,7 +189,7 @@ class DeliveryQuoteTests(unittest.TestCase):
         self.assertEqual(q["reason"], "location_required")
 
     def test_free_above(self):
-        b = branch(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10, free_delivery_above=499)
+        b = store(max_delivery_km=6, delivery_base_fee=20, delivery_per_km=10, free_delivery_above=499)
         self.assertEqual(r.quote_delivery(b, 499, *self.NEAR, None)["fee"], 0)
         self.assertEqual(r.quote_delivery(b, 498.99, *self.NEAR, None)["fee"], 41)
 
@@ -199,9 +198,9 @@ class DeliveryQuoteTests(unittest.TestCase):
         self.assertAlmostEqual(r.haversine_km(13.0827, 80.2707, 12.9791, 80.2209), 12.7, delta=0.5)
 
     def test_delivery_available(self):
-        self.assertFalse(r.delivery_available(branch()))
-        self.assertTrue(r.delivery_available(branch(pincodes=["600042"])))
-        self.assertFalse(r.delivery_available(branch(pincodes=["600042"], delivery_enabled=False)))
+        self.assertFalse(r.delivery_available(store()))
+        self.assertTrue(r.delivery_available(store(pincodes=["600042"])))
+        self.assertFalse(r.delivery_available(store(pincodes=["600042"], delivery_enabled=False)))
 
 
 class InputTests(unittest.TestCase):
@@ -231,7 +230,7 @@ class InputTests(unittest.TestCase):
 
 
 class StatusMessageTests(unittest.TestCase):
-    CTX = {"name": "Asha", "oid": "A1B2C3D4", "branch": "Velachery", "contact": "+91 98765 43210",
+    CTX = {"name": "Asha", "oid": "A1B2C3D4", "shop": "Velachery", "contact": "+91 98765 43210",
            "prep": 20, "address": "12, 100 Feet Rd"}
 
     def msg(self, status, fulfilment="pickup", **ctx):

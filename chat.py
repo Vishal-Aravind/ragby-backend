@@ -566,6 +566,8 @@ def _shape_event_for_ai(e: dict) -> dict:
         "time": e.get("event_time"),
         "location": e.get("location"),
         "spots_left": e.get("spots_left"),
+        # 0 = free. Paid events are paid on the registration page.
+        "registration_fee": float(e.get("price") or 0),
     }
 
 

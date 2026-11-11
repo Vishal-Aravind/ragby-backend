@@ -1,10 +1,10 @@
-"""Shop branch rules: opening hours, open/closed state, delivery quote and
+"""Shop store rules: opening hours, open/closed state, delivery quote and
 order-status message wording. Pure functions, no database or network, so
 every money and open-state decision the server makes can be unit tested
 (tests/test_shop_rules.py).
 
 The customer page only ever displays what these return. It never decides
-by itself whether a branch is open or what delivery costs.
+by itself whether the shop is open or what delivery costs.
 """
 import hashlib
 import json
@@ -213,23 +213,23 @@ def resolve_timezone(name):
         return ZoneInfo(name or DEFAULT_TIMEZONE)
     except Exception:
         # Validated on save, so this is a row edited by hand or an old tz.
-        sentry_sdk.capture_message(f"Shop branch has invalid timezone {name!r}; using {DEFAULT_TIMEZONE}")
+        sentry_sdk.capture_message(f"Shop has invalid timezone {name!r}; using {DEFAULT_TIMEZONE}")
         return ZoneInfo(DEFAULT_TIMEZONE)
 
 
-def branch_status(branch: dict, shop_enabled: bool, now_utc: datetime) -> dict:
-    tz = resolve_timezone(branch.get("timezone"))
+def store_status(store: dict, shop_enabled: bool, now_utc: datetime) -> dict:
+    tz = resolve_timezone(store.get("timezone"))
     now = now_utc.astimezone(tz)
-    hours = branch.get("hours")
+    hours = store.get("hours")
 
     open_now, closes_at, kind = _is_open(hours, now)
     next_open = None if open_now else _next_open(hours, now)
 
-    if not shop_enabled or not branch.get("is_active", True):
+    if not shop_enabled:
         reason = "inactive"
     elif not open_now:
         reason = "closed"
-    elif not branch.get("accepting_orders", True):
+    elif not store.get("accepting_orders", True):
         reason = "paused"
     else:
         reason = None
@@ -282,29 +282,29 @@ def haversine_km(lat1, lng1, lat2, lng2) -> float:
     return 2 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
 
 
-def delivery_area_set(branch: dict) -> bool:
-    has_pins = len(branch.get("pincodes") or []) > 0
-    max_km = branch.get("max_delivery_km")
+def delivery_area_set(store: dict) -> bool:
+    has_pins = len(store.get("pincodes") or []) > 0
+    max_km = store.get("max_delivery_km")
     has_radius = max_km is not None and float(max_km) > 0
     return has_pins or has_radius
 
 
-def delivery_available(branch: dict) -> bool:
+def delivery_available(store: dict) -> bool:
     """Delivery switched on AND a delivery area set. Without an area there
     is no rule for who may order, so delivery is off."""
-    return bool(branch.get("delivery_enabled")) and delivery_area_set(branch)
+    return bool(store.get("delivery_enabled")) and delivery_area_set(store)
 
 
 def _unavailable(reason: str, distance=None) -> dict:
     return {"available": False, "reason": reason, "fee": 0, "distance_km": distance}
 
 
-def quote_delivery(branch: dict, subtotal: float, cust_lat, cust_lng, pincode) -> dict:
-    pins = branch.get("pincodes") or []
+def quote_delivery(store: dict, subtotal: float, cust_lat, cust_lng, pincode) -> dict:
+    pins = store.get("pincodes") or []
     has_pins = len(pins) > 0
-    max_km = branch.get("max_delivery_km")
+    max_km = store.get("max_delivery_km")
     has_radius = max_km is not None and float(max_km) > 0
-    if not branch.get("delivery_enabled") or (not has_pins and not has_radius):
+    if not store.get("delivery_enabled") or (not has_pins and not has_radius):
         return _unavailable("delivery_off")
     # Delivery always needs the customer's real pin, so the fee is never
     # worked out from a pincode's rough centre.
@@ -312,21 +312,21 @@ def quote_delivery(branch: dict, subtotal: float, cust_lat, cust_lng, pincode) -
         return _unavailable("location_required")
 
     distance = None
-    if branch.get("lat") is not None and branch.get("lng") is not None:
-        distance = round(haversine_km(branch["lat"], branch["lng"], cust_lat, cust_lng), 2)
+    if store.get("lat") is not None and store.get("lng") is not None:
+        distance = round(haversine_km(store["lat"], store["lng"], cust_lat, cust_lng), 2)
 
     pin_ok = has_pins and pincode is not None and pincode in pins
     radius_ok = has_radius and distance is not None and distance <= float(max_km)
     if not (pin_ok or radius_ok):
         return _unavailable("out_of_area", distance)
 
-    per_km = float(branch.get("delivery_per_km") or 0)
-    base = float(branch.get("delivery_base_fee") or 0)
+    per_km = float(store.get("delivery_per_km") or 0)
+    base = float(store.get("delivery_base_fee") or 0)
     if per_km > 0 and distance is None:
-        # Pincode-only branch that charges per km but has no location yet.
+        # Pincode-only shop that charges per km but has no location yet.
         return _unavailable("location_required")
 
-    free_above = branch.get("free_delivery_above")
+    free_above = store.get("free_delivery_above")
     if free_above is not None and float(subtotal) >= float(free_above):
         fee = 0
     else:
@@ -363,9 +363,9 @@ def sanitize_template_param(value) -> str:
 
 def order_status_message(new_status: str, fulfilment: str, ctx: dict) -> Optional[dict]:
     """{"template", "params", "text"} for a status change, or None when that
-    status sends nothing. ctx: name, oid, branch, contact, prep, address."""
+    status sends nothing. ctx: name, oid, shop, contact, prep, address."""
     oid = ctx.get("oid") or ""
-    branch = ctx.get("branch") or "our store"
+    shop = ctx.get("shop") or "our store"
     name = ctx.get("name") or "there"
     contact = ctx.get("contact") or "our store"
     prep = ctx.get("prep")
@@ -375,25 +375,25 @@ def order_status_message(new_status: str, fulfilment: str, ctx: dict) -> Optiona
     if new_status == "cancelled":
         return {
             "template": ORDER_CANCELLED_TEMPLATE,
-            "params": [name, oid, branch, contact],
-            "text": (f"❌ *Order Cancelled* #{oid}\nYour order from {branch} has been cancelled. "
+            "params": [name, oid, shop, contact],
+            "text": (f"❌ *Order Cancelled* #{oid}\nYour order from {shop} has been cancelled. "
                      f"If you already paid, please contact {contact}."),
         }
 
     if new_status == "confirmed":
         status_text = "Confirmed"
-        text = f"✅ *Order Confirmed* #{oid}\nYour order from {branch} is confirmed."
+        text = f"✅ *Order Confirmed* #{oid}\nYour order from {shop} is confirmed."
         if prep:
             text += f"\nReady in ~{prep} min."
     elif new_status == "preparing":
         status_text = "Being prepared"
-        text = f"👨‍🍳 Your order #{oid} from {branch} is being prepared."
+        text = f"👨‍🍳 Your order #{oid} from {shop} is being prepared."
     elif new_status == "ready" and delivery:
         status_text = "Ready, dispatching soon"
         text = f"📦 Your order #{oid} is ready and will be dispatched soon."
     elif new_status == "ready":
         status_text = "Ready for pickup"
-        text = f"🛍️ Your order #{oid} is *ready for pickup* at {branch}."
+        text = f"🛍️ Your order #{oid} is *ready for pickup* at {shop}."
         if address:
             text += f"\n📍 {address}"
     elif new_status == "out_for_delivery":
@@ -404,11 +404,11 @@ def order_status_message(new_status: str, fulfilment: str, ctx: dict) -> Optiona
         text = f"🎉 Order #{oid} delivered. Enjoy your meal!"
     elif new_status == "completed":
         status_text = "Picked up"
-        text = f"🎉 Order #{oid} picked up. Thank you for ordering from {branch}!"
+        text = f"🎉 Order #{oid} picked up. Thank you for ordering from {shop}!"
     else:
         return None
 
-    return {"template": ORDER_STATUS_TEMPLATE, "params": [name, oid, branch, status_text], "text": text}
+    return {"template": ORDER_STATUS_TEMPLATE, "params": [name, oid, shop, status_text], "text": text}
 
 
 # ─────────────────────────────────────────────
@@ -426,7 +426,6 @@ OFFER_REASON_MESSAGES = {
     "expired": "This offer has expired.",
     "not_started": "This offer starts on {date}.",
     "paused": "This offer isn't available right now.",
-    "branch": "This offer isn't valid at {branch}.",
     "fulfilment": "This offer is only for {fulfilment} orders.",
     "login_required": "Open the menu from your WhatsApp chat to use this offer.",
     "min_order": "Add {short} more to use this offer (min order {min}).",
@@ -523,7 +522,7 @@ def saving_total(s: dict) -> float:
 
 def offer_ineligibility(offer: dict, ctx: dict) -> Optional[str]:
     """The first reason this offer can't apply, or None. ctx: now,
-    branch_id, fulfilment, subtotal, delivery_fee, verified, used_total,
+    fulfilment, subtotal, delivery_fee, verified, used_total,
     used_by_customer, has_prior_order."""
     now = ctx.get("now")
     if not offer.get("is_active", True) or offer.get("archived_at"):
@@ -533,9 +532,6 @@ def offer_ineligibility(offer: dict, ctx: dict) -> Optional[str]:
         return "not_started"
     if ends and now and now >= ends:
         return "expired"
-    branch_ids = [str(b) for b in (offer.get("branch_ids") or [])]
-    if branch_ids and str(ctx.get("branch_id")) not in branch_ids:
-        return "branch"
     scope = offer.get("fulfilment") or "any"
     if scope != "any" and scope != ctx.get("fulfilment"):
         return "fulfilment"
@@ -572,8 +568,6 @@ def offer_reason_message(reason: Optional[str], offer: Optional[dict] = None, ct
     if reason == "not_started":
         starts = parse_ts(offer.get("starts_at"))
         return template.format(date=_format_local(starts, ctx.get("timezone")) if starts else "a later date")
-    if reason == "branch":
-        return template.format(branch=ctx.get("branch_name") or "this branch")
     if reason == "fulfilment":
         return template.format(fulfilment="delivery" if offer.get("fulfilment") == "delivery" else "pickup")
     if reason == "min_order":
@@ -693,7 +687,6 @@ def checkout_fingerprint(d: dict) -> str:
 
     delivery = d.get("fulfilment") == "delivery"
     canonical = {
-        "branch_id": s(d.get("branch_id")),
         "items": sorted([[k, v] for k, v in merged.items()]),
         "fulfilment": s(d.get("fulfilment")),
         "name": s(d.get("name")),

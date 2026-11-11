@@ -1,5 +1,5 @@
 """Shop offers & coupons: dashboard CRUD, the public offers strip, and
-evaluate_offers, which price_order (shop_branches.py) calls to work out the
+evaluate_offers, which price_order (shop_store.py) calls to work out the
 one offer an order gets.
 
 The maths (savings, eligibility order, best-of choice, GST on the discounted
@@ -26,7 +26,6 @@ router = APIRouter()
 
 MAX_OFFERS_PER_PROJECT = 100
 MAX_ACTIVE_AUTOMATIC = 20
-MAX_BRANCH_IDS = 50
 
 # Coupon brute-force buckets (spec G.1).
 BAD_IP_LIMIT, BAD_IP_WINDOW = 8, 900
@@ -34,12 +33,12 @@ BAD_PROJECT_LIMIT, BAD_PROJECT_WINDOW = 300, 3600
 TRY_IP_LIMIT, TRY_IP_WINDOW = 60, 600
 
 _OFFER_COLUMNS = ("title", "description", "kind", "value", "max_discount", "min_order_value", "application",
-                  "code", "is_visible", "starts_at", "ends_at", "is_active", "branch_ids", "fulfilment",
+                  "code", "is_visible", "starts_at", "ends_at", "is_active", "fulfilment",
                   "first_order_only", "usage_limit", "per_customer_limit", "sort_order")
 
 
 # ─────────────────────────────────────────────
-# EVALUATION (called by shop_branches.price_order)
+# EVALUATION (called by shop_store.price_order)
 # ─────────────────────────────────────────────
 
 def _empty(coupon=None) -> dict:
@@ -94,7 +93,7 @@ def _has_prior_order(project_id: str, phone: str, exclude_order_id=None) -> bool
         return False
 
 
-def evaluate_offers(project_id, branch, fulfilment, subtotal, delivery_fee, identity, coupon_code,
+def evaluate_offers(project_id, store, fulfilment, subtotal, delivery_fee, identity, coupon_code,
                     ip, now_utc, exclude_order_id=None, exclude_offer_ids=(), enabled=True,
                     currency="₹") -> dict:
     """The one offer this order gets, the coupon verdict and the offers list.
@@ -104,7 +103,7 @@ def evaluate_offers(project_id, branch, fulfilment, subtotal, delivery_fee, iden
     Offer problems never raise; they are reported in coupon/available_offers.
     """
     identity = identity or {}
-    branch = branch or {}
+    store = store or {}
     raw_code = coupon_code.strip() if isinstance(coupon_code, str) else coupon_code
     if not enabled or not subtotal or float(subtotal) <= 0:
         if raw_code and not enabled:
@@ -172,8 +171,7 @@ def evaluate_offers(project_id, branch, fulfilment, subtotal, delivery_fee, iden
         prior = _has_prior_order(project_id, phone, exclude_order_id)
 
     base_ctx = {
-        "now": now, "branch_id": branch.get("id"), "branch_name": branch.get("name"),
-        "timezone": branch.get("timezone"), "fulfilment": fulfilment,
+        "now": now, "timezone": store.get("timezone"), "fulfilment": fulfilment,
         "subtotal": float(subtotal), "delivery_fee": float(delivery_fee or 0),
         "verified": verified, "has_prior_order": prior,
     }
@@ -236,12 +234,9 @@ def evaluate_offers(project_id, branch, fulfilment, subtotal, delivery_fee, iden
 # ─────────────────────────────────────────────
 
 @router.get("/public/shop/{project_id}/offers")
-def public_offers(project_id: str, request: Request, branch_id: Optional[str] = None,
-                  fulfilment: Optional[str] = None):
+def public_offers(project_id: str, request: Request, fulfilment: Optional[str] = None):
     _public_shop_guard(project_id, request, "shop-offers", limit=60)
     _assert_shop_enabled(project_id)
-    if branch_id and not shop_rules.UUID_RE.match(branch_id):
-        raise shop_error(400, "invalid_request", "Invalid branch id")
     if fulfilment and fulfilment not in ("pickup", "delivery"):
         raise shop_error(400, "invalid_request", "fulfilment must be 'pickup' or 'delivery'")
 
@@ -256,9 +251,6 @@ def public_offers(project_id: str, request: Request, branch_id: Optional[str] = 
             continue
         starts, ends = shop_rules.parse_ts(r.get("starts_at")), shop_rules.parse_ts(r.get("ends_at"))
         if (starts and now < starts) or (ends and now >= ends):
-            continue
-        ids = [str(b) for b in (r.get("branch_ids") or [])]
-        if branch_id and ids and branch_id not in ids:
             continue
         if fulfilment and (r.get("fulfilment") or "any") not in ("any", fulfilment):
             continue
@@ -290,7 +282,6 @@ class OfferUpsert(BaseModel):
     starts_at: Optional[str] = Field(default=None, max_length=64)
     ends_at: Optional[str] = Field(default=None, max_length=64)
     is_active: Optional[bool] = None
-    branch_ids: Optional[List[str]] = Field(default=None, max_length=200)
     fulfilment: Optional[str] = Field(default=None, max_length=16)
     first_order_only: Optional[bool] = None
     usage_limit: Optional[int] = None
@@ -327,11 +318,9 @@ def _parse_dt(label, value) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def validate_offer(merged: dict, project_id: str, creating: bool, now: Optional[datetime] = None,
-                   branch_lookup=None) -> dict:
+def validate_offer(merged: dict, project_id: str, creating: bool, now: Optional[datetime] = None) -> dict:
     """The full set of editable columns, validated and normalised. `merged`
-    is the existing row (on update) with the request's fields on top.
-    branch_lookup(project_id, ids) -> set of ids that exist (injectable for tests)."""
+    is the existing row (on update) with the request's fields on top."""
     now = now or datetime.now(timezone.utc)
     out = {}
 
@@ -395,21 +384,6 @@ def validate_offer(merged: dict, project_id: str, creating: bool, now: Optional[
     active = merged.get("is_active")
     out["is_active"] = True if active is None else bool(active)
 
-    ids = []
-    for b in (merged.get("branch_ids") or []):
-        b = str(b).lower()
-        if not shop_rules.UUID_RE.match(b):
-            raise _bad("Invalid branch id")
-        if b not in ids:
-            ids.append(b)
-    if len(ids) > MAX_BRANCH_IDS:
-        raise _bad(f"At most {MAX_BRANCH_IDS} branches per offer")
-    if ids:
-        found = (branch_lookup or _existing_branch_ids)(project_id, ids)
-        if set(ids) - set(found):
-            raise _bad("One of the branches isn't part of this shop")
-    out["branch_ids"] = ids
-
     scope = merged.get("fulfilment") or "any"
     if scope not in shop_rules.OFFER_FULFILMENTS:
         raise _bad("Fulfilment must be any, pickup or delivery")
@@ -430,11 +404,6 @@ def validate_offer(merged: dict, project_id: str, creating: bool, now: Optional[
         raise _bad("Sort order must be a whole number")
     out["sort_order"] = so
     return out
-
-
-def _existing_branch_ids(project_id: str, ids: list) -> set:
-    res = supabase.table("shop_branches").select("id").eq("project_id", project_id).in_("id", ids).execute()
-    return {str(r["id"]).lower() for r in (res.data or [])}
 
 
 def _usage(project_id: str) -> dict:

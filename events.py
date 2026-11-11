@@ -25,6 +25,12 @@ _UUID_RE = re.compile(
 # 'cancelled', an arbitrary value silently kept consuming a seat.
 VALID_REGISTRATION_STATUSES = {"confirmed", "attended", "no_show", "cancelled"}
 
+# Paid events: a registration waits as 'pending_payment' (holding its seat)
+# for this long. Unpaid holds are then cancelled with payment_status
+# 'expired', so every existing "not cancelled" seat count stays correct.
+REGISTRATION_HOLD_MINUTES = 15
+MAX_EVENT_PRICE = 1_000_000
+
 # Ceiling on confirmation messages per event per hour. Past it registrations
 # still save; only the WhatsApp is skipped. This is the last line of defence
 # on spend if every other guard fails — the send goes out on the merchant's
@@ -96,6 +102,7 @@ class EventCreate(BaseModel):
     accent_color: Optional[str] = "#6366f1"
     page_json: Optional[list] = None
     form_schema: Optional[list] = None
+    price: Optional[float] = Field(None, ge=0, le=MAX_EVENT_PRICE)
 
 class EventUpdate(BaseModel):
     title: Optional[str] = None
@@ -113,6 +120,8 @@ class EventUpdate(BaseModel):
     form_schema: Optional[list] = None
     bot_can_register: Optional[bool] = None
     send_wa_confirmation: Optional[bool] = None
+    # Ticket price. 0 or null = free.
+    price: Optional[float] = Field(None, ge=0, le=MAX_EVENT_PRICE)
 
 class RegistrationCreate(BaseModel):
     event_id: str
@@ -151,7 +160,7 @@ def list_events(project_id: str, user=Depends(verify_token)):
             "id, project_id, title, description, banner_url, event_date, "
             "event_time, location, capacity, registration_deadline, "
             "contact_phone, accent_color, page_json, form_schema, "
-            "is_active, bot_can_register, send_wa_confirmation, created_at"
+            "is_active, bot_can_register, send_wa_confirmation, price, created_at"
         ) \
         .eq("project_id", project_id) \
         .order("created_at", desc=True) \
@@ -169,8 +178,10 @@ def list_events(project_id: str, user=Depends(verify_token)):
             .execute()
         for row in (reg_res.data or []):
             counts[row["event_id"]] = counts.get(row["event_id"], 0) + 1
+        currency = _event_currency(project_id) if any((e.get("price") or 0) > 0 for e in events) else "INR"
         for e in events:
             e["registration_count"] = counts.get(e["id"], 0)
+            e["currency"] = currency
 
     return events
 
@@ -231,7 +242,7 @@ def delete_event(event_id: str, user=Depends(verify_token)):
 def list_registrations(event_id: str, user=Depends(verify_token)):
     _require_role_for_event(user.id, event_id)
     res = supabase.table("event_registrations") \
-        .select("id, event_id, name, phone, email, notes, status, source, created_at") \
+        .select("id, event_id, name, phone, email, notes, status, source, payment_status, amount, created_at") \
         .eq("event_id", event_id) \
         .order("created_at", desc=True) \
         .execute()
@@ -310,7 +321,7 @@ def get_upcoming_events_for_ai(project_id: str) -> list:
     # from reaching the model, so any new caller forwarding this raw would
     # have leaked them.
     res = supabase.table("events") \
-        .select("id, title, description, event_date, event_time, location, capacity, registration_deadline") \
+        .select("id, title, description, event_date, event_time, location, capacity, registration_deadline, price") \
         .eq("project_id", project_id) \
         .eq("is_active", True) \
         .eq("bot_can_register", True) \
@@ -492,7 +503,7 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
     # Scoped rather than select("*"): this is the unauthenticated
     # registration path, and these are the only fields it reads.
     event_res = supabase.table("events") \
-        .select("id, project_id, title, is_active, capacity, registration_deadline, event_date, event_time, location, send_wa_confirmation") \
+        .select("id, project_id, title, is_active, capacity, registration_deadline, event_date, event_time, location, send_wa_confirmation, price") \
         .eq("id", event_id) \
         .maybe_single() \
         .execute()
@@ -550,6 +561,10 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
     if status == "full":
         raise ValueError("This event is full")
     if status == "duplicate":
+        pending = supabase.table("event_registrations").select("id").eq("event_id", event_id)             .eq("phone", phone).eq("status", "pending_payment").limit(1).execute()
+        if pending.data:
+            raise ValueError(f"Your registration is waiting for payment. Finish paying with the link you opened, "
+                             f"or try again in {REGISTRATION_HOLD_MINUTES} minutes.")
         raise ValueError("You are already registered for this event")
     if status != "ok" or not result.get("registration"):
         raise ValueError("Registration is closed for this event")
@@ -576,6 +591,203 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
         sentry_sdk.capture_exception(e)
         print(f"form_submissions insert error: {e}")
 
+    price = float(event.get("price") or 0)
+    if price > 0:
+        return _start_registration_payment(event, registration, name, phone, price)
+
+    confirmation_sent = _send_registration_confirmation(event, registration, name, phone)
+    return _registration_result(event, registration, confirmation_sent)
+
+
+def _registration_result(event: dict, registration: dict, confirmation_sent: bool) -> dict:
+    return {
+        "status": "confirmed",
+        "registration_id": registration["id"],
+        "booking_id": registration["id"][:8].upper(),
+        "event_title": event["title"],
+        "event_date": event.get("event_date"),
+        "event_time": event.get("event_time"),
+        "location": event.get("location"),
+        "confirmation_sent": confirmation_sent,
+    }
+
+
+def _event_currency(project_id: str) -> str:
+    """The Razorpay currency: the shop's currency code when one is set."""
+    try:
+        res = supabase.table("shop_config").select("currency_code").eq("project_id", project_id).maybe_single().execute()
+        code = ((res.data if res else None) or {}).get("currency_code")
+        if isinstance(code, str) and re.fullmatch(r"[A-Z]{3}", code.strip().upper()):
+            return code.strip().upper()
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+    return "INR"
+
+
+def _start_registration_payment(event: dict, registration: dict, name: str, phone: str, price: float) -> dict:
+    """Paid event: the seat is held as 'pending_payment' for
+    REGISTRATION_HOLD_MINUTES and confirmed by the Razorpay webhook
+    (handle_registration_payment_paid). If no payment link can be made
+    (Razorpay not connected), the hold is released at once so it never
+    blocks a seat, and the person is told to contact the organiser."""
+    import time as time_module
+    from razorpay_oauth import _razorpay_api_request
+
+    hold_until = datetime.utcnow() + timedelta(minutes=REGISTRATION_HOLD_MINUTES)
+    supabase.table("event_registrations").update({
+        "status": "pending_payment",
+        "payment_status": "unpaid",
+        "amount": price,
+        "hold_expires_at": hold_until.isoformat() + "Z",
+    }).eq("id", registration["id"]).execute()
+
+    booking_id = registration["id"][:8].upper()
+    link = None
+    try:
+        res = _razorpay_api_request("POST", "/payment_links", event["project_id"], json={
+            "amount": int(round(price * 100)),
+            "currency": _event_currency(event["project_id"]),
+            "description": f"{event['title'][:200]} - Registration #{booking_id}",
+            "customer": {"contact": f"+{phone}", "name": name[:100]},
+            "notify": {"sms": False, "email": False},
+            "reminder_enable": False,
+            # Razorpay needs at least 15 minutes; a late payment after the
+            # hold is still honoured when a seat is free (see the webhook).
+            "expire_by": int(time_module.time()) + 60 * (REGISTRATION_HOLD_MINUTES + 16),
+        })
+        if res.status_code < 300:
+            link = res.json()
+        else:
+            sentry_sdk.capture_message(
+                f"Razorpay payment_link.create failed ({res.status_code}) for registration {registration['id']}: {res.text[:300]}")
+    except ValueError:
+        link = None  # Razorpay not connected for this project
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+
+    if not link:
+        supabase.table("event_registrations").update({
+            "status": "cancelled", "payment_status": "failed", "hold_expires_at": None,
+        }).eq("id", registration["id"]).execute()
+        raise ValueError("Online payment isn't available for this event right now. Please contact the organiser.")
+
+    supabase.table("event_registrations").update({
+        "payment_id": link["id"], "payment_status": "link_sent",
+    }).eq("id", registration["id"]).execute()
+
+    return {
+        "status": "payment_required",
+        "registration_id": registration["id"],
+        "booking_id": booking_id,
+        "event_title": event["title"],
+        "event_date": event.get("event_date"),
+        "event_time": event.get("event_time"),
+        "location": event.get("location"),
+        "amount": price,
+        "payment_url": link["short_url"],
+        "hold_minutes": REGISTRATION_HOLD_MINUTES,
+        "confirmation_sent": False,
+    }
+
+
+def handle_registration_payment_paid(registration: dict, amount_paid_paise: Optional[int] = None):
+    """Called from shop.py's /webhook/razorpay once a paid payment link is
+    found to belong to an event registration. Idempotent.
+
+    - pending_payment -> confirmed, then the usual confirmation message.
+    - Hold already expired (cancelled by the sweep): re-confirmed only if a
+      seat is still free and the phone isn't registered again; otherwise it
+      stays cancelled, marked paid, so the organiser can see it and refund.
+    """
+    if registration.get("payment_status") == "paid":
+        return
+
+    expected = int(round(float(registration.get("amount") or 0) * 100))
+    if amount_paid_paise and expected and amount_paid_paise < expected:
+        sentry_sdk.capture_message(
+            f"Razorpay underpayment for registration {registration['id']}: paid {amount_paid_paise}, expected {expected}")
+        supabase.table("event_registrations").update({"payment_status": "underpaid"}) \
+            .eq("id", registration["id"]).execute()
+        return
+
+    event_res = supabase.table("events") \
+        .select("id, project_id, title, capacity, event_date, event_time, location, send_wa_confirmation") \
+        .eq("id", registration["event_id"]).maybe_single().execute()
+    event = (event_res.data if event_res else None)
+    if not event:
+        supabase.table("event_registrations").update({"payment_status": "paid"}).eq("id", registration["id"]).execute()
+        return
+
+    if registration.get("status") == "pending_payment":
+        upd = supabase.table("event_registrations").update({
+            "status": "confirmed", "payment_status": "paid", "hold_expires_at": None,
+        }).eq("id", registration["id"]).eq("status", "pending_payment").execute()
+        if not upd.data:
+            # The sweep cancelled it at this very moment: handle as expired.
+            fresh = supabase.table("event_registrations").select("*").eq("id", registration["id"]).maybe_single().execute()
+            return handle_registration_payment_paid((fresh.data if fresh else None) or registration, amount_paid_paise)
+    elif registration.get("status") == "cancelled":
+        if not _seat_free(event, registration):
+            supabase.table("event_registrations").update({"payment_status": "paid"}).eq("id", registration["id"]).execute()
+            sentry_sdk.capture_message(
+                f"Registration {registration['id']} was paid after its hold expired and the event is full - needs a refund")
+            return
+        try:
+            supabase.table("event_registrations").update({
+                "status": "confirmed", "payment_status": "paid", "hold_expires_at": None,
+            }).eq("id", registration["id"]).eq("status", "cancelled").execute()
+        except Exception as e:
+            # Unique (event, phone) index: they registered again meanwhile.
+            sentry_sdk.capture_exception(e)
+            supabase.table("event_registrations").update({"payment_status": "paid"}).eq("id", registration["id"]).execute()
+            return
+    else:
+        # Already confirmed some other way (e.g. the organiser marked it).
+        supabase.table("event_registrations").update({"payment_status": "paid"}).eq("id", registration["id"]).execute()
+        return
+
+    _send_registration_confirmation(event, registration, registration.get("name") or "", registration["phone"], paid=True)
+
+
+def _seat_free(event: dict, registration: dict) -> bool:
+    capacity = event.get("capacity")
+    dup = supabase.table("event_registrations").select("id").eq("event_id", event["id"]) \
+        .eq("phone", registration["phone"]).neq("status", "cancelled").limit(1).execute()
+    if dup.data:
+        return False
+    if not capacity:
+        return True
+    count_res = supabase.table("event_registrations").select("id", count="exact") \
+        .eq("event_id", event["id"]).neq("status", "cancelled").execute()
+    return (count_res.count or 0) < capacity
+
+
+def release_expired_registration_holds() -> int:
+    """Runs with the appointment hold sweep (every 2 minutes). Unpaid holds
+    past REGISTRATION_HOLD_MINUTES are cancelled with payment_status
+    'expired', freeing the seat. The row is kept, so a late payment can
+    still be matched by the webhook."""
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    res = supabase.table("event_registrations").select("id") \
+        .eq("status", "pending_payment").lt("hold_expires_at", now_iso) \
+        .order("hold_expires_at").limit(200).execute()
+    released = 0
+    for row in (res.data or []):
+        try:
+            supabase.table("event_registrations").update({
+                "status": "cancelled", "payment_status": "expired",
+            }).eq("id", row["id"]).eq("status", "pending_payment").execute()
+            released += 1
+        except Exception as e:
+            print(f"Registration hold release error for {row.get('id')}: {e}")
+    return released
+
+
+def _send_registration_confirmation(event: dict, registration: dict, name: str, phone: str, paid: bool = False) -> bool:
+    """The WhatsApp confirmation. True only when the approved template went
+    out - the one message WhatsApp delivers to everyone."""
+    event_id = event["id"]
+    project_id = event["project_id"]
     # Hard ceiling on confirmations per event per hour. Everything above
     # bounds who can register; this bounds what registering can COST if one
     # of those guards is ever wrong. The registration is already saved and
@@ -593,16 +805,7 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
             f"({MAX_CONFIRMATIONS_PER_EVENT_HOUR}/hr); registration saved without a message."
         )
         print(f"Event {event_id}: confirmation cap reached, skipping WhatsApp")
-        return {
-            "status": "confirmed",
-            "registration_id": registration["id"],
-            "booking_id": registration["id"][:8].upper(),
-            "event_title": event["title"],
-            "event_date": event.get("event_date"),
-            "event_time": event.get("event_time"),
-            "location": event.get("location"),
-            "confirmation_sent": False,
-        }
+        return False
 
     # True only when the approved template went out - the one message
     # WhatsApp delivers to everyone. The plain text below only reaches people
@@ -628,7 +831,7 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
                 except Exception:
                     date_str = event["event_date"]
 
-            msg = f"✅ *Registration Confirmed!*\n\n"
+            msg = "✅ *Payment received - Registration Confirmed!*\n\n" if paid else "✅ *Registration Confirmed!*\n\n"
             msg += f"📋 {event['title']}\n"
             if date_str:
                 msg += f"📅 {date_str}"
@@ -659,17 +862,7 @@ def register_for_event_core(event_id: str, data: dict, source: Optional[str] = N
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Event registration WhatsApp confirmation error: {e}")
-
-    return {
-        "status": "confirmed",
-        "registration_id": registration["id"],
-        "booking_id": registration["id"][:8].upper(),
-        "event_title": event["title"],
-        "event_date": event.get("event_date"),
-        "event_time": event.get("event_time"),
-        "location": event.get("location"),
-        "confirmation_sent": confirmation_sent,
-    }
+    return confirmation_sent
 
 
 def cancel_registration_core(registration_id: str, notify_customer: bool = True) -> dict:
@@ -758,7 +951,7 @@ def public_event_details(event_id: str, request: Request):
         .select(
             "id, title, description, banner_url, event_date, event_time, "
             "location, capacity, registration_deadline, accent_color, "
-            "page_json, form_schema, is_active"
+            "page_json, form_schema, is_active, price, project_id"
         ) \
         .eq("id", event_id) \
         .maybe_single() \
@@ -769,6 +962,8 @@ def public_event_details(event_id: str, request: Request):
     event = res.data
     if not event.get("is_active"):
         raise HTTPException(status_code=403, detail="Registration closed")
+    project_id = event.pop("project_id", None)
+    event["currency"] = _event_currency(project_id) if (event.get("price") or 0) > 0 and project_id else None
 
     # Check registration deadline
     event["registration_open"] = not _deadline_passed(event.get("registration_deadline"))

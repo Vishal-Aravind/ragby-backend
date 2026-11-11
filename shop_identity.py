@@ -202,13 +202,11 @@ def verify_receipt(order_id: str, receipt) -> bool:
 # ─────────────────────────────────────────────
 
 def build_shop_url(project_id: str, phone: Optional[str] = None, catalog_id: Optional[str] = None,
-                   order_id: Optional[str] = None, branch_id: Optional[str] = None,
-                   view: Optional[str] = None) -> str:
+                   order_id: Optional[str] = None, view: Optional[str] = None) -> str:
     """The customer shop link. `t` is added only when a phone is given and
     a token can be issued; only call this with a VERIFIED phone (a WhatsApp
     sender), never a number a visitor typed."""
-    params = [("catalog", catalog_id), ("phone", phone), ("order_id", order_id),
-              ("branch", branch_id), ("view", view)]
+    params = [("catalog", catalog_id), ("phone", phone), ("order_id", order_id), ("view", view)]
     if phone:
         params.append(("t", issue_customer_token(project_id, str(phone))))
     query = urlencode([(k, str(v)) for k, v in params if v])

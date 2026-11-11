@@ -155,16 +155,16 @@ def line_taxables(items: list, items_discount) -> list:
     return out
 
 
-def seller_snapshot(config: dict, branch: Optional[dict]) -> dict:
-    """Seller details frozen onto the invoice: the branch's own value for a
-    field when set, else the shop's."""
-    config, branch = config or {}, branch or {}
+def seller_snapshot(config: dict) -> dict:
+    """Seller details frozen onto the invoice, from the shop settings."""
+    config = config or {}
     snap = {}
     for f in SELLER_FIELDS:
-        snap[f] = (branch.get(f) or "").strip() or (config.get(f) or "").strip() or None
-    snap["legal_name"] = snap["legal_name"] or (config.get("store_name") or "").strip() or None
-    snap["branch_name"] = branch.get("name")
-    snap["branch_address"] = branch.get("address")
+        snap[f] = (config.get(f) or "").strip() or None
+    store_name = (config.get("store_name") or "").strip() or None
+    snap["legal_name"] = snap["legal_name"] or store_name
+    snap["store_name"] = store_name
+    snap["store_address"] = (config.get("address") or "").strip() or None
     return snap
 
 
@@ -228,8 +228,9 @@ def build_invoice(order: dict, currency: str = "₹", public: bool = True) -> di
         "short_id": order["id"][:8].upper(),
         "seller": {
             "legal_name": snap.get("legal_name"),
-            "branch_name": snap.get("branch_name"),
-            "address": snap.get("registered_address") or snap.get("branch_address"),
+            # Invoices issued before branches were removed carry branch_*.
+            "trade_name": snap.get("store_name") or snap.get("branch_name"),
+            "address": snap.get("registered_address") or snap.get("store_address") or snap.get("branch_address"),
             "gstin": snap.get("gstin"),
             "state": snap.get("state"),
         },
@@ -271,7 +272,7 @@ def invoice_eligible(order: dict) -> bool:
     return order.get("status") not in (None, "pending")
 
 
-def issue_invoice(order: dict, config: Optional[dict] = None, branch: Optional[dict] = None) -> Optional[dict]:
+def issue_invoice(order: dict, config: Optional[dict] = None) -> Optional[dict]:
     """Give a paid / confirmed order its invoice number. Idempotent (the SQL
     function returns the existing number) and best-effort: any failure is
     reported and swallowed, never blocking the order. Returns the order with
@@ -285,11 +286,7 @@ def issue_invoice(order: dict, config: Optional[dict] = None, branch: Optional[d
         if config is None:
             res = _db().table("shop_config").select("*").eq("project_id", project_id).maybe_single().execute()
             config = (res.data if res else None) or {}
-        if branch is None and order.get("branch_id"):
-            b = _db().table("shop_branches").select("*").eq("id", order["branch_id"]) \
-                .eq("project_id", project_id).limit(1).execute()
-            branch = b.data[0] if b.data else None
-        snap = seller_snapshot(config, branch)
+        snap = seller_snapshot(config)
         res = _db().rpc("shop_issue_invoice", {"p_order_id": order["id"], "p_snapshot": snap}).execute()
         data = res.data
         row = (data[0] if isinstance(data, list) and data else data) or {}
@@ -364,8 +361,8 @@ class InvoiceSettings(BaseModel):
 
 
 def clean_seller_fields(data: dict) -> dict:
-    """Validated seller columns for the keys present in `data` (shop or
-    branch). ValueError with a merchant-readable message."""
+    """Validated seller columns for the keys present in `data`. ValueError
+    with a merchant-readable message."""
     out = {}
     limits = {"legal_name": ("Legal name", 200), "registered_address": ("Registered address", 500),
               "state": ("State", 60)}

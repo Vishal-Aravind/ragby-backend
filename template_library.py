@@ -349,7 +349,7 @@ TEMPLATE_LIBRARY = [
         "name": "order_status_update",
         "display_name": "Order Status Update",
         "description": "Tells the customer their shop order's new status when you update it in Shop > Orders",
-        "preview": "Hi {Name}, here is an update on your order {Order ID} from {Branch}. Status: {Status}. Thank you for ordering with us!",
+        "preview": "Hi {Name}, here is an update on your order {Order ID} from {Shop}. Status: {Status}. Thank you for ordering with us!",
         "components": [
             {
                 "type": "BODY",
@@ -357,7 +357,7 @@ TEMPLATE_LIBRARY = [
             }
         ],
         "example_body": ["Asha", "A1B2C3D4", "Geetham Velachery", "Out for delivery"],
-        "variables": ["Customer name", "Order ID", "Branch name", "Status"],
+        "variables": ["Customer name", "Order ID", "Shop name", "Status"],
         "language": "en_US",
     },
     {
@@ -367,7 +367,7 @@ TEMPLATE_LIBRARY = [
         "name": "order_cancelled",
         "display_name": "Order Cancelled",
         "description": "Tells the customer their shop order was cancelled (Shop > Orders)",
-        "preview": "Hi {Name}, your order {Order ID} from {Branch} has been cancelled. If you have already paid or have any questions, please contact us at {Phone} and we will help you.",
+        "preview": "Hi {Name}, your order {Order ID} from {Shop} has been cancelled. If you have already paid or have any questions, please contact us at {Phone} and we will help you.",
         "components": [
             {
                 "type": "BODY",
@@ -375,7 +375,7 @@ TEMPLATE_LIBRARY = [
             }
         ],
         "example_body": ["Asha", "A1B2C3D4", "Geetham Velachery", "+91 98765 43210"],
-        "variables": ["Customer name", "Order ID", "Branch name", "Contact phone"],
+        "variables": ["Customer name", "Order ID", "Shop name", "Contact phone"],
         "language": "en_US",
     },
     {
@@ -385,7 +385,7 @@ TEMPLATE_LIBRARY = [
         "name": "shop_new_order_alert",
         "display_name": "Shop New Order Alert (for you)",
         "description": "Tells YOU (the shop owner) about a new order, even when your phone hasn't messaged this number in 24 hours (Shop > Orders)",
-        "preview": "New order #{Order ID} received at {Branch} from {Customer}. Order total: {Total}. This is a {Pickup or delivery} order and the payment status is: {Payment}. Open the Orders tab in your Zavo dashboard to see the items and update the order.",
+        "preview": "New order #{Order ID} received at {Shop} from {Customer}. Order total: {Total}. This is a {Pickup or delivery} order and the payment status is: {Payment}. Open the Orders tab in your Zavo dashboard to see the items and update the order.",
         "components": [
             {
                 "type": "BODY",
@@ -393,7 +393,7 @@ TEMPLATE_LIBRARY = [
             }
         ],
         "example_body": ["A1B2C3D4", "Geetham Velachery", "Asha", "₹582.00", "pickup", "Collect payment"],
-        "variables": ["Order ID", "Branch name", "Customer name", "Order total", "Pickup or delivery", "Payment status"],
+        "variables": ["Order ID", "Shop name", "Customer name", "Order total", "Pickup or delivery", "Payment status"],
         "language": "en_US",
     },
     {
