@@ -310,10 +310,19 @@ async def get_shop_config(project_id: str, user=Depends(verify_token)):
 
 @router.put("/shop-config/{project_id}")
 async def update_shop_config(project_id: str, body: ShopConfigUpdate, user=Depends(verify_token)):
-    require_project_access(user.id, project_id, tab="shop")
-    existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
     from shop_store import STORE_KEYS, store_fields
     sent = body.model_fields_set
+    # The store fields (location, hours, delivery, min order...) used to
+    # live on shop_branches, where only an admin could change them - an
+    # agent could only flip accepting_orders (pause/resume). Now that this
+    # data lives on shop_config, which is also where the always-agent-
+    # editable fields (store_name, is_enabled, ...) live, that distinction
+    # has to be enforced here instead of by a separate table/RLS policy.
+    if (sent & set(STORE_KEYS)) - {"accepting_orders"}:
+        require_project_access(user.id, project_id, tab="shop", min_role="admin")
+    else:
+        require_project_access(user.id, project_id, tab="shop")
+    existing = supabase.table("shop_config").select("id").eq("project_id", project_id).maybe_single().execute()
     update = {k: v for k, v in body.dict().items() if v is not None and k not in STORE_KEYS}
     # Store keys: an explicit null clears (e.g. hours = always open).
     update.update(store_fields({k: getattr(body, k) for k in STORE_KEYS if k in sent}, project_id))
